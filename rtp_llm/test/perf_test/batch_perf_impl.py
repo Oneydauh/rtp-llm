@@ -16,7 +16,7 @@ from rtp_llm.utils.util import check_with_info
 
 def _curl_server_single_worker(
     i: int,
-    base_port: int,
+    base_url: str,
     input_query: str,
     is_decode: bool,
     decode_test_length: int,
@@ -24,6 +24,7 @@ def _curl_server_single_worker(
     profile: bool = False,
     generate_config: Optional[Dict[str, Any]] = None,
     profile_trace_name: str = "",
+    headers: Optional[Dict[str, str]] = None,
 ) -> ResponseInfo:
     req = {
         "prompt": input_query,
@@ -53,7 +54,7 @@ def _curl_server_single_worker(
             req["profile_trace_name"] = profile_trace_name
     try:
         response = requests.post(
-            f"http://127.0.0.1:{base_port}", json=req, timeout=wait_time
+            base_url, json=req, timeout=wait_time, headers=headers,
         )
         if response.status_code != 200:
             logging.warning(f"request failed: {response.content}")
@@ -67,7 +68,7 @@ def _curl_server_single_worker(
 
 def _curl_server_batch_worker(
     request_indices: List[int],
-    base_port: int,
+    base_url: str,
     input_queries: List[str],
     is_decode: bool,
     decode_test_length: int,
@@ -75,6 +76,7 @@ def _curl_server_batch_worker(
     profile: bool = False,
     generate_config: Optional[Dict[str, Any]] = None,
     profile_trace_name: str = "",
+    headers: Optional[Dict[str, str]] = None,
 ) -> List[ResponseInfo]:
     """Concurrently send requests, each with its own query string."""
     with ThreadPoolExecutor(max_workers=len(request_indices)) as executor:
@@ -83,7 +85,7 @@ def _curl_server_batch_worker(
             future = executor.submit(
                 _curl_server_single_worker,
                 i,
-                base_port,
+                base_url,
                 input_queries[idx],
                 is_decode,
                 decode_test_length,
@@ -91,6 +93,7 @@ def _curl_server_batch_worker(
                 profile,
                 generate_config,
                 profile_trace_name,
+                headers,
             )
             futures.append(future)
         return [f.result() for f in futures]
@@ -109,8 +112,15 @@ class BatchPerfImpl(object):
         profile: bool = True,
         generate_config: Optional[Dict[str, Any]] = None,
         profile_trace_name: str = "",
+        *,
+        base_url: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
     ):
         self.base_port = base_port
+        # base_url wins when both are passed. Use-case: remote-driven runs
+        # target a deployed worker (e.g. http://host:port), not 127.0.0.1.
+        self.base_url = base_url or f"http://127.0.0.1:{base_port}"
+        self.headers = headers
         self.dp_size = dp_size
         self.batch_size = batch_size
         if isinstance(query, str):
@@ -151,11 +161,12 @@ class BatchPerfImpl(object):
         )
         local_batch_size = self.batch_size // self.dp_size
         response = requests.post(
-            f"http://127.0.0.1:{self.base_port}/update_scheduler_info",
+            f"{self.base_url.rstrip('/')}/update_scheduler_info",
             json={
                 "batch_size": local_batch_size,
                 "mode": "decode" if self.is_decode else "prefill",
             },
+            headers=self.headers,
         )
         if response.status_code != 200 or response.json().get("status", "ok") != "ok":
             raise Exception(
@@ -177,7 +188,7 @@ class BatchPerfImpl(object):
                 self.executor.submit(
                     _curl_server_batch_worker,
                     batch_indices,
-                    self.base_port,
+                    self.base_url,
                     batch_queries,
                     self.is_decode,
                     self.decode_test_length,
@@ -185,6 +196,7 @@ class BatchPerfImpl(object):
                     profile,
                     self.generate_config,
                     self.profile_trace_name if profile else "",
+                    self.headers,
                 )
             )
 
