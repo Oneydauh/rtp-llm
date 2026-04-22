@@ -8,6 +8,7 @@ py_library(
         "distribution_runner.py",
         "grid_runner.py",
         "hub_download.py",
+        "remote_pd_profile.py",
         "sampling.py",
         "server.py",
         "test_util.py",
