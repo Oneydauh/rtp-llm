@@ -197,6 +197,52 @@ def _pin_scheduler(
     log.info("  scheduler pinned: local_batch=%d mode=%s", local_batch, mode)
 
 
+def _topology_tag(status: Dict[str, Any], role_letter: str) -> str:
+    """Format '<role>_<tp>TP<dp>DP' from a /worker_status payload — e.g.
+    'P_8TP1DP', 'D_1TP32DP'. Used to auto-name profile trace files by
+    cluster shape so multiple concurrent sweeps don't collide and a
+    filename alone identifies which deployment it came from.
+    """
+    tp = int(status.get("tp_size", 1) or 1)
+    dp = int(status.get("dp_size", 1) or 1)
+    return "%s_%dTP%dDP" % (role_letter, tp, dp)
+
+
+def _probe_topology_prefix(
+    auth_headers: Dict[str, str],
+    prefill_url: Optional[str],
+    decode_urls: Optional[List[str]],
+) -> str:
+    """Probe worker_status on the prefill seed + first decode seed and
+    build a compound tag like 'P_8TP1DP-D_1TP32DP'. Returns '' if both
+    probes fail (caller falls back to a plain tag).
+    """
+    parts: List[str] = []
+    s = _new_session(auth_headers)
+    try:
+        if prefill_url:
+            try:
+                st = _fetch_worker_status(s, prefill_url)
+                parts.append(_topology_tag(st, "P"))
+            except Exception as e:
+                log.warning(
+                    "topology probe on prefill %s failed: %s",
+                    prefill_url, e,
+                )
+        if decode_urls:
+            try:
+                st = _fetch_worker_status(s, decode_urls[0])
+                parts.append(_topology_tag(st, "D"))
+            except Exception as e:
+                log.warning(
+                    "topology probe on decode %s failed: %s",
+                    decode_urls[0], e,
+                )
+    finally:
+        s.close()
+    return "-".join(parts)
+
+
 def _role(status: Dict[str, Any]) -> str:
     """Server returns role as RoleType enum str repr ('RoleType.PREFILL').
     Strip the prefix and lowercase.
@@ -642,10 +688,17 @@ def _build_parser() -> argparse.ArgumentParser:
              "before each measurement traffic pass",
     )
     g.add_argument(
-        "--profile-trace-name", default="normal_profiler",
-        help="Prefix for trace filenames on the server "
-             "(default: normal_profiler). Each run also appends a "
-             "YYYYMMDD_HHMMSS stamp so repeated invocations don't overwrite.",
+        "--profile-trace-name", default="normal",
+        help="Trailing tag in the trace filename (default: normal). "
+             "The final prefix is '<topology>_<tag>_<YYYYMMDD_HHMMSS>' "
+             "where <topology> like 'P_8TP1DP-D_1TP32DP' is auto-derived "
+             "from /worker_status. Use --no-topology-prefix to skip the "
+             "topology part and just use '<tag>_<timestamp>'.",
+    )
+    g.add_argument(
+        "--no-topology-prefix", action="store_true",
+        help="Skip auto-probing /worker_status for tp/dp sizes; use the "
+             "plain --profile-trace-name as the prefix.",
     )
     g.add_argument(
         "--profile-num-steps", type=int, default=3,
@@ -719,10 +772,28 @@ def main() -> None:
 
     auth = {"Authorization": "Bearer %s" % args.api_key} if args.api_key else {}
 
+    # Decode URLs are parsed up-front so the topology probe can use them
+    # before the decode sweep starts. (The later decode block re-parses;
+    # that's fine — this is cheap.)
+    early_decode_urls: Optional[List[str]] = None
+    if args.decode_url:
+        early_decode_urls = [
+            u.strip() for u in args.decode_url.split(",") if u.strip()
+        ] or None
+
     # Stamp every trace name with a run id so repeated invocations produce
     # distinct timeline files on the server (rtp-llm overwrites otherwise).
     run_id = time.strftime("%Y%m%d_%H%M%S")
-    trace_prefix = "%s_%s" % (args.profile_trace_name, run_id)
+    tag = args.profile_trace_name
+    topology = ""
+    if args.capture_profile and not args.no_topology_prefix:
+        topology = _probe_topology_prefix(
+            auth, args.prefill_url, early_decode_urls,
+        )
+    if topology:
+        trace_prefix = "%s_%s_%s" % (topology, tag, run_id)
+    else:
+        trace_prefix = "%s_%s" % (tag, run_id)
     log.info("Profile trace prefix: %s", trace_prefix)
 
     if args.prefill_url:
