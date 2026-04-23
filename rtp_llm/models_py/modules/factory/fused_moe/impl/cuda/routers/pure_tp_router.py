@@ -209,6 +209,33 @@ class PureTpRouterFp8PerBlock(PureTpRouterBase):
             return trt_fp8_quantize_128(a1, False)
 
 
+class PureTpRouterFp8PerBlockBf16Passthrough(PureTpRouterBase):
+    """Pure TP router for FP8 PerBlock that passes BF16 input through unmodified.
+
+    Used by executors (e.g. flashinfer.fused_moe.cutlass_fused_moe) that take
+    BF16 activations and quantize internally.
+    """
+
+    def __init__(
+        self,
+        config: MoEConfigAdapter,
+        quant_config: FusedMoEQuantConfig,
+    ):
+        super().__init__(config, quant_config, do_recompute_topk=False)
+
+    @classmethod
+    def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
+        super().check_conditions(checker, config)
+        resolver = MoeConfigResolver()
+        quant_method = resolver.get_quant_method(config)
+        checker.check(quant_method == "FP8_PER_BLOCK")
+
+    def _do_quant(
+        self, a1: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return a1, None
+
+
 class PureTpRouterW4a8Int4PerChannel(PureTpRouterBase):
     """Pure TP router with W4A8 INT4 per-channel quantization."""
 

@@ -87,6 +87,26 @@ py_test (
 )
 
 py_test (
+    name = "cutlass_fused_moe_test",
+    srcs = ["cutlass_fused_moe_test.py"],
+    deps = [
+        "//rtp_llm/models_py:modules",
+        "//rtp_llm:config",
+        "//rtp_llm:testlib",
+        "//rtp_llm:flashinfer-python",
+    ],
+    env = {
+        "GPU_COUNT": "1",
+        "FLASHINFER_DISABLE_VERSION_CHECK": "1",
+        # flashinfer's deepseek FP8 block-scale GEMM JIT-compiles via nvcc
+        "PATH": "/opt/conda310/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "CUDA_HOME": "/usr/local/cuda",
+    },
+    tags = ["open_skip", "H20"],
+    exec_properties = {'gpu':'H20', 'gpu_count':'1'},
+)
+
+py_test (
     name = "cutedsl_fp4_executor_test",
     srcs = ["cutedsl_fp4_executor_test.py"],
     deps = [
