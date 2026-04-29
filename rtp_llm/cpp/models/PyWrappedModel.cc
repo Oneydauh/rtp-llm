@@ -290,7 +290,7 @@ std::optional<PyCacheStoreInputs> PyWrappedModel::prepareWriteCacheParams(const 
                                                   && mla_ops_type_ != rtp_llm::MlaOpsType::MHA,
                                               cache_manager_ ? cache_manager_->getCacheStore() : nullptr,
                                               cache_store_async_writer_.get(),
-                                              cache_manager_ ? cache_manager_->connectorCoordinator().get() : nullptr};
+                                              cache_manager_ ? cache_manager_->connectorCoordinator() : nullptr};
         params = cache_store_inputs;
     }
     return params;

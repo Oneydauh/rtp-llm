@@ -1,4 +1,4 @@
-package(default_visibility = ["//rtp_llm/cpp/cache/p2p_connector:__subpackages__"])
+package(default_visibility = ["//rtp_llm/cpp/cache/connector/p2p:__subpackages__"])
 
 load("//bazel:tf_proto.bzl", "cc_proto")
 

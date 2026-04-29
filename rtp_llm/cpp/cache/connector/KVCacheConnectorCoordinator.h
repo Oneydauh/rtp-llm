@@ -59,6 +59,8 @@ public:
         return allocator_->convertToGlobalLayerId(model_id, layer_id);
     }
 
+    void reportP2PCacheWriteFailure() override;
+
     /// Prefill-side StartLoad path; P2P connector wiring fills this in when enabled.
     virtual void handleRead(const P2PConnectorStartLoadRequestPB& request,
                             P2PConnectorStartLoadResponsePB&      response,

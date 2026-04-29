@@ -9,6 +9,7 @@
 #include "rtp_llm/cpp/cache/connector/memory/KVCacheMemoryConnector.h"
 #include "rtp_llm/cpp/cache/connector/p2p/P2PConnector.h"
 #include "rtp_llm/cpp/cache/connector/p2p/LayerBlockConverterImpl.h"
+#include "rtp_llm/cpp/cache/connector/p2p/P2PConnectorMetrics.h"
 #ifdef USE_REMOTE_KV_CACHE
 #include "rtp_llm/cpp/cache/connector/remote_connector/RemoteConnector.h"
 #endif
@@ -367,6 +368,13 @@ std::vector<CacheKeyType> KVCacheConnectorCoordinator::memoryCacheKeys() const {
         return {};
     }
     return memory_connector_->cacheKeys();
+}
+
+void KVCacheConnectorCoordinator::reportP2PCacheWriteFailure() {
+    if (metrics_reporter_) {
+        CacheWriteOpFailureMetricsCollector collector;
+        metrics_reporter_->report<P2PConnectorMetrics, CacheWriteOpFailureMetricsCollector>(nullptr, &collector);
+    }
 }
 
 }  // namespace rtp_llm

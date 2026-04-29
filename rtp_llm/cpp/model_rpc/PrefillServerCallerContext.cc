@@ -17,6 +17,12 @@ PrefillServerCallerContext::~PrefillServerCallerContext() {
         client_context_->TryCancel();
     }
     completion_queue_->Shutdown();
+    // Drain all remaining events per gRPC contract: after Shutdown(), Next() must be
+    // called until it returns SHUTDOWN to avoid leaking pending async operations.
+    void* drain_tag = nullptr;
+    bool  drain_ok  = false;
+    while (completion_queue_->Next(&drain_tag, &drain_ok)) {
+    }
 }
 
 void PrefillServerCallerContext::cancel() {

@@ -198,9 +198,11 @@ void writeCacheToConnector(const CacheStoreInputs& param, IKVCacheConnectorCoord
     const auto seq_size_per_block = param.tokens_per_block;
     const auto global_layer_id    = connector_coordinator->convertToGlobalLayerId(param.model_id, param.layer_id);
     if (global_layer_id == std::numeric_limits<uint32_t>::max()) {
-        RTP_LLM_LOG_ERROR("writeCacheToConnector: convertToGlobalLayerId failed, model_id=%d, layer_id=%d",
+        RTP_LLM_LOG_ERROR("writeCacheToConnector: convertToGlobalLayerId failed, model_id=%zu, layer_id=%d. "
+                          "Skipping P2P cache write for this layer — decode side will not receive data.",
                           param.model_id,
                           param.layer_id);
+        connector_coordinator->reportP2PCacheWriteFailure();
         return;
     }
 
@@ -276,10 +278,12 @@ void writeCacheToConnector(const CacheStoreInputs& param, IKVCacheConnectorCoord
             kv_cache_resource->cacheKeys().push_back(cache_key);
         }
         if (!cache_keys_valid) {
-            RTP_LLM_LOG_WARNING(
-                "writeCacheToConnector failed to convert cache_key to int64_t, request_id=%ld, batch_id=%zu",
+            RTP_LLM_LOG_ERROR(
+                "writeCacheToConnector: cache_key conversion failed, request_id=%ld, batch_id=%zu, "
+                "skipping P2P cache write for this batch",
                 request_id,
                 batch_id);
+            connector_coordinator->reportP2PCacheWriteFailure();
             continue;
         }
 

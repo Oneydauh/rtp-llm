@@ -21,6 +21,8 @@ grpc::Status DecodeRpcServerNew2::init(const EngineInitParams&                  
         RTP_LLM_LOG_WARNING("decode rpc server new2 init failed, kvcache manager is null");
         return grpc::Status(grpc::StatusCode::INTERNAL, "kvcache manager is null");
     }
+    // Validate P2P connector coordinator is initialized (required for PD separation cache transfer).
+    // The coordinator itself is accessed later via KVCacheManager during cache operations.
     auto connector_coordinator = kvcache_manager->connectorCoordinator();
     if (!connector_coordinator) {
         RTP_LLM_LOG_WARNING("decode rpc server new2 init failed, connector coordinator is null");
@@ -89,14 +91,19 @@ grpc::Status DecodeRpcServerNew2::GenerateStreamCall(grpc::ServerContext*       
         }
     }
     if (prefill_ip.empty() || prefill_port <= 0) {
-        RTP_LLM_LOG_WARNING("decode rpc server new2 init failed, prefill_ip or prefill_port is not available");
+        RTP_LLM_LOG_WARNING("decode rpc server new2 generate failed: prefill addr unavailable, request_id=%ld",
+                            request_id);
         return grpc::Status(grpc::StatusCode::INTERNAL, "prefill_ip or prefill_port is not available");
     }
 
     int prefill_tp_size = prefill_server_caller_->getPrefillTpSize(
         prefill_ip, prefill_port, static_cast<int32_t>(request->generate_config().timeout_ms()));
     if (prefill_tp_size <= 0) {
-        RTP_LLM_LOG_WARNING("decode rpc server new2 init failed, prefill_tp_size is not available");
+        RTP_LLM_LOG_WARNING("decode rpc server new2 generate failed: prefill_tp_size unavailable, "
+                            "request_id=%ld, prefill_addr=%s:%u",
+                            request_id,
+                            prefill_ip.c_str(),
+                            prefill_port);
         return grpc::Status(grpc::StatusCode::INTERNAL, "prefill_tp_size is not available");
     }
     stream->setPrefillTpSize(prefill_tp_size);

@@ -505,8 +505,20 @@ void LocalRpcServer::reportCacheStatusTime(int64_t request_begin_time_us) {
         return grpc::Status(grpc::StatusCode::INTERNAL, "cache manager is null");
     }
     if (!cache_manager->executeFunction(*request, *response)) {
-        RTP_LLM_LOG_WARNING("execute function failed");
-        const std::string error_msg = "execute function failed";
+        std::string request_case;
+        if (request->has_mem_request()) {
+            request_case = "mem_request";
+        } else if (request->has_remote_request()) {
+            request_case = "remote_request(trace_id=" + request->remote_request().trace_id() + ")";
+        } else if (request->has_p2p_request()) {
+            request_case = "p2p_request";
+        } else {
+            request_case = "unknown";
+        }
+        RTP_LLM_LOG_WARNING("execute function failed, peer: %s, request_case: %s",
+                            context->peer().c_str(),
+                            request_case.c_str());
+        const std::string error_msg = "execute function failed, request_case: " + request_case;
         return grpc::Status(grpc::StatusCode::INTERNAL, error_msg);
     }
     return grpc::Status::OK;

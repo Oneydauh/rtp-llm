@@ -3,12 +3,14 @@
 #include "rtp_llm/cpp/model_rpc/RpcErrorCode.h"
 #include "rtp_llm/cpp/utils/ErrorCode.h"
 #include "rtp_llm/cpp/utils/TimeUtil.h"
+#include <algorithm>
 #include <chrono>
 #include <thread>
 
 namespace rtp_llm {
 
 constexpr int32_t kPeerInfoProbeMaxMs = 500;
+constexpr int32_t kPeerInfoProbeMinMs = 50;
 
 PrefillServerCaller::PrefillServerCaller(const std::string& process_id):
     rpc_pool_(std::make_shared<RPCPool>()), process_id_(process_id) {}
@@ -144,7 +146,7 @@ int PrefillServerCaller::getPrefillTpSize(const std::string& ip, uint32_t port, 
 
     grpc::ClientContext ctx;
     ctx.set_deadline(std::chrono::system_clock::now()
-                     + std::chrono::milliseconds(std::max(request_timeout_ms, kPeerInfoProbeMaxMs)));
+                     + std::chrono::milliseconds(std::clamp(request_timeout_ms, kPeerInfoProbeMinMs, kPeerInfoProbeMaxMs)));
 
     GetPeerInfoRequestPB  request;
     GetPeerInfoResponsePB response;

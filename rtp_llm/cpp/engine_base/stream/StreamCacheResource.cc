@@ -126,7 +126,9 @@ static bool applyP2PSideChannelToStream(const std::shared_ptr<FusedAsyncReadCont
         return false;
     }
 
-    // Apply side-channel data to GenerateStream
+    // Apply side-channel data to GenerateStream.
+    // Note: stream->update() internally acquires stream->mutex_ (std::lock_guard), so no
+    // external lock is needed here — there is no data race with concurrent update callers.
     // 1. First token: append to stream
     if (payload->first_token_id > 0) {
         stream->setIsContextStream(false);

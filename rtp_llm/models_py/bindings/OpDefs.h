@@ -139,7 +139,7 @@ struct PyCacheStoreInputs {
     // Opaque cache_store reference (C++ only; passes through Python without inspection)
     std::shared_ptr<rtp_llm::CacheStore>   cache_store;
     rtp_llm::CacheStoreAsyncWriter*        cache_store_async_writer = nullptr;
-    rtp_llm::IKVCacheConnectorCoordinator* connector_coordinator    = nullptr;
+    std::shared_ptr<rtp_llm::IKVCacheConnectorCoordinator> connector_coordinator;
 };
 
 struct PyPrefillCudaGaphCopyParams {
