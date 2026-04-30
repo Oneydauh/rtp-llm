@@ -530,11 +530,16 @@ void CudaGraphRunner::initCapture() {
         capture_mem_hold_ = CaptureMemoryHold(output, inputs, is_prefill_cuda_graph_mode_);
         initKernelInternalMemory();
 
-        // get real output data type (params already prepared in attn impl __init__/create_params)
-        auto attn_pyobj = py_attn_pyobj_method_(capture_mem_hold_.py_model_inputs_, true);
-        RTP_LLM_LOG_INFO("initCapture forward for output datatype start");
-        py_forward_method_(capture_mem_hold_.py_model_inputs_, attn_pyobj);
-        RTP_LLM_LOG_INFO("initCapture forward for output datatype end");
+        // Decode path will run warmup/capture in captureDecode(); avoid an extra full forward here.
+        // This significantly reduces startup time for long-context decode capture.
+        if (is_prefill_cuda_graph_mode_) {
+            auto attn_pyobj = py_attn_pyobj_method_(capture_mem_hold_.py_model_inputs_, true);
+            RTP_LLM_LOG_INFO("initCapture forward for output datatype start");
+            py_forward_method_(capture_mem_hold_.py_model_inputs_, attn_pyobj);
+            RTP_LLM_LOG_INFO("initCapture forward for output datatype end");
+        } else {
+            RTP_LLM_LOG_INFO("Skip initCapture output-dtype warmup forward for decode mode.");
+        }
         output = torch::zeros({max_num_token_, hidden_size_}, options_cuda_float_);
         capture_mem_hold_.setHiddenStates(output);
         initCaptureAttentionInputsPost();

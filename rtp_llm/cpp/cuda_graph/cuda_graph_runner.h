@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <unordered_map>
 #include <vector>
 #include <pybind11/embed.h>
@@ -47,6 +48,13 @@ public:
             max_bs_ = graph_params.max_context_batch_size;
         } else {
             max_bs_ = graph_params.concurrency_limit;
+            if (!decode_capture_batch_sizes_.empty()) {
+                const int max_capture_bs =
+                    *std::max_element(decode_capture_batch_sizes_.begin(), decode_capture_batch_sizes_.end());
+                if (max_capture_bs > 0 && max_capture_bs < max_bs_) {
+                    max_bs_ = max_capture_bs;
+                }
+            }
         }
         py_attn_pyobj_method_ = py_instance_.attr("prepare_fmha_impl");
         py_forward_method_    = py_instance_.attr("forward");

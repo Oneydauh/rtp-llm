@@ -83,6 +83,7 @@ def release_trt_workspace_buffer(buffer: torch.Tensor) -> None:
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = 448.0
 NVFP4_BLOCK_SIZE = 16
+_E2M1_THRESHOLDS = torch.tensor([0.0, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
 
 # Global scale factor for online NVFP4 KV cache quantization.
 #
@@ -98,6 +99,58 @@ NVFP4_BLOCK_SIZE = 16
 # The dequantized value = fp4_val * scale_fp8 / global_sf is mathematically independent
 # of global_sf (it cancels), but different values give different fp8 rounding behavior.
 _DEFAULT_NVFP4_GLOBAL_SF = 1.0
+
+
+def _quantize_nvfp4_linear_fallback(
+    x_2d: torch.Tensor,
+    global_sf: torch.Tensor,
+    thresholds: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SM90 fallback NVFP4 quantization for linear (non-swizzled) SF layout.
+
+    flashinfer.fp4_quantize relies on SM100+ device code paths. For SM90 we use
+    a numerically stable Python fallback that keeps the same storage contract:
+      - packed fp4 in E2M1x2 uint8
+      - per-16-element block scale in float8_e4m3fn
+    """
+    if x_2d.shape[-1] % NVFP4_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"head_size must be divisible by {NVFP4_BLOCK_SIZE}, got {x_2d.shape[-1]}"
+        )
+    device = x_2d.device
+    if thresholds is None:
+        thresholds = _E2M1_THRESHOLDS.to(device=device, dtype=torch.float32)
+    else:
+        thresholds = thresholds.to(device=device, dtype=torch.float32)
+    global_scale = global_sf.to(device=device, dtype=torch.float32).reshape(1)
+
+    x_groups = x_2d.view(x_2d.shape[0], -1, NVFP4_BLOCK_SIZE)
+    vec_max = x_groups.abs().amax(dim=-1)
+
+    sf_value = global_scale * (vec_max / FLOAT4_E2M1_MAX)
+    sf_narrow = sf_value.to(torch.float8_e4m3fn)
+    sf_narrow_f32 = sf_narrow.to(torch.float32)
+
+    output_scale = torch.where(
+        sf_narrow_f32 > 0,
+        global_scale / sf_narrow_f32,
+        torch.zeros_like(sf_narrow_f32),
+    )
+    x_q = torch.clamp(
+        x_groups * output_scale.unsqueeze(-1), -FLOAT4_E2M1_MAX, FLOAT4_E2M1_MAX
+    )
+
+    # Match TensorRT-LLM floatToE2M1 tie-to-even behavior.
+    x_abs = x_q.abs().to(torch.float32)
+    e2m1_idx = torch.zeros_like(x_abs, dtype=torch.int64)
+    for i in range(7, 0, -1):
+        cond = (x_abs > thresholds[i]) | ((x_abs == thresholds[i]) & (i % 2 == 0))
+        e2m1_idx = torch.where(cond & (e2m1_idx == 0), i, e2m1_idx)
+
+    sign_bit = (x_q < 0).to(torch.int64) << 3
+    e2m1_code = (e2m1_idx | sign_bit).to(torch.uint8)
+    packed = (e2m1_code[..., 0::2] | (e2m1_code[..., 1::2] << 4)).contiguous()
+    return packed.view(x_2d.shape[0], -1), sf_narrow.view(x_2d.shape[0], -1)
 
 
 class NVFP4KVCacheWriteOp:
@@ -127,26 +180,29 @@ class NVFP4KVCacheWriteOp:
         # Global scale factor tensors (on GPU, created lazily)
         self._k_global_sf: Optional[torch.Tensor] = None
         self._v_global_sf: Optional[torch.Tensor] = None
+        self._e2m1_thresholds: Optional[torch.Tensor] = None
         # kv_global_scale = (1/k_global_sf, 1/v_global_sf) for FMHA kernel
         self.kv_global_scale: Tuple[float, float] = (
             1.0 / _DEFAULT_NVFP4_GLOBAL_SF,
             1.0 / _DEFAULT_NVFP4_GLOBAL_SF,
         )
 
-        # Pre-compute swizzle index tables for scale writing.
+        # Pre-compute index tables for scale writing.
         # SM100 trtllm-gen MHA kernel expects swizzled scale layout (HND):
         #   [P, H, T//4, 4, 4, S//4] → permute(0,1,2,4,5,3) → [P, H, T, S]
-        # Per-element index formulas:
-        #   swizzled_row = (t//4)*4 + s//(S//4)
-        #   swizzled_col = (s%(S//4))*4 + t%4
+        # Non-SM100 python-attention fallback reads linear scales, so keep [T, S].
         T = token_per_block
         S = self.scale_dim
-        s_parts = S // 4
         t_idx = torch.arange(T)
         s_idx = torch.arange(S)
         t_grid, s_grid = torch.meshgrid(t_idx, s_idx, indexing="ij")  # [T, S]
-        self._swizzle_rows = (t_grid // 4) * 4 + s_grid // s_parts  # [T, S]
-        self._swizzle_cols = (s_grid % s_parts) * 4 + t_grid % 4  # [T, S]
+        if is_sm_100():
+            s_parts = S // 4
+            self._swizzle_rows = (t_grid // 4) * 4 + s_grid // s_parts  # [T, S]
+            self._swizzle_cols = (s_grid % s_parts) * 4 + t_grid % 4  # [T, S]
+        else:
+            self._swizzle_rows = t_grid
+            self._swizzle_cols = s_grid
 
     def _ensure_global_sf(self, device: torch.device) -> None:
         """Lazily create global scale factor tensors on the right device."""
@@ -156,6 +212,9 @@ class NVFP4KVCacheWriteOp:
             )
             self._v_global_sf = torch.tensor(
                 [_DEFAULT_NVFP4_GLOBAL_SF], dtype=torch.float32, device=device
+            )
+            self._e2m1_thresholds = _E2M1_THRESHOLDS.to(
+                device=device, dtype=torch.float32
             )
             self._swizzle_rows = self._swizzle_rows.to(device)
             self._swizzle_cols = self._swizzle_cols.to(device)
@@ -190,18 +249,26 @@ class NVFP4KVCacheWriteOp:
         k_2d = key.reshape(-1, self.head_size).contiguous()  # [N*H, D]
         v_2d = value.reshape(-1, self.head_size).contiguous()
 
-        k_fp4, k_sf = flashinfer.fp4_quantize(
-            k_2d,
-            self._k_global_sf,
-            sf_vec_size=NVFP4_BLOCK_SIZE,
-            is_sf_swizzled_layout=False,
-        )
-        v_fp4, v_sf = flashinfer.fp4_quantize(
-            v_2d,
-            self._v_global_sf,
-            sf_vec_size=NVFP4_BLOCK_SIZE,
-            is_sf_swizzled_layout=False,
-        )
+        if is_sm_100():
+            k_fp4, k_sf = flashinfer.fp4_quantize(
+                k_2d,
+                self._k_global_sf,
+                sf_vec_size=NVFP4_BLOCK_SIZE,
+                is_sf_swizzled_layout=False,
+            )
+            v_fp4, v_sf = flashinfer.fp4_quantize(
+                v_2d,
+                self._v_global_sf,
+                sf_vec_size=NVFP4_BLOCK_SIZE,
+                is_sf_swizzled_layout=False,
+            )
+        else:
+            k_fp4, k_sf = _quantize_nvfp4_linear_fallback(
+                k_2d, self._k_global_sf, self._e2m1_thresholds
+            )
+            v_fp4, v_sf = _quantize_nvfp4_linear_fallback(
+                v_2d, self._v_global_sf, self._e2m1_thresholds
+            )
 
         # Reshape to [total_tokens, H, ...]
         k_fp4 = k_fp4.view(torch.uint8).reshape(
@@ -210,12 +277,12 @@ class NVFP4KVCacheWriteOp:
         v_fp4 = v_fp4.view(torch.uint8).reshape(
             total_tokens, self.num_kv_heads, self.head_size // 2
         )
-        k_sf = k_sf.view(torch.float8_e4m3fn).reshape(
-            total_tokens, self.num_kv_heads, self.scale_dim
-        )
-        v_sf = v_sf.view(torch.float8_e4m3fn).reshape(
-            total_tokens, self.num_kv_heads, self.scale_dim
-        )
+        if k_sf.dtype == torch.uint8:
+            k_sf = k_sf.view(torch.float8_e4m3fn)
+        if v_sf.dtype == torch.uint8:
+            v_sf = v_sf.view(torch.float8_e4m3fn)
+        k_sf = k_sf.reshape(total_tokens, self.num_kv_heads, self.scale_dim)
+        v_sf = v_sf.reshape(total_tokens, self.num_kv_heads, self.scale_dim)
 
         # 2. Write FP4 data to cache using append_paged_kv_cache
         if kv_cache.kv_cache_base.dim() == 5:
