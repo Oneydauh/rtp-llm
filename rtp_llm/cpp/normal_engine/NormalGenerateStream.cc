@@ -175,35 +175,46 @@ void NormalGenerateStream::updateOutput(const StreamUpdateInfo& update_info) {
         setSoftmaxProbs(update_info.softmax_probs, seqLength() - update_info.num_new_tokens);
     }
 
-    // P2P side-channel: must be before finished_ assignment, because in PD-sep prefill
-    // the first (and only) token generation triggers needFinish()=true, and we need
-    // to send side-channel data before finished_ becomes true.
+    // PD handoff must happen before finished_ assignment.
+    // Old remote-connector PD flow and new decode-entrance(P2P) flow have different
+    // handoff semantics, so keep them in separate branches.
     if (!finished_ && queryPdSep() && update_info.update_remote_generate
         && resourceContext().role_type == RoleType::PREFILL) {
-        reportEventWithoutLock(StreamEvents::NeedRemoteGenerate);
-
-        // Notify P2P side-channel data ready so that waitAndFillResponse can proceed
+        // Keep KV cache alive until decode finishes load cache. Old remote connector
+        // PD flow still relies on this hold/release pairing.
+        holdKVCacheForPDSep();
         auto& rc = resourceContext();
-        if (rc.cache_manager && rc.cache_manager->hasP2PConnector()) {
-            P2PConnectorResourceEntry::SideChannelData side_data;
-            auto                                       tokens = currentExecuteTokens(0);
-            if (!tokens.empty()) {
-                side_data.first_token_id = tokens.back();
+
+        if (rc.decode_entrance) {
+            reportEventWithoutLock(StreamEvents::NeedRemoteGenerate);
+
+            // Notify P2P side-channel data ready so that waitAndFillResponse can proceed.
+            if (rc.cache_manager && rc.cache_manager->hasP2PConnector()) {
+                P2PConnectorResourceEntry::SideChannelData side_data;
+                auto                                       tokens = currentExecuteTokens(0);
+                if (!tokens.empty()) {
+                    side_data.first_token_id = tokens.back();
+                }
+                side_data.total_reuse_len  = reuseLength();
+                side_data.local_reuse_len  = localReuseLength();
+                side_data.remote_reuse_len = remoteReuseLength();
+                side_data.memory_reuse_len = memoryReuseLength();
+                if (getContainProposeToken()) {
+                    side_data.propose_tokens = getProposeToken();
+                }
+                auto pos_ids = getContextPositionIds();
+                if (pos_ids.defined() && pos_ids.numel() > 0) {
+                    auto pos_cpu = pos_ids.to(torch::kCPU).contiguous();
+                    side_data.position_ids.assign(pos_cpu.data_ptr<int32_t>(),
+                                                  pos_cpu.data_ptr<int32_t>() + pos_cpu.numel());
+                }
+                rc.cache_manager->notifySideChannelReady(uniqueKey(), side_data);
             }
-            side_data.total_reuse_len  = reuseLength();
-            side_data.local_reuse_len  = localReuseLength();
-            side_data.remote_reuse_len = remoteReuseLength();
-            side_data.memory_reuse_len = memoryReuseLength();
-            if (getContainProposeToken()) {
-                side_data.propose_tokens = getProposeToken();
-            }
-            auto pos_ids = getContextPositionIds();
-            if (pos_ids.defined() && pos_ids.numel() > 0) {
-                auto pos_cpu = pos_ids.to(torch::kCPU).contiguous();
-                side_data.position_ids.assign(pos_cpu.data_ptr<int32_t>(),
-                                              pos_cpu.data_ptr<int32_t>() + pos_cpu.numel());
-            }
-            rc.cache_manager->notifySideChannelReady(uniqueKey(), side_data);
+        } else {
+            // Old remote-connector PD flow relies on GenerateDone being reported here
+            // to drive the prefill stream state machine to FINISHED.
+            reportEventWithoutLock(StreamEvents::NeedRemoteGenerate);
+            reportEventWithoutLock(StreamEvents::GenerateDone);
         }
     }
 
