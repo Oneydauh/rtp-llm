@@ -1,8 +1,10 @@
 #pragma once
 
+#include <future>
 #include <list>
 #include <memory>
 
+#include <pybind11/pybind11.h>
 #include <torch/all.h>
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -13,6 +15,8 @@
 #include "rtp_llm/cpp/normal_engine/NormalModelInputGatherer.h"
 #include "rtp_llm/cpp/normal_engine/NormalOutputDispatcher.h"
 #include "rtp_llm/cpp/normal_engine/NormalSamplerInputGatherer.h"
+
+namespace py = pybind11;
 
 namespace rtp_llm {
 
@@ -29,6 +33,8 @@ public:
     virtual absl::StatusOr<SamplerInputs>  gatherSamplerInput(const StreamGroups&    stream_groups,
                                                               const GptModelInputs&  model_inputs,
                                                               const GptModelOutputs& model_output) const;
+
+    void applyGrammarConstraints(SamplerInputs& inputs) const;
 
 protected:
     SamplerInputs allocateSamplerInputs(const StreamGroups& stream_groups,
@@ -57,6 +63,14 @@ protected:
     std::unique_ptr<NormalModelInputGatherer>   model_input_gatherer_;
     std::unique_ptr<NormalSamplerInputGatherer> sampler_input_gatherer_;
     std::unique_ptr<NormalOutputDispatcher>     output_dispatcher_;
+    py::module_                                 grammar_batch_ops_;
+    // Thread-safety: written in dispatch() and consumed (get()) in
+    // applyGrammarConstraints(). Both run on the single executor worker
+    // thread, serialized per forward iteration (dispatch -> next forward ->
+    // applyGrammarConstraints). `mutable` is only for the const-qualified
+    // applyGrammarConstraints accessor; no external synchronization is
+    // needed as long as that contract holds.
+    mutable std::future<void> grammar_accept_future_;
 };
 
 }  // namespace rtp_llm

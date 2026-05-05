@@ -114,7 +114,13 @@ struct EngineInitParams {
     py::object                   py_eplb;
     py::object                   py_sp_model;
     py::object                   weight_manager;
-    kmonitor::MetricsReporterPtr metrics_reporter = nullptr;
+    py::object                   grammar_backend = py::none();
+    // Wall-clock timeout (ms) that a single grammar-compile request may sit
+    // in the GrammarManager queue before being force-failed.
+    int64_t grammar_compile_timeout_ms = 60000;
+    // Size of the GrammarManager C++ compile worker pool.
+    int                          grammar_num_workers = 2;
+    kmonitor::MetricsReporterPtr metrics_reporter    = nullptr;
 
 public:
     void showDebugInfo() const {

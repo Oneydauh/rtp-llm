@@ -139,6 +139,19 @@ py_library(
 )
 
 py_library(
+    name = "xgrammar",
+    deps = select({
+        "@//:cuda_pre_12_9": ["@pip_gpu_cuda12_torch//xgrammar"],
+        "@//:using_cuda12_9_x86": ["@pip_gpu_cuda12_9_torch//xgrammar"],
+        "@//:using_cuda12_arm": ["@pip_cuda12_arm_torch//xgrammar"],
+        "@//:using_rocm": ["@pip_gpu_rocm_torch//xgrammar"],
+        "@//:using_arm": ["@pip_arm_torch//xgrammar"],
+        "//conditions:default": ["@pip_cpu_torch//xgrammar"],
+    }),
+    visibility = ["//visibility:public"],
+)
+
+py_library(
     name = "utils",
     srcs = glob([
         "utils/**/*.py",
@@ -185,6 +198,7 @@ py_library(
     deps = [
         ":torch",
         ":utils",
+        ":xgrammar",
     ],
 )
 
@@ -345,9 +359,11 @@ py_library(
     deps = [
         ":utils",
         ":ops",
+        ":xgrammar",
         ":config",
         ":structure",
         "//rtp_llm/cpp/model_rpc:model_rpc_client",
+        "//rtp_llm/models_py/triton_kernels:grammar",
     ],
 )
 

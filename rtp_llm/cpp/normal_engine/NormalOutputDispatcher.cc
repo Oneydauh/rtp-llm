@@ -168,4 +168,70 @@ void NormalOutputDispatcher::dispatchSingleStream(GenerateStreamPtr    stream,
                     all_hidden_states});
 }
 
+std::future<void> NormalOutputDispatcher::batchAcceptGrammarTokensAsync(const StreamGroups&  stream_groups,
+                                                                        const torch::Tensor& token_ids_cpu) const {
+    if (!token_ids_cpu.defined())
+        return {};
+
+    const size_t token_stride  = token_ids_cpu.size(1);
+    int          batch_idx_out = 0;
+
+    py::gil_scoped_acquire         acquire;
+    py::list                       triples;
+    std::vector<GenerateStreamPtr> grammar_streams;
+
+    for (auto& stream : stream_groups.allStreams()) {
+        auto next_batch_size = stream->nextBatchSize();
+        bool has_beam_search = stream->currentNumBeams() > 1 || stream->nextNumBeams() > 1;
+
+        py::object grammar = has_beam_search ? py::none() : stream->tryGetGrammarObject();
+        if (!grammar.is_none()) {
+            int32_t token_id = token_ids_cpu.data_ptr<int32_t>()[batch_idx_out * token_stride + token_stride - 1];
+            bool    is_done  = !stream->isActive();
+            triples.append(py::make_tuple(grammar, token_id, is_done));
+            grammar_streams.push_back(stream);
+        }
+
+        batch_idx_out += next_batch_size;
+    }
+
+    if (triples.empty())
+        return {};
+
+    RTP_LLM_LOG_DEBUG("[xgrammar batch_accept] count=%zu, launching async", grammar_streams.size());
+
+    auto ops_copy     = grammar_batch_ops_;
+    auto streams_copy = std::move(grammar_streams);
+
+    return std::async(
+        std::launch::async,
+        [triples = std::move(triples), ops = std::move(ops_copy), streams = std::move(streams_copy)]() mutable {
+            py::gil_scoped_acquire acquire;
+            try {
+                py::list errors = ops.attr("batch_accept_tokens")(triples).cast<py::list>();
+
+                for (auto& err : errors) {
+                    auto        t   = err.cast<py::tuple>();
+                    int         idx = t[0].cast<int>();
+                    std::string msg = t[1].cast<std::string>();
+                    if (idx >= 0 && idx < (int)streams.size()) {
+                        RTP_LLM_LOG_WARNING(
+                            "[xgrammar batch_accept] stream [%ld] FAILED: %s", streams[idx]->streamId(), msg.c_str());
+                        streams[idx]->reportError(ErrorCode::INVALID_PARAMS, "grammar accept_token error: " + msg);
+                    }
+                }
+            } catch (const py::error_already_set& e) {
+                RTP_LLM_LOG_WARNING("[xgrammar batch_accept] batch call failed: %s", e.what());
+                for (auto& stream : streams) {
+                    stream->reportError(ErrorCode::INVALID_PARAMS, std::string("grammar batch_accept error: ") + e.what());
+                }
+            }
+            // Move Python objects into locals so they are destroyed while GIL is
+            // still held.  Leaving the captures with null internal pointers avoids
+            // Py_DECREF without GIL when the future's shared state is released.
+            { auto tmp = std::move(triples); }
+            { auto tmp = std::move(ops); }
+        });
+}
+
 }  // namespace rtp_llm

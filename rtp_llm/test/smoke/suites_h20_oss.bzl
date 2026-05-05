@@ -216,6 +216,22 @@ def h20_oss_suites():
         ],
     )
 
+    # H20 Grammar (xgrammar) structured-output smoke: exercises json_schema + regex
+    # response_format, and walks through FILE_CACHE_MISS -> FILE_CACHE_HIT ->
+    # MEMORY_CACHE_HIT paths.
+    native.test_suite(
+        name = "smoke_h20_grammar",
+        tests = [
+            smoke_test(
+                name = "qwen2_1_5b_grammar_cache_base",
+                task_info = "data/model/qwen2/q_r_grammar.json",
+                smoke_args = "--act_type BF16 --warm_up 0 --seq_size_per_block 8",
+                gpu_type = ["H20"],
+                envs = ["PYTHONUNBUFFERED=TRUE"],
+            ),
+        ],
+    )
+
 
     # H20 Qwen3.5/Next
     native.test_suite(

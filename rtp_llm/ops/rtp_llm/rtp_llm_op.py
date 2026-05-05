@@ -18,6 +18,7 @@ class RtpLLMOp:
         mm_engine: Optional[MMProcessEngine] = None,
         propose_model: Optional[ProposeModel] = None,
         token_processor: Optional[TokenProcessor] = None,
+        grammar_backend=None,
     ):
         self.engine_config = engine_config
         self.model = model
@@ -25,10 +26,12 @@ class RtpLLMOp:
         self.propose_model = propose_model
         self.ft_op = CppRtpLLMOp()
         self.token_processor = token_processor
+        self.grammar_backend = grammar_backend
 
     def start(self):
         self.weight = self.model.weight
         logging.info("engine_config: %s", self.engine_config.to_string())
+        grammar_config = self.engine_config.grammar_config
         self.ft_op.init(  # type: ignore
             self.model,
             self.engine_config,
@@ -36,6 +39,9 @@ class RtpLLMOp:
             self.mm_engine,
             self.propose_model,
             self.token_processor,
+            self.grammar_backend,
+            int(grammar_config.compile_timeout_ms),
+            int(grammar_config.num_workers),
         )
 
     def stop(self):

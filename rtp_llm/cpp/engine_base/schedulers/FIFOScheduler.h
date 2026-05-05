@@ -8,6 +8,7 @@
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateTypes.h"
 #include "rtp_llm/cpp/engine_base/schedulers/SchedulerBase.h"
+#include "rtp_llm/cpp/engine_base/schedulers/GrammarManager.h"
 #include "kmonitor/client/MetricsReporter.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/engine_base/schedulers/EngineScheduleInfo.h"
@@ -21,8 +22,11 @@ public:
                            const ParallelismConfig&               parallelism_config,
                            const ModelSpecificConfig&             model_specific_config,
                            const std::shared_ptr<KVCacheManager>& cache_manager,
-                           const kmonitor::MetricsReporterPtr     metrics_reporter = nullptr,
-                           const int                              max_score_len    = 1);
+                           py::object                             grammar_backend,
+                           int                                    grammar_num_workers        = 2,
+                           int64_t                                grammar_compile_timeout_ms = 60000,
+                           const kmonitor::MetricsReporterPtr     metrics_reporter           = nullptr,
+                           const int                              max_score_len              = 1);
 
     ~FIFOScheduler() override;
 
@@ -84,6 +88,8 @@ protected:
 
     std::vector<EngineScheduleInfo::TaskInfo> waiting_task_list_;
     std::vector<EngineScheduleInfo::TaskInfo> running_task_list_;
+    py::object                                grammar_backend_;
+    std::unique_ptr<GrammarManager>           grammar_manager_;
 
     // TODO @wangyin support different beams run togather
 };

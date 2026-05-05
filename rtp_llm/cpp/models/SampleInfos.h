@@ -4,6 +4,7 @@
 #include "rtp_llm/models_py/bindings/core/Types.h"
 #include "rtp_llm/models_py/bindings/core/OpData.h"
 #include "rtp_llm/cpp/utils/TensorDebugUtils.h"
+#include <pybind11/pybind11.h>
 
 namespace rtp_llm {
 
@@ -35,6 +36,8 @@ public:
     LogitsProcessorStatesPtr logits_processor_states_ptr;
 
     size_t vocab_size;
+    // Original tokenizer/model vocab size (non-padded).
+    size_t origin_vocab_size = 0;
     size_t step;  // typically largest sequence length in the batch
 
     size_t        batch_size;            // sum of all num_beams_in of all streams
@@ -53,6 +56,9 @@ public:
 
     mutable torch::Tensor cum_log_probs;  // shape: [batch_size]
     mutable torch::Tensor all_probs;      // shape: [batch_size, vocab_size]
+
+    // Request-scoped grammar objects aligned with sampler batch rows.
+    std::vector<py::object> grammar_objs;
 
     std::vector<at::Generator> generator;
 };

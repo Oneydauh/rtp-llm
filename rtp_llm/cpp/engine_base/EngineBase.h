@@ -11,6 +11,7 @@
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include "rtp_llm/models_py/bindings/core/DeviceData.h"
 #include "rtp_llm/cpp/disaggregate/cache_store/NormalCacheStore.h"
+#include <pybind11/pybind11.h>
 
 namespace rtp_llm {
 
@@ -95,8 +96,11 @@ protected:
     MlaOpsType                     mla_ops_type_       = MlaOpsType::AUTO;
     int32_t                        kv_cache_group_num_ = 1;
     std::vector<int32_t>           kv_cache_layer_to_group_;
-    std::unique_ptr<SchedulerBase> scheduler_ = nullptr;
-    bool                           pause_     = false;
+    py::object                     grammar_backend_            = py::none();
+    int64_t                        grammar_compile_timeout_ms_ = 60000;
+    int                            grammar_num_workers_        = 2;
+    std::unique_ptr<SchedulerBase> scheduler_                  = nullptr;
+    bool                           pause_                      = false;
 };
 
 }  // namespace rtp_llm

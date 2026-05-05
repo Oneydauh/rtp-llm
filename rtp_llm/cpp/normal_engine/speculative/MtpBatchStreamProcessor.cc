@@ -1,8 +1,12 @@
 #include "rtp_llm/cpp/normal_engine/speculative/MtpBatchStreamProcessor.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
+#include "rtp_llm/cpp/pybind/PyUtils.h"
+#include "rtp_llm/cpp/utils/ErrorCode.h"
+#include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/utils/TensorDebugUtils.h"
 #include "rtp_llm/cpp/utils/StringUtil.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
+#include <future>
 #include <numeric>
 #include <cstring>
 
@@ -506,6 +510,112 @@ void MtpBatchStreamProcessor::gatherHiddenStates(const StreamGroups& stream_grou
     }
 
     model_input.last_hidden_states = all_hidden_states;
+}
+
+void MtpBatchStreamProcessor::applySpecGrammarConstraints(SamplerInputs&       inputs,
+                                                          const StreamGroups&  stream_groups,
+                                                          const torch::Tensor& draft_token_ids,
+                                                          size_t               propose_step) const {
+    py::gil_scoped_acquire acquire;
+
+    auto all_streams = stream_groups.allStreams();
+    bool has_grammar = false;
+    for (auto& stream : all_streams) {
+        py::object grammar = stream->tryGetGrammarObject();
+        if (!grammar.is_none()) {
+            has_grammar = true;
+            break;
+        }
+    }
+    if (!has_grammar) {
+        return;
+    }
+
+    size_t   score_len = propose_step + 1;
+    py::list stream_grammars;
+    int      stream_idx = 0;
+
+    for (auto& stream : all_streams) {
+        py::object grammar = stream->tryGetGrammarObject();
+        if (grammar.is_none()) {
+            stream_grammars.append(py::make_tuple(py::none(), py::list()));
+        } else {
+            py::list   draft_tokens;
+            const int* token_ptr = draft_token_ids.data_ptr<int>() + stream_idx * draft_token_ids.size(1);
+            for (size_t k = 1; k <= propose_step; ++k) {
+                draft_tokens.append(token_ptr[k]);
+            }
+            stream_grammars.append(py::make_tuple(grammar, draft_tokens));
+        }
+        stream_idx++;
+    }
+
+    py::object logits_py = convertTensorToObject(inputs.logits);
+    grammar_batch_ops_.attr("batch_apply_spec_grammar_constraints")(stream_grammars, logits_py, (int)score_len);
+}
+
+std::future<void> MtpBatchStreamProcessor::batchAcceptSpecGrammarTokensAsync(
+    const StreamGroups& stream_groups, const speculative::SpeculativeSamplerOutput& spec_output) const {
+
+    py::gil_scoped_acquire         acquire;
+    py::list                       triples;
+    std::vector<GenerateStreamPtr> grammar_streams;
+
+    int stream_idx = 0;
+    for (auto& stream : stream_groups.allStreams()) {
+        py::object grammar = stream->tryGetGrammarObject();
+        if (!grammar.is_none()) {
+            size_t     accept_len = spec_output.accept_len[stream_idx];
+            const int* token_ptr  = spec_output.accept_tokens[stream_idx].data_ptr<int>();
+
+            py::list token_ids;
+            for (size_t k = 0; k < accept_len; ++k) {
+                token_ids.append(token_ptr[k]);
+            }
+
+            bool is_done = !stream->isActive();
+            triples.append(py::make_tuple(grammar, token_ids, is_done));
+            grammar_streams.push_back(stream);
+        }
+        stream_idx++;
+    }
+
+    if (triples.empty()) {
+        return {};
+    }
+
+    RTP_LLM_LOG_INFO("[xgrammar spec_accept] count=%zu, launching async", grammar_streams.size());
+
+    auto ops_copy     = grammar_batch_ops_;
+    auto streams_copy = std::move(grammar_streams);
+
+    return std::async(
+        std::launch::async,
+        [triples = std::move(triples), ops = std::move(ops_copy), streams = std::move(streams_copy)]() mutable {
+            py::gil_scoped_acquire acquire;
+            try {
+                py::list errors = ops.attr("batch_accept_spec_tokens")(triples).cast<py::list>();
+
+                for (auto& err : errors) {
+                    auto        t   = err.cast<py::tuple>();
+                    int         idx = t[0].cast<int>();
+                    std::string msg = t[1].cast<std::string>();
+                    if (idx >= 0 && idx < (int)streams.size()) {
+                        RTP_LLM_LOG_WARNING(
+                            "[xgrammar spec_accept] stream [%ld] FAILED: %s", streams[idx]->streamId(), msg.c_str());
+                        streams[idx]->reportError(ErrorCode::INVALID_PARAMS, "grammar spec accept_token error: " + msg);
+                    }
+                }
+            } catch (const py::error_already_set& e) {
+                RTP_LLM_LOG_WARNING("[xgrammar spec_accept] batch call failed: %s", e.what());
+                for (auto& stream : streams) {
+                    stream->reportError(ErrorCode::INVALID_PARAMS,
+                                        std::string("grammar spec batch_accept error: ") + e.what());
+                }
+            }
+            { auto tmp = std::move(triples); }
+            { auto tmp = std::move(ops); }
+        });
 }
 
 }  // namespace rtp_llm

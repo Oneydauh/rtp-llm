@@ -27,10 +27,12 @@ public:
     };
     BatchDecodeScheduler(const RuntimeConfig&                   runtime_config,
                          const std::shared_ptr<KVCacheManager>& cache_manager,
+                         py::object                             grammar_backend,
                          const kmonitor::MetricsReporterPtr     metrics_reporter,
                          int                                    dp_rank = 0) {
         cache_manager_    = cache_manager;
         metrics_reporter_ = metrics_reporter;
+        grammar_backend_  = grammar_backend;
         batch_size_       = runtime_config.batch_decode_scheduler_config.batch_decode_scheduler_batch_size;
         scheduler_type_   = SchedulerType::kBatchDecode;
         dp_rank_          = dp_rank;
@@ -238,6 +240,7 @@ private:
 
     std::shared_ptr<KVCacheManager> cache_manager_;
     kmonitor::MetricsReporterPtr    metrics_reporter_;
+    py::object                      grammar_backend_ = py::none();
     SchedulerType                   scheduler_type_;
     int                             dp_rank_ = 0;
 };

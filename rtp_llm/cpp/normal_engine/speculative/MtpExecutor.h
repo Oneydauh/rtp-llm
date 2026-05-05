@@ -1,5 +1,6 @@
 #pragma once
 
+#include <future>
 #include <memory>
 #include "kmonitor/client/MetricsReporter.h"
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
@@ -134,6 +135,11 @@ private:
 
     bool     warm_up_;
     RoleType role_type_;
+    // Thread-safety: populated at the end of decodeStep() (post-dispatch)
+    // and consumed (get()) at the start of the next decodeStep() target-
+    // sample block. Both points execute on the same executor thread in
+    // strict temporal order, so no synchronization is required.
+    mutable std::future<void> grammar_accept_future_;
 
     // group id tensors
     torch::Tensor target_kv_cache_layer_to_group;

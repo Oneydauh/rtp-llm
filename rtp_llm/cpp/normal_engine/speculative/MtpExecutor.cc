@@ -22,6 +22,20 @@
 
 namespace rtp_llm {
 
+namespace {
+// True iff any stream in the group requested grammar-guided decoding.
+bool streamGroupsHaveGrammar(const StreamGroups& stream_groups) {
+    for (const auto& s : stream_groups.allStreams()) {
+        const auto& cfg = s->generateConfig();
+        if (cfg->json_schema.has_value() || cfg->regex.has_value() || cfg->ebnf.has_value()
+            || cfg->structural_tag.has_value()) {
+            return true;
+        }
+    }
+    return false;
+}
+}  // namespace
+
 bool MtpExecutor::isTpRank0() const {
     return tp_rank_ == 0;
 }
@@ -376,6 +390,9 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         } else {
             CHECK_AND_RETURN_REF(sampler_input,
                                  batch_stream_processor_->gatherSamplerInput(stream_groups, model_input, model_output));
+            if (streamGroupsHaveGrammar(stream_groups)) {
+                batch_stream_processor_->applyGrammarConstraints(sampler_input);
+            }
             sampler_output = std::move(sampler_->forward(sampler_input));
             batch_stream_processor_->updatePrefillPostDraftModelInput(model_input, model_output, sampler_output);
         }
@@ -649,6 +666,30 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             CHECK_AND_RETURN_REF(
                 sampler_input,
                 batch_stream_processor_->gatherSpecSamplerInput(stream_groups, model_input, model_output));
+
+            // grammar bitmask via DFS accept/rollback — only when grammar is requested
+            if (streamGroupsHaveGrammar(stream_groups)) {
+                if (grammar_accept_future_.valid()) {
+                    grammar_accept_future_.get();
+                }
+                torch::Tensor draft_tokens_for_grammar;
+                if (propose_step_ == 1) {
+                    draft_tokens_for_grammar = torch::empty({(int64_t)batch_size, 2}, torch::kInt32);
+                    int idx                  = 0;
+                    for (auto& stream : stream_groups.allStreams()) {
+                        auto sp_buf = stream->getSPOutputBuffer();
+                        memcpy(draft_tokens_for_grammar.data_ptr<int>() + idx * 2,
+                               sp_buf->tokens.data_ptr<int>(),
+                               2 * sizeof(int));
+                        idx++;
+                    }
+                } else {
+                    draft_tokens_for_grammar = draft_token_ids_t.cpu();
+                }
+                batch_stream_processor_->applySpecGrammarConstraints(
+                    sampler_input, stream_groups, draft_tokens_for_grammar, propose_step_);
+            }
+
             sampler_output           = std::move(sampler_->forward(sampler_input));
             sampler_output.all_probs = sampler_output.all_probs.reshape(
                 {(int64_t)batch_size, (int64_t)(propose_step_ + 1), (int64_t)vocab_size_});
@@ -726,6 +767,13 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             stream_groups,
             speculative_sampler_output,
             {std::move(draft_prefill_model_output), std::move(draft_prefill_sampler_output)});
+
+        // async grammar accept for verified tokens — only when grammar is requested
+        if (streamGroupsHaveGrammar(stream_groups)) {
+            grammar_accept_future_ =
+                batch_stream_processor_->batchAcceptSpecGrammarTokensAsync(stream_groups, speculative_sampler_output);
+        }
+
         // clean holder tensors from grpc
         for (auto& stream : streams) {
             stream->getSPOutputBuffer()->tensors_holder.clear();

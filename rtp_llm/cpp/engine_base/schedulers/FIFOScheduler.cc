@@ -3,11 +3,13 @@
 #include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
+#include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/cpp/cache/Types.h"
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <thread>
 
 using namespace std;
 namespace rtp_llm {
@@ -18,6 +20,9 @@ FIFOScheduler::FIFOScheduler(const RuntimeConfig&                   runtime_conf
                              const ParallelismConfig&               parallelism_config,
                              const ModelSpecificConfig&             model_specific_config,
                              const std::shared_ptr<KVCacheManager>& cache_manager,
+                             py::object                             grammar_backend,
+                             int                                    grammar_num_workers,
+                             int64_t                                grammar_compile_timeout_ms,
                              const kmonitor::MetricsReporterPtr     metrics_reporter,
                              const int                              max_score_len):
     pd_sep_config_(pd_sep_config),
@@ -27,7 +32,10 @@ FIFOScheduler::FIFOScheduler(const RuntimeConfig&                   runtime_conf
     max_batch_tokens_size_(runtime_config.fifo_scheduler_config.max_batch_tokens_size),
     max_generate_batch_size_(runtime_config.max_generate_batch_size),
     need_fill_fake_stream_(parallelism_config.dp_size > 1 && parallelism_config.tp_rank == 0),
-    metrics_reporter_(metrics_reporter) {
+    metrics_reporter_(metrics_reporter),
+    grammar_backend_(std::move(grammar_backend)) {
+    grammar_manager_ =
+        std::make_unique<GrammarManager>(grammar_backend_, grammar_num_workers, grammar_compile_timeout_ms);
     RTP_LLM_LOG_INFO("max_generate_batch_size is [%d], max_batch_tokens_size is [%d]",
                      max_generate_batch_size_,
                      max_batch_tokens_size_);
@@ -40,7 +48,8 @@ FIFOScheduler::~FIFOScheduler() {
 
 bool FIFOScheduler::empty() {
     lock_guard<mutex> lock(lock_);
-    return waiting_streams_.empty() && loading_cache_streams_.empty() && running_streams_.empty();
+    return waiting_streams_.empty() && loading_cache_streams_.empty() && running_streams_.empty()
+           && (!grammar_manager_ || !grammar_manager_->has_waiting_grammars());
 }
 
 void FIFOScheduler::cancelStreams(std::list<GenerateStreamPtr>& streams) {
@@ -87,7 +96,18 @@ absl::Status FIFOScheduler::enqueue(const GenerateStreamPtr& stream) {
     if (!checkInputLength(stream)) {
         return absl::InvalidArgumentError("Check input length failed");
     }
-    {
+    bool in_grammar_queue = false;
+    if (grammar_manager_) {
+        in_grammar_queue = grammar_manager_->process_req_with_grammar(stream);
+        RTP_LLM_LOG_DEBUG("stream [%ld] enqueue after grammar preprocess: active=%d, in_grammar_queue=%d",
+                          stream->streamId(),
+                          static_cast<int>(stream->isActive()),
+                          static_cast<int>(in_grammar_queue));
+        if (!stream->isActive()) {
+            return absl::OkStatus();
+        }
+    }
+    if (!in_grammar_queue) {
         std::lock_guard<std::mutex> lock(lock_);
         waiting_streams_.emplace_back(stream);
         schedule_trigger_ = true;
@@ -101,16 +121,23 @@ std::vector<std::shared_ptr<GenerateStream>> FIFOScheduler::batchEnqueue(const v
     // Preserve 1:1 correspondence with the caller's input vector: failing streams are still
     // returned (already marked errored by checkInputLength via reportError) but only valid ones
     // enter the waiting queue.
-    std::vector<std::shared_ptr<GenerateStream>> stream_enqueued;
-    stream_enqueued.reserve(streams.size());
+    std::vector<std::shared_ptr<GenerateStream>> ready_streams;
+    ready_streams.reserve(streams.size());
     for (const auto& stream : streams) {
-        if (checkInputLength(stream)) {
-            stream_enqueued.emplace_back(stream);
+        if (!checkInputLength(stream)) {
+            continue;
         }
+        if (grammar_manager_) {
+            bool in_grammar_queue = grammar_manager_->process_req_with_grammar(stream);
+            if (!stream->isActive() || in_grammar_queue) {
+                continue;
+            }
+        }
+        ready_streams.emplace_back(stream);
     }
     {
         std::lock_guard<std::mutex> lock(lock_);
-        waiting_streams_.insert(waiting_streams_.end(), stream_enqueued.begin(), stream_enqueued.end());
+        waiting_streams_.insert(waiting_streams_.end(), ready_streams.begin(), ready_streams.end());
         schedule_trigger_ = true;
     }
     cond_.notify_all();
@@ -155,7 +182,7 @@ void FIFOScheduler::accountBatchMetrics(const GenerateStreamPtr& new_stream) {
 bool FIFOScheduler::waitPredicate() {
     // Check streams directly without calling empty() which acquires lock_ (already held by schedule())
     return stop_ || schedule_trigger_ || !waiting_streams_.empty() || !loading_cache_streams_.empty()
-           || !running_streams_.empty();
+           || !running_streams_.empty() || (grammar_manager_ && grammar_manager_->has_waiting_grammars());
 }
 
 // 通过 GenerateStateMachine 驱动每个 stream 的状态转移，状态变化的 stream 移入对应队列
@@ -269,6 +296,9 @@ void FIFOScheduler::addStreamToNewState(const GenerateStreamPtr& stream, StreamS
             new_streams_.push_back(stream);
             break;
         case StreamState::FINISHED:
+            if (grammar_manager_) {
+                grammar_manager_->cleanupStream(stream);
+            }
             break;
         default:
             RTP_LLM_LOG_ERROR("Unknown state: %d for stream [%ld]", static_cast<int>(new_state), stream->streamId());
@@ -285,6 +315,17 @@ absl::StatusOr<list<GenerateStreamPtr>> FIFOScheduler::schedule() {
     }
 
     schedule_trigger_ = false;
+
+    if (grammar_manager_ && grammar_manager_->has_waiting_grammars()) {
+        size_t                       waiting_before = waiting_streams_.size();
+        std::list<GenerateStreamPtr> grammar_ready  = grammar_manager_->get_ready_grammar_requests();
+        size_t                       ready_count    = grammar_ready.size();
+        waiting_streams_.splice(waiting_streams_.begin(), grammar_ready);
+        RTP_LLM_LOG_DEBUG("schedule grammar backfill: ready_count=%zu, waiting_before=%zu, waiting_after=%zu",
+                          ready_count,
+                          waiting_before,
+                          waiting_streams_.size());
+    }
 
     // LOADING_CACHE -> DONE/WAITING: error / load cache done
     evaluateAndUpdateStreams(loading_cache_streams_);

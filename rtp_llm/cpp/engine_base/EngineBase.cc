@@ -10,6 +10,9 @@ namespace rtp_llm {
 
 EngineBase::EngineBase(const EngineInitParams& params) {
     initRuntime(params);
+    grammar_backend_            = params.grammar_backend;
+    grammar_compile_timeout_ms_ = params.grammar_compile_timeout_ms;
+    grammar_num_workers_        = params.grammar_num_workers;
 }
 
 EngineBase::~EngineBase() {}

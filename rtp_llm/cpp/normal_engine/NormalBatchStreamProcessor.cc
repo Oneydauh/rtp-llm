@@ -1,4 +1,5 @@
 #include "rtp_llm/cpp/normal_engine/NormalBatchStreamProcessor.h"
+#include "rtp_llm/cpp/pybind/PyUtils.h"
 
 namespace rtp_llm {
 
@@ -31,12 +32,22 @@ NormalBatchStreamProcessor::NormalBatchStreamProcessor(
 
     model_input_gatherer_   = std::make_unique<NormalModelInputGatherer>(model_input_gatherer_config_);
     sampler_input_gatherer_ = std::make_unique<NormalSamplerInputGatherer>();
-    output_dispatcher_      = std::make_unique<NormalOutputDispatcher>();
+    {
+        py::gil_scoped_acquire acquire;
+        grammar_batch_ops_ = py::module_::import("rtp_llm.async_decoder_engine.grammar_batch_ops");
+    }
+    output_dispatcher_ = std::make_unique<NormalOutputDispatcher>(grammar_batch_ops_);
 }
 
 absl::Status NormalBatchStreamProcessor::dispatch(const StreamGroups& stream_groups,
                                                   const MergedOutput& merge_outputs) const {
-    return output_dispatcher_->dispatch(stream_groups, merge_outputs);
+    auto status = output_dispatcher_->dispatch(stream_groups, merge_outputs);
+    if (status.ok()) {
+        const auto&         token_ids     = merge_outputs.sampler_output.token_ids;
+        const torch::Tensor token_ids_cpu = token_ids.defined() ? token_ids.cpu() : torch::Tensor();
+        grammar_accept_future_ = output_dispatcher_->batchAcceptGrammarTokensAsync(stream_groups, token_ids_cpu);
+    }
+    return status;
 }
 
 absl::StatusOr<GptModelInputs> NormalBatchStreamProcessor::gatherModelInput(const StreamGroups& stream_groups) const {
@@ -67,6 +78,44 @@ void NormalBatchStreamProcessor::setLogitsProcessorInputs(SamplerInputs&        
                                                           std::list<GenerateStreamPtr>& all_streams,
                                                           bool                          score_batch) const {
     sampler_input_gatherer_->setLogitsProcessorInputs(sampler_inputs, all_streams, score_batch);
+}
+
+void NormalBatchStreamProcessor::applyGrammarConstraints(SamplerInputs& inputs) const {
+    // Fast-path probe without GIL. `py::object::is_none()` is implemented as
+    // `ptr() == Py_None` — a pure C++ pointer compare against a static CPython
+    // singleton, with no refcount / heap / interpreter interaction. That is
+    // GIL-independent. Safety here additionally relies on two invariants:
+    //   (a) `inputs.grammar_objs` was populated upstream on this same
+    //       executor thread by `gatherSamplerInput` and is not concurrently
+    //       mutated during this forward, so there is no data race on the
+    //       stored PyObject* members.
+    //   (b) `gatherSamplerInput` always fills each slot with either
+    //       `py::none()` or a real grammar object — never a default-
+    //       constructed empty handle (nullptr), which `is_none()` would
+    //       (correctly per its spec, but misleadingly for us) report as
+    //       NOT-None and push us into the GIL-held slow path below.
+    auto& grammar_objs = inputs.grammar_objs;
+    bool  has_grammar  = false;
+    for (auto& obj : grammar_objs) {
+        if (!obj.is_none()) {
+            has_grammar = true;
+            break;
+        }
+    }
+    if (!has_grammar && !grammar_accept_future_.valid()) {
+        return;
+    }
+
+    if (grammar_accept_future_.valid()) {
+        grammar_accept_future_.get();
+    }
+    if (!has_grammar) {
+        return;
+    }
+
+    py::gil_scoped_acquire acquire;
+    py::object             logits_py = convertTensorToObject(inputs.logits);
+    grammar_batch_ops_.attr("batch_apply_grammar_constraints")(grammar_objs, logits_py);
 }
 
 }  // namespace rtp_llm

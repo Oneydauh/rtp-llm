@@ -1,5 +1,6 @@
 #include <memory>
 #include <chrono>
+#include <optional>
 #include "rtp_llm/cpp/engine_base/stream/GenerateTypes.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
@@ -170,6 +171,21 @@ grpc::Status LocalRpcServer::GenerateStreamCall(grpc::ServerContext*            
         if (!mm_res.ok()) {
             generate_context.error_status = serializeErrorMsg(generate_context.request_key, mm_res);
         }
+    }
+    if (input && input->generate_config) {
+        const std::string json_schema     = input->generate_config->json_schema.value_or("");
+        const std::string regex           = input->generate_config->regex.value_or("");
+        const std::string ebnf            = input->generate_config->ebnf.value_or("");
+        const std::string structural_tag  = input->generate_config->structural_tag.value_or("");
+        const std::string response_format = input->generate_config->response_format.value_or("");
+        RTP_LLM_LOG_DEBUG(
+            "request [%ld] grammar params: json_schema=%s, regex=%s, ebnf=%s, structural_tag=%s, response_format=%s",
+            request_id,
+            json_schema.c_str(),
+            regex.c_str(),
+            ebnf.c_str(),
+            structural_tag.c_str(),
+            response_format.c_str());
     }
     CHECK_ERROR_STATUS(generate_context);
 

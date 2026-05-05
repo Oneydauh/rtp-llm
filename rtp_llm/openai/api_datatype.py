@@ -121,6 +121,20 @@ class GPTToolDefinition(BaseModel):
     function: GPTFunctionDefinition
 
 
+class ResponseFormatJSONSchema(BaseModel):
+    name: Optional[str] = None
+    schema: Optional[Dict[str, Any]] = None
+    strict: Optional[bool] = None
+
+
+class ResponseFormat(BaseModel):
+    type: str  # json_schema | json_object | regex | ebnf | structural_tag
+    json_schema: Optional[ResponseFormatJSONSchema] = None  # for type=json_schema
+    pattern: Optional[str] = None  # for type=regex
+    grammar: Optional[str] = None  # for type=ebnf
+    structural_tag: Optional[Dict[str, Any]] = None  # for type=structural_tag
+
+
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = None
     messages: List[ChatMessage]
@@ -136,6 +150,7 @@ class ChatCompletionRequest(BaseModel):
     n: Optional[int] = None
     logprobs: Optional[bool] = None
     top_logprobs: Optional[int] = None
+    response_format: Optional[ResponseFormat] = None
 
     # ---- These functions are not implemented yet.
     # presence_penalty: Optional[float] = 0.0

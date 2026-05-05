@@ -5,6 +5,10 @@ from typing import Dict, Optional
 from typing_extensions import override
 
 from rtp_llm.async_decoder_engine.base_engine import BaseEngine
+from rtp_llm.async_decoder_engine.base_grammar_backend import (
+    InvalidGrammarObject,
+    create_grammar_backend,
+)
 from rtp_llm.config.engine_config import EngineConfig
 from rtp_llm.frontend.token_processor import TokenProcessor
 from rtp_llm.models.base_model import BaseModel
@@ -44,8 +48,31 @@ class LanguageCppEngine(BaseEngine):
             self.mm_engine = MMProcessEngine(self.model, self.model.vit_config)
         else:
             self.mm_engine = None
+
+        tokenizer = self.model.tokenizer.tokenizer
+        vocab_size = self.config.vocab_size
+        grammar_config = engine_config.grammar_config
+        from rtp_llm.async_decoder_engine.grammar_cache import resolve_grammar_cache_dir
+
+        self.grammar_backend = create_grammar_backend(
+            grammar_backend=grammar_config.grammar_backend,
+            constrained_json_disable_any_whitespace=grammar_config.constrained_json_disable_any_whitespace,
+            reasoning_parser=grammar_config.reasoning_parser,
+            tokenizer=tokenizer,
+            vocab_size=vocab_size,
+            eos_token_ids=None,
+            cache_dir=resolve_grammar_cache_dir(grammar_config.cache_dir),
+        )
+        if self.grammar_backend is not None:
+            # Bind class handle once in Python creation path.
+            self.grammar_backend._invalid_grammar_cls = InvalidGrammarObject
         self.rtp_llm_op_ = RtpLLMOp(
-            engine_config, model, self.mm_engine, propose_model, self.token_processor
+            engine_config,
+            model,
+            self.mm_engine,
+            propose_model,
+            self.token_processor,
+            self.grammar_backend,
         )
 
     @timer_wrapper(description="start async engine")

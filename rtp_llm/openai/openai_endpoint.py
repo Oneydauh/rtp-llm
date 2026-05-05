@@ -164,6 +164,32 @@ class OpenaiEndpoint(object):
     ) -> List[List[int]]:
         return [i for i, _ in itertools.groupby(sorted(stop_words_list))]
 
+    @staticmethod
+    def _apply_response_format(rf: "ResponseFormat", config: GenerateConfig) -> None:
+        """Extract grammar constraints from a typed ResponseFormat into GenerateConfig fields."""
+        config.json_schema = None
+        config.regex = None
+        config.ebnf = None
+        config.structural_tag = None
+        if rf.type == "json_schema":
+            if rf.json_schema and rf.json_schema.schema is not None:
+                config.json_schema = json.dumps(
+                    rf.json_schema.schema, ensure_ascii=False, separators=(",", ":")
+                )
+        elif rf.type == "json_object":
+            config.json_schema = json.dumps({"type": "object"})
+        elif rf.type == "regex":
+            if rf.pattern:
+                config.regex = rf.pattern
+        elif rf.type == "ebnf":
+            if rf.grammar:
+                config.ebnf = rf.grammar
+        elif rf.type == "structural_tag":
+            if rf.structural_tag:
+                config.structural_tag = json.dumps(
+                    rf.structural_tag, ensure_ascii=False, separators=(",", ":")
+                )
+
     def _extract_generation_config(
         self, request: ChatCompletionRequest
     ) -> GenerateConfig:
@@ -212,6 +238,9 @@ class OpenaiEndpoint(object):
             and isinstance(request.extra_configs.max_thinking_tokens, int)
         ):
             config.max_thinking_tokens = request.extra_configs.max_thinking_tokens
+        # Structured output: extract grammar constraints from response_format.
+        if request.response_format is not None:
+            self._apply_response_format(request.response_format, config)
         # add_thinking_params now accepts generate_env_config parameter
         config.add_thinking_params(self.tokenizer, self.generate_env_config)
         if request.debug_info:

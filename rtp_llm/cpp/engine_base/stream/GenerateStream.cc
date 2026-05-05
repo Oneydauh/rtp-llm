@@ -1007,6 +1007,45 @@ int GenerateStream::reuseBlockSize() const {
     return reuse_length / seq_size_per_block;
 }
 
+void GenerateStream::setGrammarObject(const py::object& grammar) {
+    std::lock_guard<std::mutex> lock(*mutex_);
+    py::gil_scoped_acquire      acquire;
+    grammar_obj_ = grammar;
+}
+
+py::object GenerateStream::grammarObject() const {
+    std::lock_guard<std::mutex> lock(*mutex_);
+    py::gil_scoped_acquire      acquire;
+    if (!grammar_obj_) {
+        return py::none();
+    }
+    return grammar_obj_;
+}
+
+bool GenerateStream::hasGrammarObject() const {
+    std::lock_guard<std::mutex> lock(*mutex_);
+    py::gil_scoped_acquire      acquire;
+    if (!grammar_obj_) {
+        return false;
+    }
+    return !grammar_obj_.is_none();
+}
+
+py::object GenerateStream::tryGetGrammarObject() const {
+    std::lock_guard<std::mutex> lock(*mutex_);
+    py::gil_scoped_acquire      acquire;
+    if (!grammar_obj_ || grammar_obj_.is_none()) {
+        return py::none();
+    }
+    return grammar_obj_;
+}
+
+void GenerateStream::clearGrammarObject() {
+    std::lock_guard<std::mutex> lock(*mutex_);
+    py::gil_scoped_acquire      acquire;
+    grammar_obj_ = py::none();
+}
+
 void GenerateStream::setSeqLength(int seq_length) {
     complete_token_ids_->setSeqLength(seq_length);
 }

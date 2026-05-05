@@ -17,6 +17,14 @@ public:
         NormalBatchStreamProcessor(model_config, pd_sep_config, profiling_debug_logging_config, cache_config, warm_up),
         propose_step_(sp_config.gen_num_per_cycle) {}
 
+    void applySpecGrammarConstraints(SamplerInputs&       inputs,
+                                     const StreamGroups&  stream_groups,
+                                     const torch::Tensor& draft_token_ids,
+                                     size_t               propose_step) const;
+
+    std::future<void> batchAcceptSpecGrammarTokensAsync(const StreamGroups&                          stream_groups,
+                                                        const speculative::SpeculativeSamplerOutput& spec_output) const;
+
     absl::Status dispatchPrefill(const StreamGroups& stream_groups,
                                  const MergedOutput& prefill_output,
                                  const MergedOutput& propose_output) const;

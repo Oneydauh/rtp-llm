@@ -108,10 +108,14 @@ void RtpLLMOp::init(py::object model,
                     py::object vit_config,
                     py::object mm_process_engine,
                     py::object propose_model,
-                    py::object token_processor) {
+                    py::object token_processor,
+                    py::object grammar_backend,
+                    int64_t    grammar_compile_timeout_ms,
+                    int        grammar_num_workers) {
     RTP_LLM_LOG_DEBUG(__PRETTY_FUNCTION__);
 
-    EngineInitParams params = initModel(model, engine_config, vit_config);
+    EngineInitParams params =
+        initModel(model, engine_config, vit_config, grammar_backend, grammar_compile_timeout_ms, grammar_num_workers);
 
     if (!propose_model.is_none()) {
         if (!propose_model.attr("model").is_none()) {
@@ -136,7 +140,12 @@ void RtpLLMOp::init(py::object model,
     }
 }
 
-EngineInitParams RtpLLMOp::initModel(py::object model, py::object engine_config, py::object vit_config) {
+EngineInitParams RtpLLMOp::initModel(py::object model,
+                                     py::object engine_config,
+                                     py::object vit_config,
+                                     py::object grammar_backend,
+                                     int64_t    grammar_compile_timeout_ms,
+                                     int        grammar_num_workers) {
     try {
         // Get model_config from model
         auto model_config = model.attr("model_config").cast<ModelConfig>();
@@ -206,8 +215,11 @@ EngineInitParams RtpLLMOp::initModel(py::object model, py::object engine_config,
                                 py_model,
                                 weight_manager,
                                 py_eplb);
-        params.nccl_comm_config = engine_config.attr("nccl_comm_config").cast<NcclCommConfig>();
-        params.server_config    = engine_config.attr("server_config");
+        params.nccl_comm_config           = engine_config.attr("nccl_comm_config").cast<NcclCommConfig>();
+        params.server_config              = engine_config.attr("server_config");
+        params.grammar_backend            = std::move(grammar_backend);
+        params.grammar_compile_timeout_ms = grammar_compile_timeout_ms;
+        params.grammar_num_workers        = grammar_num_workers;
         model_id_++;
         if (parallelism_config.tp_rank == 0) {
             // kmon metric init
@@ -405,7 +417,10 @@ void registerRtpLLMOp(const py::module& m) {
              py::arg("vit_config"),
              py::arg("mm_process_engine"),
              py::arg("propose_model"),
-             py::arg("token_processor"))
+             py::arg("token_processor"),
+             py::arg("grammar_backend")            = py::none(),
+             py::arg("grammar_compile_timeout_ms") = int64_t(60000),
+             py::arg("grammar_num_workers")        = int(2))
         .def("start_http_server",
              &RtpLLMOp::startHttpServer,
              py::arg("model_weights_loader"),

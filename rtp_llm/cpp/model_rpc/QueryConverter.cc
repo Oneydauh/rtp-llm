@@ -1,11 +1,80 @@
 #include "rtp_llm/cpp/model_rpc/QueryConverter.h"
 
+#include <optional>
+
 #include "RPCPool.h"
+#include "autil/legacy/json.h"
 #include "rtp_llm/models_py/bindings/core/Types.h"
 #include "rtp_llm/cpp/model_rpc/TensorPbConvert.h"
 #include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
 
 namespace rtp_llm {
+namespace {
+
+using JsonMap = autil::legacy::json::JsonMap;
+
+std::optional<std::string> extractSchemaFromJsonSchemaPayload(const std::string& payload) {
+    try {
+        const auto any_obj   = autil::legacy::json::ParseJson(payload);
+        const auto obj_map   = autil::legacy::AnyCast<JsonMap>(any_obj);
+        const auto schema_it = obj_map.find("schema");
+        if (schema_it == obj_map.end()) {
+            return std::nullopt;
+        }
+        try {
+            const auto schema_str = autil::legacy::AnyCast<std::string>(schema_it->second);
+            if (!schema_str.empty()) {
+                return schema_str;
+            }
+        } catch (...) {}
+        return autil::legacy::ToJsonString(schema_it->second, true);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::optional<std::string> extractSchemaFromResponseFormat(const std::string& response_format_str) {
+    try {
+        const auto response_any = autil::legacy::json::ParseJson(response_format_str);
+        const auto response_map = autil::legacy::AnyCast<JsonMap>(response_any);
+        const auto type_it      = response_map.find("type");
+        if (type_it == response_map.end()) {
+            return std::nullopt;
+        }
+        const auto format_type = autil::legacy::AnyCast<std::string>(type_it->second);
+        if (format_type != "json_schema") {
+            return std::nullopt;
+        }
+
+        const auto json_schema_it = response_map.find("json_schema");
+        if (json_schema_it == response_map.end()) {
+            return std::nullopt;
+        }
+        try {
+            const auto json_schema_str = autil::legacy::AnyCast<std::string>(json_schema_it->second);
+            if (!json_schema_str.empty()) {
+                return json_schema_str;
+            }
+        } catch (...) {}
+
+        const auto json_schema_map = autil::legacy::AnyCast<JsonMap>(json_schema_it->second);
+        const auto schema_it       = json_schema_map.find("schema");
+        if (schema_it == json_schema_map.end()) {
+            return std::nullopt;
+        }
+        try {
+            const auto schema_str = autil::legacy::AnyCast<std::string>(schema_it->second);
+            if (!schema_str.empty()) {
+                return schema_str;
+            }
+        } catch (...) {}
+        return autil::legacy::ToJsonString(schema_it->second, true);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+}  // namespace
 #define TRANS_OPTIONAL(name)                                                                                           \
     if (config_proto->has_##name()) {                                                                                  \
         generate_config->name = config_proto->name().value();                                                          \
@@ -70,6 +139,11 @@ std::shared_ptr<GenerateConfig> QueryConverter::transGenerateConfig(const Genera
     TRANS_OPTIONAL(top_p_decay);
     TRANS_OPTIONAL(top_p_min);
     TRANS_OPTIONAL(top_p_reset_ids);
+    TRANS_OPTIONAL(json_schema);
+    TRANS_OPTIONAL(regex);
+    TRANS_OPTIONAL(ebnf);
+    TRANS_OPTIONAL(structural_tag);
+    TRANS_OPTIONAL(response_format);
     TRANS_OPTIONAL(task_id);
     TRANS_OPTIONAL(adapter_name);
     generate_config->in_think_mode       = config_proto->in_think_mode();
@@ -100,6 +174,19 @@ std::shared_ptr<GenerateConfig> QueryConverter::transGenerateConfig(const Genera
             combo.push_back(value);
         }
         generate_config->banned_combo_token_ids.push_back(std::move(combo));
+    }
+
+    if (generate_config->json_schema.has_value()) {
+        auto normalized_schema = extractSchemaFromJsonSchemaPayload(generate_config->json_schema.value());
+        if (normalized_schema.has_value()) {
+            generate_config->json_schema = normalized_schema.value();
+        }
+    }
+    if (!generate_config->json_schema.has_value() && config_proto->has_response_format()) {
+        auto schema_from_response_format = extractSchemaFromResponseFormat(config_proto->response_format().value());
+        if (schema_from_response_format.has_value()) {
+            generate_config->json_schema = schema_from_response_format.value();
+        }
     }
 
     return generate_config;

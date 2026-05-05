@@ -1,0 +1,418 @@
+{
+    "model_type": "qwen_2",
+    "model_path": "/home/yanxi.wln/work/models/Qwen2-1.5B-Instruct/",
+    "query_result": [
+        {
+            "endpoint": "/v1/chat/completions",
+            "query": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Generate a person profile as JSON."
+                    }
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "person",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string"
+                                },
+                                "age": {
+                                    "type": "integer"
+                                },
+                                "city": {
+                                    "type": "string"
+                                }
+                            },
+                            "required": [
+                                "name",
+                                "age",
+                                "city"
+                            ]
+                        }
+                    }
+                },
+                "max_tokens": 128,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "stream": false
+            },
+            "result": {
+                "id": "chat-",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "{\n  \"name\": \"John Doe\",\n  \"age\": 35,\n  \"city\": \"New York City\"\n}",
+                            "partial": false
+                        },
+                        "finish_reason": "stop"
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 26,
+                    "total_tokens": 54,
+                    "completion_tokens": 28
+                },
+                "aux_info": {
+                    "iter_count": 28,
+                    "input_len": 26,
+                    "output_len": 28,
+                    "step_output_len": 28,
+                    "pd_sep": false,
+                    "reuse_len": 0,
+                    "local_reuse_len": 0,
+                    "remote_reuse_len": 0,
+                    "memory_reuse_len": 0
+                }
+            }
+        },
+        {
+            "endpoint": "/v1/chat/completions",
+            "query": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Generate another person profile."
+                    }
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "person",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string"
+                                },
+                                "age": {
+                                    "type": "integer"
+                                },
+                                "city": {
+                                    "type": "string"
+                                }
+                            },
+                            "required": [
+                                "name",
+                                "age",
+                                "city"
+                            ]
+                        }
+                    }
+                },
+                "max_tokens": 128,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "stream": false
+            },
+            "result": {
+                "id": "chat-",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "{\n  \"name\": \"John Doe\",\n  \"age\": 35,\n  \"city\": \"New York City\"\n}",
+                            "partial": false
+                        },
+                        "finish_reason": "stop"
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 24,
+                    "total_tokens": 52,
+                    "completion_tokens": 28
+                },
+                "aux_info": {
+                    "iter_count": 28,
+                    "input_len": 24,
+                    "output_len": 28,
+                    "step_output_len": 28,
+                    "pd_sep": false,
+                    "reuse_len": 0,
+                    "local_reuse_len": 0,
+                    "remote_reuse_len": 0,
+                    "memory_reuse_len": 0
+                }
+            }
+        },
+        {
+            "endpoint": "/v1/chat/completions",
+            "query": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "One more person please."
+                    }
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "person",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string"
+                                },
+                                "age": {
+                                    "type": "integer"
+                                },
+                                "city": {
+                                    "type": "string"
+                                }
+                            },
+                            "required": [
+                                "name",
+                                "age",
+                                "city"
+                            ]
+                        }
+                    }
+                },
+                "max_tokens": 128,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "stream": false
+            },
+            "result": {
+                "id": "chat-",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "{\"name\": \"John\", \"age\": 25, \"city\": \"New York\"}",
+                            "partial": false
+                        },
+                        "finish_reason": "stop"
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 24,
+                    "total_tokens": 45,
+                    "completion_tokens": 21
+                },
+                "aux_info": {
+                    "iter_count": 21,
+                    "input_len": 24,
+                    "output_len": 21,
+                    "step_output_len": 21,
+                    "pd_sep": false,
+                    "reuse_len": 0,
+                    "local_reuse_len": 0,
+                    "remote_reuse_len": 0,
+                    "memory_reuse_len": 0
+                }
+            }
+        },
+        {
+            "endpoint": "/v1/chat/completions",
+            "query": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Generate an email address."
+                    }
+                ],
+                "response_format": {
+                    "type": "regex",
+                    "pattern": "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"
+                },
+                "max_tokens": 64,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "stream": false
+            },
+            "result": {
+                "id": "chat-",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "Sure.Hereisanexampleofanemailaddressformatthatyoucanuse.Keepinmindthatyouwillneedtochangetheusernameanddomainnameaccordingtoyourpreferences.Keepinmindthatyouwillneedtochangetheusernameanddomainnameaccordingtoyourpreferences.Keepinmindthatyouwillneedtochangethe",
+                            "partial": false
+                        },
+                        "finish_reason": "length"
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 24,
+                    "total_tokens": 88,
+                    "completion_tokens": 64
+                },
+                "aux_info": {
+                    "iter_count": 64,
+                    "input_len": 24,
+                    "output_len": 64,
+                    "step_output_len": 64,
+                    "pd_sep": false,
+                    "reuse_len": 0,
+                    "local_reuse_len": 0,
+                    "remote_reuse_len": 0,
+                    "memory_reuse_len": 0
+                }
+            }
+        },
+        {
+            "endpoint": "/v1/chat/completions",
+            "query": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Another email address please."
+                    }
+                ],
+                "response_format": {
+                    "type": "regex",
+                    "pattern": "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"
+                },
+                "max_tokens": 64,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "stream": false
+            },
+            "result": {
+                "id": "chat-",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I",
+                            "partial": false
+                        },
+                        "finish_reason": "length"
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 24,
+                    "total_tokens": 88,
+                    "completion_tokens": 64
+                },
+                "aux_info": {
+                    "iter_count": 64,
+                    "input_len": 24,
+                    "output_len": 64,
+                    "step_output_len": 64,
+                    "pd_sep": false,
+                    "reuse_len": 0,
+                    "local_reuse_len": 0,
+                    "remote_reuse_len": 0,
+                    "memory_reuse_len": 0
+                }
+            },
+            "_comment": "regex #2: finish_reason=length and content lacks '@'. This appears to be an xgrammar regex constraint issue or truncation. Golden captured as-is; update when xgrammar behavior is fixed."
+        },
+        {
+            "endpoint": "/v1/chat/completions",
+            "query": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Give me a company org structure."
+                    }
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "company",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "company": {
+                                    "type": "string"
+                                },
+                                "departments": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "name": {
+                                                "type": "string"
+                                            },
+                                            "head": {
+                                                "type": "string"
+                                            },
+                                            "size": {
+                                                "type": "integer"
+                                            }
+                                        },
+                                        "required": [
+                                            "name",
+                                            "head",
+                                            "size"
+                                        ]
+                                    }
+                                }
+                            },
+                            "required": [
+                                "company",
+                                "departments"
+                            ]
+                        }
+                    }
+                },
+                "max_tokens": 4000,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "stream": false
+            },
+            "result": {
+                "id": "chat-",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "{\n  \"company\": \"Example Company\",\n  \"departments\": [\n    {\n      \"name\": \"Sales\",\n      \"head\": \"Sales Manager\",\n      \"size\": 50\n    },\n    {\n      \"name\": \"Marketing\",\n      \"head\": \"Marketing Manager\",\n      \"size\": 30\n    },\n    {\n      \"name\": \"Operations\",\n      \"head\": \"Operations Manager\",\n      \"size\": 20\n    },\n    {\n      \"name\": \"Finance\",\n      \"head\": \"Finance Manager\",\n      \"size\": 10\n    },\n    {\n      \"name\": \"Human Resources\",\n      \"head\": \"HR Manager\",\n      \"size\": 15\n    },\n    {\n      \"name\": \"IT\",\n      \"head\": \"IT Manager\",\n      \"size\": 10\n    }\n  ]\n}",
+                            "partial": false
+                        },
+                        "finish_reason": "stop"
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 26,
+                    "total_tokens": 219,
+                    "completion_tokens": 193
+                },
+                "aux_info": {
+                    "iter_count": 193,
+                    "input_len": 26,
+                    "output_len": 193,
+                    "step_output_len": 193,
+                    "pd_sep": false,
+                    "reuse_len": 0,
+                    "local_reuse_len": 0,
+                    "remote_reuse_len": 0,
+                    "memory_reuse_len": 0
+                }
+            }
+        }
+    ]
+}

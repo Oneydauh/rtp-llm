@@ -14,6 +14,8 @@
 #include "rtp_llm/cpp/engine_base/system_prompt/SystemPrompt.h"
 #include "rtp_llm/cpp/models/position_ids/PositionIdsGenerator.h"
 #include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
+#include <pybind11/pybind11.h>
+#include <cstdint>
 #include <iterator>
 #include <mutex>
 #include <optional>
@@ -99,6 +101,11 @@ public:
                    size_t                                extra_reserve_token_num = 0,
                    bool                                  pert_test               = false);
     virtual ~GenerateStream() {
+        // py::object DECREF must happen under GIL.
+        try {
+            py::gil_scoped_acquire acquire;
+            grammar_obj_ = py::none();
+        } catch (...) {}
         reportMetric();
         releaseResource();
         stream_magic_ = 0;
@@ -443,6 +450,12 @@ public:
         return generator_;
     }
 
+    void       setGrammarObject(const py::object& grammar);
+    py::object grammarObject() const;
+    bool       hasGrammarObject() const;
+    py::object tryGetGrammarObject() const;
+    void       clearGrammarObject();
+
     torch::Tensor getProposeTokens() const {
         if (propose_stream_ && propose_stream_->sp_output_buffer_->tokens.defined()) {
             return propose_stream_->sp_output_buffer_->tokens;
@@ -626,6 +639,10 @@ protected:
 
     std::vector<BaseLogitsProcessorPtr> logits_processor_list_;
     at::Generator                       generator_;
+    // Compiled grammar result (written once by GrammarManager after compile
+    // finishes, read many times from the decode hot path). All other grammar
+    // plumbing (future / key / wait_count) is kept inside GrammarManager.
+    py::object grammar_obj_;
 
     // just for bool test
     bool perf_test_ = false;

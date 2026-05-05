@@ -1,6 +1,7 @@
 import functools
+import json
 import logging
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator, Mapping, Union
 
 import grpc
 from grpc import StatusCode
@@ -27,6 +28,65 @@ from rtp_llm.utils.grpc_host_channel_pool import GrpcHostChannelPool
 from rtp_llm.utils.grpc_util import trans_option, trans_option_cast, trans_tensor
 
 MAX_GRPC_TIMEOUT_SECONDS = 3600
+
+_JSON_PB_KW = {"ensure_ascii": False, "separators": (",", ":")}
+
+
+def _pb_string_value_for_json_field(value: Union[str, Mapping[str, Any]]) -> str:
+    """Protobuf StringValue fields expect a string; GenerateConfig may use dict (e.g. OpenAI response_format)."""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, **_JSON_PB_KW)
+
+
+def _normalize_grammar_fields(config) -> None:
+    """If response_format is set but json_schema/regex/ebnf/structural_tag are not,
+    extract the concrete grammar fields from response_format so that we don't
+    need to transmit the raw response_format to the C++ side."""
+    if not config.response_format:
+        return
+    if config.json_schema or config.regex or config.ebnf or config.structural_tag:
+        return
+
+    rf = config.response_format
+    if isinstance(rf, str):
+        try:
+            rf = json.loads(rf)
+        except (json.JSONDecodeError, TypeError):
+            return
+
+    if not isinstance(rf, dict):
+        return
+
+    fmt_type = rf.get("type")
+    if fmt_type == "json_schema":
+        json_schema_obj = rf.get("json_schema", {})
+        if isinstance(json_schema_obj, dict):
+            schema = json_schema_obj.get("schema")
+            if schema is not None:
+                config.json_schema = (
+                    json.dumps(schema, **_JSON_PB_KW)
+                    if not isinstance(schema, str)
+                    else schema
+                )
+        elif isinstance(json_schema_obj, str):
+            config.json_schema = json_schema_obj
+    elif fmt_type == "json_object":
+        config.json_schema = json.dumps({"type": "object"})
+    elif fmt_type == "regex":
+        pattern = rf.get("pattern")
+        if pattern:
+            config.regex = pattern
+    elif fmt_type == "ebnf":
+        grammar = rf.get("grammar")
+        if grammar:
+            config.ebnf = grammar
+    elif fmt_type == "structural_tag":
+        tag = rf.get("structural_tag")
+        if tag:
+            config.structural_tag = (
+                json.dumps(tag, **_JSON_PB_KW) if not isinstance(tag, str) else tag
+            )
 
 
 class StreamState:
@@ -93,6 +153,14 @@ def trans_input(input_py: GenerateInput):
     trans_option(generate_config_pb, input_py.generate_config, "top_p_decay")
     trans_option(generate_config_pb, input_py.generate_config, "top_p_min")
     trans_option(generate_config_pb, input_py.generate_config, "top_p_reset_ids")
+    _normalize_grammar_fields(input_py.generate_config)
+    if input_py.generate_config.json_schema:
+        generate_config_pb.json_schema.value = _pb_string_value_for_json_field(
+            input_py.generate_config.json_schema
+        )
+    trans_option(generate_config_pb, input_py.generate_config, "regex")
+    trans_option(generate_config_pb, input_py.generate_config, "ebnf")
+    trans_option(generate_config_pb, input_py.generate_config, "structural_tag")
     trans_option(generate_config_pb, input_py.generate_config, "adapter_name")
     trans_option_cast(
         generate_config_pb, input_py.generate_config, "task_id", functools.partial(str)

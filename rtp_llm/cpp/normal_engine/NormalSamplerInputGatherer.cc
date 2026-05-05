@@ -133,6 +133,7 @@ SamplerInputs NormalSamplerInputGatherer::allocateSamplerInputs(const StreamGrou
     }
     sampler_inputs.token_ids =
         torch::empty({(int64_t)total_batch_size_in, (int64_t)(sampler_inputs.step + 1)}, torch::kInt32);
+    sampler_inputs.grammar_objs.resize(total_batch_size_in, py::none());
     sampler_inputs.generator.resize(total_batch_size_in);
     return sampler_inputs;
 }
@@ -190,6 +191,29 @@ void NormalSamplerInputGatherer::fillSamplerCommonInputs(SamplerInputs&         
             no_repeat_ngram_size[batch_idx]     = stream->generateConfig()->no_repeat_ngram_size.value_or(0);
             sampler_inputs.generator[batch_idx] = stream->getGenerator();
             batch_idx += 1;
+        }
+    }
+
+    {
+        py::gil_scoped_acquire acquire;
+        batch_idx = 0;
+        for (auto& stream : all_streams) {
+            int sampler_batch_size;
+            if (score_batch) {
+                sampler_batch_size = stream->scoreLen();
+            } else if (stream->needTilingForSampling()) {
+                sampler_batch_size = stream->nextBatchSize();
+            } else {
+                sampler_batch_size = stream->currentBatchSize();
+            }
+            py::object grammar     = stream->tryGetGrammarObject();
+            bool       has_grammar = !grammar.is_none();
+            for (int i = 0; i < sampler_batch_size; ++i) {
+                if (has_grammar) {
+                    sampler_inputs.grammar_objs[batch_idx] = grammar;
+                }
+                batch_idx += 1;
+            }
         }
     }
 }

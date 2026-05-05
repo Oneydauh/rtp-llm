@@ -448,7 +448,7 @@ class ModelDeployWeightInfo:
 
         def __update_weight_config(weight: WeightModule):
             if isinstance(weight, FfnWeight):
-                logging.info(f"src_weights: {weight}")
+                logging.debug(f"src_weights: {weight}")
                 params = weight.extract_params(weight.__class__, weight, None)
                 return weight.__class__(**params)
             else:
@@ -462,7 +462,7 @@ class ModelDeployWeightInfo:
             layer_weights.append(fix_weight)
 
         origin_weight_info.layer_weights = layer_weights
-        logging.info(
+        logging.debug(
             f"fix weight config when need_merge_w13 {origin_weight_info.layer_weights[0]}"
         )
         return origin_weight_info

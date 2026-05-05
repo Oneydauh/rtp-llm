@@ -22,7 +22,10 @@ public:
               py::object vit_config,
               py::object mm_process_engine,
               py::object propose_model,
-              py::object token_processor);
+              py::object token_processor,
+              py::object grammar_backend,
+              int64_t    grammar_compile_timeout_ms,
+              int        grammar_num_workers);
     void stop();
     void
     startHttpServer(py::object model_weights_loader, py::object world_info, py::object tokenizer, py::object render);
@@ -30,13 +33,18 @@ public:
     void restart();
 
 private:
-    void             _init(int64_t                                       model_rpc_port,
-                           int64_t                                       http_port,
-                           const EngineInitParams                        maga_init_params,
-                           py::object                                    mm_process_engine,
-                           std::unique_ptr<ProposeModelEngineInitParams> propose_params,
-                           py::object                                    token_processor);
-    EngineInitParams initModel(py::object model, py::object engine_config, py::object vit_config);
+    void                                          _init(int64_t                                       model_rpc_port,
+                                                        int64_t                                       http_port,
+                                                        const EngineInitParams                        maga_init_params,
+                                                        py::object                                    mm_process_engine,
+                                                        std::unique_ptr<ProposeModelEngineInitParams> propose_params,
+                                                        py::object                                    token_processor);
+    EngineInitParams                              initModel(py::object model,
+                                                            py::object engine_config,
+                                                            py::object vit_config,
+                                                            py::object grammar_backend,
+                                                            int64_t    grammar_compile_timeout_ms,
+                                                            int        grammar_num_workers);
     std::unique_ptr<ProposeModelEngineInitParams> initProposeModel(py::object              propose_model,
                                                                    const EngineInitParams& base_params);
     void                                          initRPCServer(const EngineInitParams                        maga_init_params,
