@@ -65,3 +65,19 @@ cc_test(
     },
     exec_properties = {'gpu':'A10'},
 )
+
+cc_test(
+    name = "grammar_manager_test",
+    srcs = [
+        "GrammarManagerTest.cc",
+    ],
+    data = [],
+    copts = copts() + ["-fno-access-control"],
+    deps = test_deps + [
+        "//rtp_llm/cpp/cache/test:cache_config_test_utils",
+    ],
+    env = {
+        "TEST_USING_DEVICE": "CUDA",
+    },
+    exec_properties = {'gpu':'H20'},
+)

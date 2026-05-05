@@ -218,7 +218,9 @@ def h20_oss_suites():
 
     # H20 Grammar (xgrammar) structured-output smoke: exercises json_schema + regex
     # response_format, and walks through FILE_CACHE_MISS -> FILE_CACHE_HIT ->
-    # MEMORY_CACHE_HIT paths.
+    # MEMORY_CACHE_HIT paths. Bounded regexes (#[0-9A-Fa-f]{6}, [0-9]{5}) force
+    # the NFA to transition through specific states, proving xgrammar's logits
+    # mask is enforced.
     native.test_suite(
         name = "smoke_h20_grammar",
         tests = [
@@ -228,6 +230,125 @@ def h20_oss_suites():
                 smoke_args = "--act_type BF16 --warm_up 0 --seq_size_per_block 8",
                 gpu_type = ["H20"],
                 envs = ["PYTHONUNBUFFERED=TRUE"],
+            ),
+            smoke_test(
+                name = "qwen2_1_5b_grammar_pd_cache_base",
+                task_info = "data/model/qwen2/q_r_grammar_pd.json",
+                smoke_args = {
+                    "prefill": "--act_type BF16 --warm_up 0 --seq_size_per_block 8 --role_type PREFILL --cache_store_rdma_mode 0 --use_local 1 --tp_size 1",
+                    "decode":  "--act_type BF16 --warm_up 0 --seq_size_per_block 8 --role_type DECODE  --cache_store_rdma_mode 0 --use_local 1 --tp_size 1",
+                },
+                gpu_type = ["H20"],
+                envs = ["PYTHONUNBUFFERED=TRUE"],
+            ),
+            smoke_test(
+                name = "qwen2_14b_mtp_grammar_cache_base",
+                task_info = "data/model/qwen2_14b/q_r_mtp_grammar.json",
+                smoke_args = "--max_seq_len 16384 --ft_disable_custom_ar 1 --sp_type eagle --gen_num_per_cycle 4 --act_type FP16 --sp_model_type qwen_2-mtp --sp_checkpoint_path /mnt/nas1/mtp_reg/qwen2_14b_draft/ --warm_up 0 --reserver_runtime_mem_mb 21954 --tp_size 2",
+                gpu_type = ["H20"],
+                envs = ["PYTHONUNBUFFERED=TRUE"],
+            ),
+            # Streaming: verifies xgrammar mask is applied on each SSE token
+            # chunk (not just a one-shot pass) and that delta aggregation gives
+            # a regex/json-valid final payload.
+            smoke_test(
+                name = "qwen2_1_5b_grammar_stream",
+                task_info = "data/model/qwen2/q_r_grammar_stream.json",
+                smoke_args = "--act_type BF16 --warm_up 0 --seq_size_per_block 8",
+                gpu_type = ["H20"],
+                envs = ["PYTHONUNBUFFERED=TRUE"],
+            ),
+            # EBNF (GBNF) grammar type: a different compile/dispatch path from
+            # regex and json_schema (xgrammar_backend.dispatch_ebnf).
+            smoke_test(
+                name = "qwen2_1_5b_grammar_ebnf",
+                task_info = "data/model/qwen2/q_r_grammar_ebnf.json",
+                smoke_args = "--act_type BF16 --warm_up 0 --seq_size_per_block 8",
+                gpu_type = ["H20"],
+                envs = ["PYTHONUNBUFFERED=TRUE"],
+            ),
+            # Concurrent: drives 5 parallel requests through the same server so
+            # that batch_apply_grammar_constraints exercises its parallel fill
+            # path (_FILL_PARALLEL_THRESHOLD=4) and schedulers handle multiple
+            # active grammar streams in one batch.
+            smoke_test(
+                name = "qwen2_1_5b_grammar_concurrent",
+                task_info = "data/model/qwen2/q_r_grammar.json",
+                smoke_args = "--act_type BF16 --warm_up 0 --seq_size_per_block 8",
+                gpu_type = ["H20"],
+                envs = ["PYTHONUNBUFFERED=TRUE"],
+                concurrency_test = True,
+            ),
+            # Error path: malformed json_schema / regex / ebnf. Server must
+            # gracefully reject (HTTP 4xx or error body) and keep serving —
+            # a final valid query must still produce a regex-matching hex
+            # color, proving the error didn't crash / leak / deadlock the
+            # grammar backend.
+            smoke_test(
+                name = "qwen2_1_5b_grammar_invalid_schema",
+                task_info = "data/model/qwen2/q_r_grammar_invalid.json",
+                smoke_args = "--act_type BF16 --warm_up 0 --seq_size_per_block 8",
+                gpu_type = ["H20"],
+                envs = ["PYTHONUNBUFFERED=TRUE", "VISIT_RETRY_TIME=1"],
+            ),
+            # Mixed batch: grammar + non-grammar streams colocated in the
+            # same server. 5 concurrent threads walk heterogeneous-length
+            # queries so the scheduler naturally assembles mixed batches. The
+            # non-grammar sidecars (skip_content_check=true) catch any
+            # active-index / parallel-fill path that would let a grammar
+            # stream's bitmask leak onto a non-grammar neighbour.
+            smoke_test(
+                name = "qwen2_1_5b_grammar_mixed_batch",
+                task_info = "data/model/qwen2/q_r_grammar_mixed.json",
+                smoke_args = "--act_type BF16 --warm_up 0 --seq_size_per_block 8",
+                gpu_type = ["H20"],
+                envs = ["PYTHONUNBUFFERED=TRUE"],
+                concurrency_test = True,
+            ),
+            # Multi-rank TP2 + grammar + concurrent — regression guard.
+            # Under RTP-LLM's TP-master-only scheduling (NormalEngine.cc
+            # gates scheduler work on tp_rank==0), the grammar queue
+            # exists on only one rank in a pure TP setup, so the
+            # cross-rank sync short-circuits (dp_size==1). This smoke
+            # confirms the refactored get_ready_grammar_requests() still
+            # makes forward progress in the short-circuit branch.
+            smoke_test(
+                name = "qwen2_1_5b_grammar_tp2_sync",
+                task_info = "data/model/qwen2/q_r_grammar.json",
+                smoke_args = "--act_type BF16 --warm_up 0 --seq_size_per_block 8 --tp_size 2 --world_size 2",
+                gpu_type = ["H20"],
+                envs = ["PYTHONUNBUFFERED=TRUE"],
+                concurrency_test = True,
+            ),
+            # DP2 + grammar + concurrent — drives the real cross-rank
+            # sync path. Each dp_rank owns an independent scheduler and
+            # grammar_queue_, so ranks will compile the same schema at
+            # slightly different wall-clock times. Without the AND(ready)
+            # / OR(failed) bitmap fold, the two dp_ranks would each
+            # decide "my request is ready" at different ticks and the
+            # batch would split. This smoke exercises:
+            #   * dp_tp_world_size_ > 1 entering syncGrammarMasksAcrossRanks
+            #   * ParallelMode::DP allGather call + tensor pack/unpack
+            #   * intersection/union fold + Phase A3 splice-by-streamId
+            # Concurrency (5 threads) ensures queue depth > 1 so multiple
+            # bitmap positions are populated, not just the trivial bit-0.
+            smoke_test(
+                name = "qwen2_1_5b_grammar_dp2_sync",
+                task_info = "data/model/qwen2/q_r_grammar.json",
+                smoke_args = "--act_type BF16 --warm_up 0 --seq_size_per_block 8 --dp_size 2 --world_size 2",
+                gpu_type = ["H20"],
+                envs = ["PYTHONUNBUFFERED=TRUE"],
+                concurrency_test = True,
+            ),
+            # MTP + CUDA graph + grammar: guards the interaction of graph
+            # capture/replay with xgrammar accept_token timing (any host-side
+            # state desync would immediately produce off-state mask outputs).
+            smoke_test(
+                name = "qwen2_14b_mtp_grammar_cudagraph",
+                task_info = "data/model/qwen2_14b/q_r_mtp_grammar.json",
+                smoke_args = "--max_seq_len 16384 --ft_disable_custom_ar 1 --sp_type eagle --gen_num_per_cycle 4 --act_type FP16 --sp_model_type qwen_2-mtp --sp_checkpoint_path /mnt/nas1/mtp_reg/qwen2_14b_draft/ --warm_up 0 --reserver_runtime_mem_mb 24096 --tp_size 2 --enable_cuda_graph 1 --decode_capture_config '1,2,3,4' --concurrency_limit 4",
+                gpu_type = ["H20"],
+                envs = ["PYTHONUNBUFFERED=TRUE", "NCCL_DISABLE_ABORT=1"],
             ),
         ],
     )
@@ -392,6 +513,12 @@ def h20_oss_suites():
                 name="eagle_mtp_tp2",
                 task_info="data/model/qwen2_14b/q_r_mtp.json",
                 smoke_args="--max_seq_len 16384 --ft_disable_custom_ar 1 --sp_type eagle --gen_num_per_cycle 4 --act_type FP16 --sp_model_type qwen_2-mtp --sp_checkpoint_path /mnt/nas1/mtp_reg/qwen2_14b_draft/  --warm_up 0 --reserver_runtime_mem_mb 21954 --tp_size 2",
+                gpu_type=["H20"]
+            ),
+            smoke_test(
+                name="eagle_mtp_tp2_vocab_prune",
+                task_info="data/model/qwen2_14b/q_r_mtp_vocab_prune.json",
+                smoke_args="--max_seq_len 16384 --ft_disable_custom_ar 1 --sp_type eagle --gen_num_per_cycle 4 --act_type FP16 --sp_model_type qwen_2-mtp --sp_checkpoint_path /mnt/nas1/mtp/vocab_prune/qwen2.5_14b_draft/ --warm_up 0 --reserver_runtime_mem_mb 20000 --tp_size 2 --enable_cuda_graph 1",
                 gpu_type=["H20"]
             ),
             smoke_test(

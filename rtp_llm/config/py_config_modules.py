@@ -294,6 +294,10 @@ class GrammarConfig:
         # Directory for the persistent grammar file cache. Empty string =>
         # use the default under ~/.cache/grammar.
         self.cache_dir: str = ""
+        # Promote the first few per-step grammar traces (accept_token,
+        # bitmask stats) from DEBUG to INFO. Targeted switch so grammar
+        # debugging doesn't require raising the global log level.
+        self.debug_log: bool = False
 
     def to_string(self):
         return (
@@ -303,7 +307,8 @@ class GrammarConfig:
             f"reasoning_parser: {self.reasoning_parser}\n"
             f"compile_timeout_ms: {self.compile_timeout_ms}\n"
             f"num_workers: {self.num_workers}\n"
-            f"cache_dir: {self.cache_dir!r}"
+            f"cache_dir: {self.cache_dir!r}\n"
+            f"debug_log: {self.debug_log}"
         )
 
 

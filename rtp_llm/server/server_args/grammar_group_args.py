@@ -30,3 +30,15 @@ def init_grammar_group_args(parser, grammar_config):
         default=False,
         help="Enable reasoner grammar wrapper when tokenizer supports think_end_id",
     )
+    grammar_group.add_argument(
+        "--grammar_debug_log",
+        env_name="GRAMMAR_DEBUG_LOG",
+        bind_to=(grammar_config, "debug_log"),
+        type=str2bool,
+        default=False,
+        help=(
+            "Promote per-step grammar traces (accept_token, bitmask stats) "
+            "from DEBUG to INFO for targeted xgrammar debugging without "
+            "raising the global log level."
+        ),
+    )

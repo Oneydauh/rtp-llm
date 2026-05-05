@@ -207,6 +207,17 @@ class CaseRunner(object):
         if q_r.get("tau2_bench", False):
             return Tau2BenchComparer
         if "messages" in q_r["query"]:
+            if (
+                "response_format" in q_r["query"]
+                or q_r.get("skip_content_check")
+                or q_r.get("expect_grammar_error")
+            ):
+                # GrammarConstraintComparer dispatches by response_format.type
+                # and also honours two qr_info flags:
+                # - skip_content_check: mixed-batch non-grammar sidecar.
+                # - expect_grammar_error: malformed-schema error-path smoke.
+                from smoke.grammar_constraint_comparer import GrammarConstraintComparer
+                return GrammarConstraintComparer
             return OpenaiComparer
         elif request_endpoint in [
             "/v1/embeddings",

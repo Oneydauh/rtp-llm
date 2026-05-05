@@ -267,6 +267,7 @@ def create_grammar_backend(
     vocab_size: int,
     eos_token_ids: Optional[set] = None,
     cache_dir: Optional[str] = None,
+    debug_log: bool = False,
 ) -> Optional[BaseGrammarBackend]:
     name = grammar_backend
 
@@ -306,6 +307,7 @@ def create_grammar_backend(
                 model_eos_token_ids=eos_list,
                 any_whitespace=not constrained_json_disable_any_whitespace,
                 cache_dir=cache_dir,
+                debug_log=debug_log,
             )
         except TokenizerNotSupportedError as e:
             logger.warning(

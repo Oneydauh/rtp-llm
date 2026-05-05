@@ -63,6 +63,7 @@ class XGrammarGrammar(BaseGrammarObject):
         override_stop_tokens: Optional[Union[List[int], int]],
         key_string: Optional[str] = None,  # TODO (sk): for debugging, remove later
         grammar_stats: Optional[GrammarStats] = GrammarStats(),
+        debug_log: bool = False,
     ) -> None:
         super().__init__()
         self.matcher = matcher
@@ -72,6 +73,7 @@ class XGrammarGrammar(BaseGrammarObject):
         self.accepted_tokens = []
         self.key_string = key_string
         self.grammar_stats = grammar_stats
+        self.debug_log = debug_log
 
     def accept_token(self, token: int):
         if not self.is_terminated():
@@ -87,9 +89,11 @@ class XGrammarGrammar(BaseGrammarObject):
             else:
                 self.accepted_tokens.append(token)
                 terminated_after = self.matcher.is_terminated()
-                logger.debug(
-                    "[xgrammar accept_token] token=%d, n_accepted=%d, "
-                    "terminated=%s->%s, finished=%s",
+                log = logger.info if self.debug_log and len(self.accepted_tokens) <= 12 else logger.debug
+                log(
+                    "[xgrammar accept_token] key=%s token=%d n_accepted=%d "
+                    "terminated=%s->%s finished=%s",
+                    (self.key_string or "?")[:60],
                     token,
                     len(self.accepted_tokens),
                     terminated_before,
@@ -191,6 +195,7 @@ class XGrammarGrammar(BaseGrammarObject):
             self.override_stop_tokens,
             self.key_string,
             grammar_stats,
+            debug_log=self.debug_log,
         )
 
     def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
@@ -238,8 +243,10 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         model_eos_token_ids: Optional[List[int]] = None,
         any_whitespace: bool = True,
         cache_dir: Optional[str] = None,
+        debug_log: bool = False,
     ):
         super().__init__()
+        self.debug_log = debug_log
 
         if hasattr(tokenizer, "init_xgrammar"):
             tokenizer_info, override_stop_tokens = tokenizer.init_xgrammar()
@@ -340,6 +347,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             self.override_stop_tokens,
             key_string,
             grammar_stats,
+            debug_log=self.debug_log,
         )
 
     def dispatch_json(self, key_string: str) -> BaseGrammarObject:

@@ -1,0 +1,76 @@
+{
+    "model_type": "qwen_2",
+    "model_path": "/home/yanxi.wln/work/models/Qwen2-1.5B-Instruct/",
+    "query_result": [
+        {
+            "endpoint": "/v1/chat/completions",
+            "query": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Output a hex color like #AABBCC."
+                    }
+                ],
+                "response_format": {
+                    "type": "ebnf",
+                    "grammar": "root ::= \"#\" hex hex hex hex hex hex\nhex ::= [0-9A-Fa-f]\n"
+                },
+                "max_tokens": 16,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "stream": false
+            },
+            "result": {
+                "id": "chat-",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "", "partial": false},
+                        "finish_reason": "stop"
+                    }
+                ],
+                "usage": {"prompt_tokens": 0, "total_tokens": 0, "completion_tokens": 0}
+            },
+            "ebnf_validate_regex": "#[0-9A-Fa-f]{6}",
+            "_comment": "EBNF (GBNF) grammar — verifies xgrammar.dispatch_ebnf compiles and masks. Grammar is equivalent to regex #[0-9A-Fa-f]{6} but travels through a different compile path."
+        },
+        {
+            "endpoint": "/v1/chat/completions",
+            "query": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Output an IP-like value, e.g. ip:1.2.3.4"
+                    }
+                ],
+                "response_format": {
+                    "type": "ebnf",
+                    "grammar": "root ::= \"ip:\" octet \".\" octet \".\" octet \".\" octet\noctet ::= digit | digit digit | digit digit digit\ndigit ::= [0-9]\n"
+                },
+                "max_tokens": 24,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "stream": false
+            },
+            "result": {
+                "id": "chat-",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "", "partial": false},
+                        "finish_reason": "stop"
+                    }
+                ],
+                "usage": {"prompt_tokens": 0, "total_tokens": 0, "completion_tokens": 0}
+            },
+            "ebnf_validate_regex": "ip:[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}",
+            "_comment": "EBNF with alternation and recursion-free repetition — exercises a grammar shape regex can't trivially express (structural separator + variable-length octets)."
+        }
+    ]
+}
