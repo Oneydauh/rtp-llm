@@ -87,6 +87,7 @@ TEST_F(SamplerTest, testGeneralSampling) {
         torch::Tensor(),  // finished_mask
         cum_log_probs.clone(),
         torch::Tensor(),  // all_probs
+        {},               // grammar_objs
         generator,
     };
 
