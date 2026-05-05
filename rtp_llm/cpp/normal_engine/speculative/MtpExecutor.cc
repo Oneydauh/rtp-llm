@@ -16,6 +16,7 @@
 #include "rtp_llm/cpp/models/logits_processor/LogitsProcessorFactory.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "autil/TimeUtility.h"
+#include <cstdlib>
 #include <memory>
 #include <thread>
 #include <random>
@@ -33,6 +34,61 @@ bool streamGroupsHaveGrammar(const StreamGroups& stream_groups) {
         }
     }
     return false;
+}
+
+// Opt-in per-step trace of chain-spec accept_len. Enabled by RTP_SP_ACCEPT_TRACE=1.
+// Emits one line per stream per decode step so an offline analyzer can build
+// accept_len distributions with vs without grammar.
+bool spAcceptTraceEnabled() {
+    static const bool kEnabled = [] {
+        const char* v = std::getenv("RTP_SP_ACCEPT_TRACE");
+        return v != nullptr && std::string(v) == "1";
+    }();
+    return kEnabled;
+}
+
+// Short grammar-kind tag for log grouping. Avoids printing the full
+// schema/regex (potentially huge and PII-sensitive); just the type.
+std::string grammarKindTag(const GenerateStreamPtr& stream) {
+    const auto& cfg = stream->generateConfig();
+    if (cfg->json_schema.has_value()) {
+        return "json_schema";
+    }
+    if (cfg->regex.has_value()) {
+        return "regex";
+    }
+    if (cfg->ebnf.has_value()) {
+        return "ebnf";
+    }
+    if (cfg->structural_tag.has_value()) {
+        return "structural_tag";
+    }
+    return "none";
+}
+
+void logSpAcceptTrace(const StreamGroups&                          stream_groups,
+                      const speculative::SpeculativeSamplerOutput& spec_output,
+                      size_t                                       propose_step) {
+    if (!spAcceptTraceEnabled()) {
+        return;
+    }
+    size_t stream_idx = 0;
+    for (const auto& stream : stream_groups.allStreams()) {
+        if (stream_idx >= spec_output.accept_len.size()) {
+            break;
+        }
+        const int accept_len = spec_output.accept_len[stream_idx];
+        const std::string kind = grammarKindTag(stream);
+        // Keep format easy to grep and parse:
+        //   [sp_accept_trace] stream_id=<id> grammar=<kind> propose_step=<n> accept_len=<k>
+        RTP_LLM_LOG_INFO(
+            "[sp_accept_trace] stream_id=%ld grammar=%s propose_step=%zu accept_len=%d",
+            stream->streamId(),
+            kind.c_str(),
+            propose_step,
+            accept_len);
+        ++stream_idx;
+    }
 }
 }  // namespace
 
@@ -390,10 +446,21 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         } else {
             CHECK_AND_RETURN_REF(sampler_input,
                                  batch_stream_processor_->gatherSamplerInput(stream_groups, model_input, model_output));
-            if (streamGroupsHaveGrammar(stream_groups)) {
+            const bool has_grammar = streamGroupsHaveGrammar(stream_groups);
+            if (has_grammar) {
                 batch_stream_processor_->applyGrammarConstraints(sampler_input);
             }
             sampler_output = std::move(sampler_->forward(sampler_input));
+            if (has_grammar) {
+                // Advance matcher past the prefill bonus token so the first
+                // decode step's bitmask reflects "state after T0", not START.
+                const torch::Tensor token_ids_cpu =
+                    sampler_output.token_ids.defined() && sampler_output.token_ids.is_cuda()
+                        ? sampler_output.token_ids.cpu()
+                        : sampler_output.token_ids;
+                grammar_accept_future_ =
+                    batch_stream_processor_->batchAcceptPrefillBonusTokensAsync(stream_groups, token_ids_cpu);
+            }
             batch_stream_processor_->updatePrefillPostDraftModelInput(model_input, model_output, sampler_output);
         }
     }
@@ -697,6 +764,12 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             // rejection sampling
             speculative_sampler_output = speculative_sampler_->forward(streams, draft_sampler_output, sampler_output);
         }
+        // Per-step accept_len trace (opt-in via RTP_SP_ACCEPT_TRACE=1). Only
+        // emit for real streams — fake-stream ticks always report accept_len=1
+        // and would skew averages toward 1.
+        if (!model_input.is_fake_stream) {
+            logSpAcceptTrace(stream_groups, speculative_sampler_output, propose_step_);
+        }
         // NOTE: here will have cuda device sync before update model input
         batch_stream_processor_->updateDecodePostDraftModelInput(
             model_input, model_output, speculative_sampler_output, batch_size, hidden_states_d_t, total_accept_len);
@@ -909,6 +982,17 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         RTP_LLM_LOG_DEBUG("[MTP draftDecode] loop step %d/%d start, batch_size %zu", i, propose_step_ - 1, batch_size);
         draft_decode_model_output = std::move(draft_model_->forward(model_input));
         RTP_LLM_LOG_DEBUG("[MTP draftDecode] loop step %d forward done", i);
+
+        // Draft-side grammar mask: constrain draft's next token to grammar-legal
+        // set so the chain survives target verify's rejection. Matcher accept +
+        // rollback are balanced inside the helper → no state leak. Skipped for
+        // fake / warm-up streams (no matcher) and when no stream requests grammar.
+        if (!model_input.is_fake_stream && !warm_up_ && streamGroupsHaveGrammar(stream_groups)) {
+            auto draft_tokens_cpu =
+                torch::cat(draft_token_ids_list, 1).to(torch::kInt32).to(torch::kCPU);
+            batch_stream_processor_->applyDraftGrammarConstraints(
+                draft_decode_model_output.logits, stream_groups, draft_tokens_cpu, i);
+        }
 
         // sample
         auto fast_topk_sampler_output = fast_topk_sampler_->forward(draft_decode_model_output.logits, 1);

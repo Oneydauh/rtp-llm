@@ -62,6 +62,7 @@ class LanguageCppEngine(BaseEngine):
             vocab_size=vocab_size,
             eos_token_ids=None,
             cache_dir=resolve_grammar_cache_dir(grammar_config.cache_dir),
+            debug_log=grammar_config.debug_log,
         )
         if self.grammar_backend is not None:
             # Bind class handle once in Python creation path.

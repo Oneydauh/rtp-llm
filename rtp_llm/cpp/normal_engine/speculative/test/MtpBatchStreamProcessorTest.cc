@@ -2,6 +2,8 @@
 #include "torch/all.h"
 #include "gtest/gtest.h"
 
+#include <pybind11/stl.h>
+
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/cpp/cache/test/CacheConfigTestUtils.h"
 
@@ -669,6 +671,218 @@ TEST_F(MtpBatchStreamProcessorTest, updateMultiStepDraftSamplerOutput) {
     vector<float> expect_all_probs = {0.1, 0.2, 0.3, 0.4, 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 2.4,
                                       0.5, 0.6, 0.7, 0.8, 1.5, 1.6, 1.7, 1.8, 2.5, 2.6, 2.7, 2.8};
     EXPECT_EQ(expect_all_probs, toVec<float>(sampler_output.all_probs));
+}
+
+// =========================================================================
+// Grammar integration tests
+// =========================================================================
+//
+// These drive applyDraftGrammarConstraints / applySpecGrammarConstraints /
+// batchAcceptPrefillBonusTokensAsync against streams carrying a pure-Python
+// fake grammar. The fake records all accept / rollback / fill_vocab_mask /
+// is_terminated calls so we can assert:
+//
+//   * `applyDraftGrammarConstraints` leaves matcher net state UNCHANGED
+//     (accept + rollback balanced) — this is the core invariant of the
+//     Solution B design.
+//   * `applySpecGrammarConstraints` accepts propose_step tokens + rolls back
+//     propose_step at the end (the DFS "walk-and-restore" pattern).
+//   * `batchAcceptPrefillBonusTokensAsync` advances matcher by exactly one
+//     token per stream.
+//   * Short-circuits when no stream in the group has a grammar object.
+
+namespace {
+
+py::object makeFakeGrammarHelpers() {
+    py::dict ns;
+    py::exec(R"py(
+class _FakeGrammar:
+    """Records grammar hot-path calls. Mimics XGrammarGrammar's public API."""
+    def __init__(self, vocab_size=32):
+        self.vocab_size = vocab_size
+        self._terminated = False
+        self.finished = False
+        self.accepted = []
+        self.rollbacks = []
+        self.fill_calls = []
+    def is_terminated(self):
+        return self._terminated
+    def accept_token(self, tok):
+        self.accepted.append(tok)
+    def rollback(self, k):
+        # keep list consistent so the final snapshot reflects net state
+        self.rollbacks.append(k)
+        if k > 0:
+            del self.accepted[-k:]
+    def fill_vocab_mask(self, bitmask, idx):
+        self.fill_calls.append(int(idx))
+        # claim only token id 0 to produce an observable mask
+        row = bitmask[idx] if bitmask.ndim == 2 else bitmask
+        row.zero_()
+        row[0] = 1
+def make():
+    return _FakeGrammar()
+)py", ns, ns);
+    return ns["make"];
+}
+
+// Wire the minimal MtpBatchStreamProcessor for grammar-only tests. The
+// grammar methods only read logits + stream group; no executor state needed.
+std::unique_ptr<MtpBatchStreamProcessor> buildProcessorForGrammar(
+    ModelConfig& model_config,
+    RuntimeConfig& runtime_config,
+    SpeculativeExecutionConfig& sp_config,
+    CacheConfig& cache_config) {
+    PDSepConfig                 pd_sep_config;
+    ProfilingDebugLoggingConfig profiling_debug_logging_config;
+    model_config.max_seq_len    = 128;
+    model_config.vocab_size     = 32;
+    model_config.num_layers     = 1;
+    sp_config.gen_num_per_cycle = 4;
+    cache_config.group_types    = {CacheGroupType::FULL};
+    return std::make_unique<MtpBatchStreamProcessor>(
+        model_config, pd_sep_config, profiling_debug_logging_config, cache_config, sp_config, false);
+}
+
+}  // namespace
+
+TEST_F(MtpBatchStreamProcessorTest, ApplyDraftGrammarConstraintsNoOpWithoutGrammar) {
+    // Two streams, neither has a grammar → must short-circuit before touching
+    // the Python helper. Logits must stay zero.
+    ModelConfig mc; RuntimeConfig rtc; SpeculativeExecutionConfig sp; CacheConfig cc;
+    ResourceContext rc;
+    auto processor = buildProcessorForGrammar(mc, rtc, sp, cc);
+
+    auto s1 = createContextStream(mc, rtc, rc, {1}, /*block_id=*/1);
+    auto s2 = createContextStream(mc, rtc, rc, {2}, /*block_id=*/2);
+    StreamGroups groups({s1, s2});
+
+    auto logits = torch::zeros({2, 32}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    auto draft_tokens_cpu = torch::zeros({2, 2}, torch::kInt32);
+
+    processor->applyDraftGrammarConstraints(logits, groups, draft_tokens_cpu, /*step_idx=*/0);
+
+    // Logits unchanged (no mask applied).
+    EXPECT_TRUE(torch::all(logits == 0).item<bool>());
+}
+
+TEST_F(MtpBatchStreamProcessorTest, ApplyDraftGrammarConstraintsMatcherInvariant) {
+    // One stream WITH grammar, one WITHOUT. The active stream's matcher must
+    // return to its entry state (accept + rollback balanced), and the
+    // non-active row's logits must be untouched.
+    ModelConfig mc; RuntimeConfig rtc; SpeculativeExecutionConfig sp; CacheConfig cc;
+    ResourceContext rc;
+    auto processor = buildProcessorForGrammar(mc, rtc, sp, cc);
+
+    auto s1 = createContextStream(mc, rtc, rc, {1}, 1);
+    auto s2 = createContextStream(mc, rtc, rc, {2}, 2);
+    StreamGroups groups({s1, s2});
+
+    py::object fake_g;
+    {
+        py::gil_scoped_acquire acquire;
+        fake_g = makeFakeGrammarHelpers()();
+        s1->setGrammarObject(fake_g);
+        // s2 has no grammar — stays none.
+    }
+
+    auto logits = torch::zeros({2, 32}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    // draft_tokens_so_far layout: [T0, d_0, d_1] — Python skips T0, accepts d_0 + d_1.
+    auto draft_tokens_cpu = torch::tensor({{99, 10, 20}, {99, 10, 20}}, torch::kInt32);
+
+    processor->applyDraftGrammarConstraints(logits, groups, draft_tokens_cpu, /*step_idx=*/2);
+
+    py::gil_scoped_acquire acquire;
+    // Matcher net state: all accepts rolled back.
+    auto accepted = fake_g.attr("accepted").cast<std::vector<int>>();
+    EXPECT_TRUE(accepted.empty()) << "matcher left in advanced state, size=" << accepted.size();
+    // Exactly one rollback of size 2.
+    auto rollbacks = fake_g.attr("rollbacks").cast<std::vector<int>>();
+    ASSERT_EQ(rollbacks.size(), 1u);
+    EXPECT_EQ(rollbacks[0], 2);
+
+    // Only row 0 (active stream) was masked — row 1 remains all zeros.
+    auto row1 = logits[1].cpu();
+    EXPECT_TRUE(torch::all(row1 == 0).item<bool>()) << "non-grammar stream had its logits mutated";
+}
+
+TEST_F(MtpBatchStreamProcessorTest, ApplySpecGrammarConstraintsDfsAcceptRollback) {
+    // DFS over the chain: applySpecGrammarConstraints must accept
+    // propose_step draft tokens (positions 1..propose_step of the chain)
+    // and rollback by exactly that count, leaving matcher unchanged.
+    ModelConfig mc; RuntimeConfig rtc; SpeculativeExecutionConfig sp; CacheConfig cc;
+    ResourceContext rc;
+    auto processor = buildProcessorForGrammar(mc, rtc, sp, cc);
+
+    auto s1 = createContextStream(mc, rtc, rc, {1}, 1);
+    StreamGroups groups({s1});
+
+    py::object fake_g;
+    {
+        py::gil_scoped_acquire acquire;
+        fake_g = makeFakeGrammarHelpers()();
+        s1->setGrammarObject(fake_g);
+    }
+
+    const size_t propose_step = 4;
+    const size_t score_len    = propose_step + 1;
+    SamplerInputs inputs;
+    inputs.logits = torch::zeros(
+        {static_cast<int64_t>(score_len), 32},
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    // draft_token_ids shape [batch=1, propose_step+1]; the DFS reads [1..propose_step].
+    auto draft_token_ids = torch::tensor({{99, 11, 22, 33, 44}}, torch::kInt32);
+
+    processor->applySpecGrammarConstraints(inputs, groups, draft_token_ids, propose_step);
+
+    py::gil_scoped_acquire acquire;
+    auto accepted = fake_g.attr("accepted").cast<std::vector<int>>();
+    EXPECT_TRUE(accepted.empty()) << "DFS matcher not restored";
+    auto rollbacks = fake_g.attr("rollbacks").cast<std::vector<int>>();
+    ASSERT_EQ(rollbacks.size(), 1u);
+    EXPECT_EQ(rollbacks[0], static_cast<int>(propose_step));
+    // fill_vocab_mask should fire once per chain position (score_len times).
+    auto fill_calls = fake_g.attr("fill_calls").cast<std::vector<int>>();
+    EXPECT_EQ(fill_calls.size(), score_len);
+}
+
+TEST_F(MtpBatchStreamProcessorTest, BatchAcceptPrefillBonusTokensFuture) {
+    // Each stream gets one accept call for the bonus token (last column of
+    // token_ids_cpu). The future returned must complete cleanly.
+    ModelConfig mc; RuntimeConfig rtc; SpeculativeExecutionConfig sp; CacheConfig cc;
+    ResourceContext rc;
+    auto processor = buildProcessorForGrammar(mc, rtc, sp, cc);
+
+    auto s1 = createContextStream(mc, rtc, rc, {1}, 1);
+    auto s2 = createContextStream(mc, rtc, rc, {2}, 2);
+    StreamGroups groups({s1, s2});
+
+    py::object fake1, fake2;
+    {
+        py::gil_scoped_acquire acquire;
+        py::object make = makeFakeGrammarHelpers();
+        fake1 = make();
+        fake2 = make();
+        s1->setGrammarObject(fake1);
+        s2->setGrammarObject(fake2);
+    }
+
+    // token_ids_cpu shape [batch=2, stride=2]. Last column holds the bonus
+    // token we want accepted. batchAcceptPrefillBonusTokensAsync indexes
+    // rows by each stream's nextBatchSize (1 for NormalGenerateStream).
+    auto token_ids_cpu = torch::tensor({{100, 7}, {200, 8}}, torch::kInt32);
+
+    auto fut = processor->batchAcceptPrefillBonusTokensAsync(groups, token_ids_cpu);
+    ASSERT_TRUE(fut.valid()) << "empty future for grammar batch";
+    fut.get();  // should complete without throwing
+
+    py::gil_scoped_acquire acquire;
+    auto a1 = fake1.attr("accepted").cast<std::vector<int>>();
+    auto a2 = fake2.attr("accepted").cast<std::vector<int>>();
+    ASSERT_EQ(a1.size(), 1u);
+    ASSERT_EQ(a2.size(), 1u);
+    EXPECT_EQ(a1[0], 7);
+    EXPECT_EQ(a2[0], 8);
 }
 
 }  // namespace rtp_llm

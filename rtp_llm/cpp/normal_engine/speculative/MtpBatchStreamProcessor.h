@@ -22,8 +22,26 @@ public:
                                      const torch::Tensor& draft_token_ids,
                                      size_t               propose_step) const;
 
+    // Mask draft logits at a single chain position. draft_tokens_so_far is
+    // [batch, step_idx+1]: col 0 is T0 (already accepted by prefill); cols
+    // 1..step_idx are draft tokens sampled earlier in this draftModelDecode
+    // invocation. The Python helper walks cols 1.. with accept_token, fills +
+    // applies the bitmask, then rolls back — matcher state at return equals
+    // state at entry.
+    void applyDraftGrammarConstraints(torch::Tensor&       logits,
+                                      const StreamGroups&  stream_groups,
+                                      const torch::Tensor& draft_tokens_so_far,
+                                      int                  step_idx) const;
+
     std::future<void> batchAcceptSpecGrammarTokensAsync(const StreamGroups&                          stream_groups,
                                                         const speculative::SpeculativeSamplerOutput& spec_output) const;
+
+    // Advance xgrammar matcher with the single token just sampled by target
+    // at prefill. Without this, the first decode step's bitmask would be
+    // generated from matcher state=START instead of "after T0", letting the
+    // model produce duplicated start tokens (e.g. `##` or double `{`).
+    std::future<void> batchAcceptPrefillBonusTokensAsync(const StreamGroups&  stream_groups,
+                                                         const torch::Tensor& token_ids_cpu) const;
 
     absl::Status dispatchPrefill(const StreamGroups& stream_groups,
                                  const MergedOutput& prefill_output,
