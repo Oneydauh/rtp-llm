@@ -71,7 +71,6 @@ TEST_F(SamplerTest, testGeneralSampling) {
         sequence_lengths,
         state_ptr,
         size_t(vocab_size),
-        size_t(0),  // origin_vocab_size
         size_t(step),
         batch_size,
         batch_size,

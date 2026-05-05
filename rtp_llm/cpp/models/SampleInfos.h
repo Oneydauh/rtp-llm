@@ -36,8 +36,6 @@ public:
     LogitsProcessorStatesPtr logits_processor_states_ptr;
 
     size_t vocab_size;
-    // Original tokenizer/model vocab size (non-padded).
-    size_t origin_vocab_size = 0;
     size_t step;  // typically largest sequence length in the batch
 
     size_t        batch_size;            // sum of all num_beams_in of all streams
