@@ -128,6 +128,7 @@ requirement([
     "aiter",
     "fastsafetensors",
     "pybind11_stubgen",
+    "xgrammar",
 ] + deep + flashinfer_with_cache + flashmla + rtp_kernel + flashattn)
 
 
@@ -135,19 +136,6 @@ py_library(
     name = "empty_target",
     srcs = [],
     deps = [],
-    visibility = ["//visibility:public"],
-)
-
-py_library(
-    name = "xgrammar",
-    deps = select({
-        "@//:cuda_pre_12_9": ["@pip_gpu_cuda12_torch//xgrammar"],
-        "@//:using_cuda12_9_x86": ["@pip_gpu_cuda12_9_torch//xgrammar"],
-        "@//:using_cuda12_arm": ["@pip_cuda12_arm_torch//xgrammar"],
-        "@//:using_rocm": ["@pip_gpu_rocm_torch//xgrammar"],
-        "@//:using_arm": ["@pip_arm_torch//xgrammar"],
-        "//conditions:default": ["@pip_cpu_torch//xgrammar"],
-    }),
     visibility = ["//visibility:public"],
 )
 
