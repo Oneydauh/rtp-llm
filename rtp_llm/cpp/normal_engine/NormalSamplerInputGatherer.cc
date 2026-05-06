@@ -133,7 +133,11 @@ SamplerInputs NormalSamplerInputGatherer::allocateSamplerInputs(const StreamGrou
     }
     sampler_inputs.token_ids =
         torch::empty({(int64_t)total_batch_size_in, (int64_t)(sampler_inputs.step + 1)}, torch::kInt32);
-    sampler_inputs.grammar_objs.resize(total_batch_size_in, py::none());
+    // Default-construct empty py::object() (m_ptr=nullptr). Setting py::none() here
+    // would touch Python and fail in cc_test runs that have no embedded interpreter.
+    // The grammar fill loop below populates only the slots whose stream has a real
+    // grammar, leaving the rest as empty objects (treated as "no grammar" downstream).
+    sampler_inputs.grammar_objs.resize(total_batch_size_in);
     sampler_inputs.generator.resize(total_batch_size_in);
     return sampler_inputs;
 }
@@ -194,7 +198,18 @@ void NormalSamplerInputGatherer::fillSamplerCommonInputs(SamplerInputs&         
         }
     }
 
-    {
+    // No-GIL pre-check: if no stream has a grammar object set, skip the whole
+    // populate loop (and the GIL acquire). hasGrammarObject() short-circuits on
+    // m_ptr==nullptr without touching Python, so cc_test runs that never set a
+    // grammar take the GIL-free fast path here.
+    bool any_grammar = false;
+    for (auto& stream : all_streams) {
+        if (stream->hasGrammarObject()) {
+            any_grammar = true;
+            break;
+        }
+    }
+    if (any_grammar) {
         py::gil_scoped_acquire acquire;
         batch_idx = 0;
         for (auto& stream : all_streams) {
@@ -206,8 +221,11 @@ void NormalSamplerInputGatherer::fillSamplerCommonInputs(SamplerInputs&         
             } else {
                 sampler_batch_size = stream->currentBatchSize();
             }
-            py::object grammar     = stream->tryGetGrammarObject();
-            bool       has_grammar = !grammar.is_none();
+            py::object grammar = stream->tryGetGrammarObject();
+            // tryGetGrammarObject() returns an empty py::object() (m_ptr==nullptr) when
+            // no grammar was ever set; check both that case and the explicit py::none()
+            // case before assigning into the slot.
+            bool has_grammar = static_cast<bool>(grammar) && !grammar.is_none();
             for (int i = 0; i < sampler_batch_size; ++i) {
                 if (has_grammar) {
                     sampler_inputs.grammar_objs[batch_idx] = grammar;

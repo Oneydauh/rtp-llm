@@ -240,7 +240,9 @@ private:
 
     std::shared_ptr<KVCacheManager> cache_manager_;
     kmonitor::MetricsReporterPtr    metrics_reporter_;
-    py::object                      grammar_backend_ = py::none();
+    // Default-constructed empty py::object() — m_ptr=nullptr, no Python
+    // touched at construction. Production callers assign a real backend.
+    py::object                      grammar_backend_;
     SchedulerType                   scheduler_type_;
     int                             dp_rank_ = 0;
 };

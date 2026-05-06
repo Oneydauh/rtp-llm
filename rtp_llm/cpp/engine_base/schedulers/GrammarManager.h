@@ -48,7 +48,13 @@ struct GrammarReadyPayload {
 // caller while any public method is waiting on `queue_mutex_`.
 class GrammarManager {
 public:
-    explicit GrammarManager(py::object grammar_backend, int num_workers = 2, int64_t compile_timeout_ms = 60000);
+    // Default-construct grammar_backend = empty py::object() so callers
+    // (mainly cc_test ctors) that have no Python interpreter can omit it
+    // entirely. py::object() with m_ptr=nullptr does NOT touch Python; only
+    // a real backend (or py::none()) would. hasBackend() guards the rest.
+    explicit GrammarManager(py::object grammar_backend  = py::object(),
+                            int        num_workers      = 2,
+                            int64_t    compile_timeout_ms = 60000);
     ~GrammarManager();
 
     size_t size() const;
@@ -101,9 +107,19 @@ private:
     void        replayPrefillTokensToGrammar(const GenerateStreamPtr& stream,
                                              py::object&              grammar_obj);  // requires GIL
 
+    // True iff grammar_backend_ holds a real (non-null, non-None) Python
+    // object. Tests construct with the default empty py::object() and never
+    // need a Python interpreter.
+    bool hasBackend() const {
+        return static_cast<bool>(grammar_backend_) && !grammar_backend_.is_none();
+    }
+
     // Python-side backend. `grammar_backend_` is accessed only under GIL.
+    // Default-constructed = empty (m_ptr == nullptr), no GIL needed for ctor
+    // or dtor. invalid_grammar_cls_ likewise — drop the `= py::none()` form
+    // because that initializer would call into Python at member init time.
     py::object grammar_backend_;
-    py::object invalid_grammar_cls_ = py::none();
+    py::object invalid_grammar_cls_;
 
     // Queue of in-flight grammar entries. Protected by queue_mutex_ for all
     // read and write access. Entries are ordered by arrival (FIFO-ish).

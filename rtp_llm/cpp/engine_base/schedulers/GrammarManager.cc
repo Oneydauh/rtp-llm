@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <future>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -39,20 +40,30 @@ std::string keyBrief(const GrammarKey& key) {
 
 GrammarManager::GrammarManager(py::object grammar_backend, int num_workers, int64_t compile_timeout_ms):
     grammar_backend_(std::move(grammar_backend)) {
-    py::gil_scoped_acquire acquire;
-    if (!grammar_backend_.is_none() && py::hasattr(grammar_backend_, "_invalid_grammar_cls")) {
-        invalid_grammar_cls_ = grammar_backend_.attr("_invalid_grammar_cls");
-    }
     if (compile_timeout_ms > 0) {
         grammar_compile_timeout_ms_ = compile_timeout_ms;
     }
-    RTP_LLM_LOG_INFO("GrammarManager init: backend_type=%s, compile_timeout_ms=%lld, num_workers=%d",
-                     pyObjTypeName(grammar_backend_).c_str(),
-                     static_cast<long long>(grammar_compile_timeout_ms_),
-                     num_workers);
 
-    // Release GIL before spawning workers — workers acquire GIL themselves.
-    py::gil_scoped_release release;
+    // No backend → "disabled" mode used by cc_test ctors. Skip every
+    // Python touch (GIL acquire, hasattr, attr lookup, worker spawn). The
+    // manager then short-circuits in process_req_with_grammar and friends
+    // via hasBackend() guards.
+    if (!hasBackend()) {
+        RTP_LLM_LOG_INFO("GrammarManager init: backend=disabled, compile_timeout_ms=%lld",
+                         static_cast<long long>(grammar_compile_timeout_ms_));
+        return;
+    }
+
+    {
+        py::gil_scoped_acquire acquire;
+        if (py::hasattr(grammar_backend_, "_invalid_grammar_cls")) {
+            invalid_grammar_cls_ = grammar_backend_.attr("_invalid_grammar_cls");
+        }
+        RTP_LLM_LOG_INFO("GrammarManager init: backend_type=%s, compile_timeout_ms=%lld, num_workers=%d",
+                         pyObjTypeName(grammar_backend_).c_str(),
+                         static_cast<long long>(grammar_compile_timeout_ms_),
+                         num_workers);
+    }
 
     if (num_workers < 1) {
         num_workers = 1;
@@ -72,20 +83,39 @@ GrammarManager::~GrammarManager() {
         stop_ = true;
     }
     worker_cv_.notify_all();
-    for (auto& t : workers_) {
-        if (t.joinable()) {
-            t.join();
+
+    // Disabled mode: no workers were spawned and members are empty
+    // py::object() (m_ptr=nullptr). Their dtors are no-ops, no GIL needed.
+    if (!hasBackend()) {
+        return;
+    }
+
+    {
+        // Workers may be inside compile_now waiting to re-acquire GIL.
+        // If the caller holds GIL, t.join() deadlocks — release for the
+        // join. PyGILState_Check guards against double-release when the
+        // caller already released GIL.
+        std::optional<py::gil_scoped_release> release;
+        if (PyGILState_Check()) {
+            release.emplace();
+        }
+        for (auto& t : workers_) {
+            if (t.joinable()) {
+                t.join();
+            }
         }
     }
 
     // Drop python handles and queue entries under GIL for clean refcount.
-    try {
-        py::gil_scoped_acquire acquire;
-        grammar_queue_.clear();
-        compile_tasks_.clear();
-        invalid_grammar_cls_ = py::none();
-        grammar_backend_     = py::none();
-    } catch (...) {}
+    if (Py_IsInitialized()) {
+        try {
+            py::gil_scoped_acquire acquire;
+            grammar_queue_.clear();
+            compile_tasks_.clear();
+            grammar_backend_     = py::object();
+            invalid_grammar_cls_ = py::object();
+        } catch (...) {}
+    }
 }
 
 size_t GrammarManager::size() const {
@@ -111,13 +141,18 @@ void GrammarManager::clear() {
 
     RTP_LLM_LOG_INFO("GrammarManager clear: drained=%zu", drained.size());
 
+    if (!hasBackend()) {
+        // Disabled mode: drained is empty (no entries are ever queued
+        // when there's no backend); just clear it and return.
+        drained.clear();
+        return;
+    }
+
     py::gil_scoped_acquire acquire;
-    if (!grammar_backend_.is_none()) {
-        try {
-            grammar_backend_.attr("reset")();
-        } catch (const py::error_already_set& e) {
-            RTP_LLM_LOG_WARNING("grammar backend reset failed: %s", e.what());
-        }
+    try {
+        grammar_backend_.attr("reset")();
+    } catch (const py::error_already_set& e) {
+        RTP_LLM_LOG_WARNING("grammar backend reset failed: %s", e.what());
     }
     for (auto& entry : drained) {
         if (entry.stream) {
@@ -154,7 +189,7 @@ py::tuple GrammarManager::grammarKeyToPyTuple(const GrammarKey& key) const {
 }
 
 bool GrammarManager::isInvalidGrammar(const py::object& obj) const {
-    if (invalid_grammar_cls_.is_none()) {
+    if (!static_cast<bool>(invalid_grammar_cls_) || invalid_grammar_cls_.is_none()) {
         return false;
     }
     return py::isinstance(obj, invalid_grammar_cls_);
@@ -202,6 +237,18 @@ bool GrammarManager::process_req_with_grammar(const GenerateStreamPtr& stream) {
     // queue_mutex_ to enforce the lock order (queue_mutex_ before GIL).
     // ------------------------------------------------------------------
     RTP_LLM_LOG_INFO("stream [%ld] process_req_with_grammar ENTER", stream ? stream->streamId() : -1);
+
+    // Disabled mode (no backend, no Python): short-circuit before any GIL
+    // acquire. isGrammarRequested only reads the C++ generate config — safe
+    // to call without GIL.
+    if (!hasBackend()) {
+        if (isGrammarRequested(stream)) {
+            stream->reportError(ErrorCode::INVALID_PARAMS,
+                                "Grammar-based generation requested but grammar backend is disabled");
+        }
+        return false;
+    }
+
     bool       require_reasoning = false;
     GrammarKey key;
     {
@@ -210,13 +257,6 @@ bool GrammarManager::process_req_with_grammar(const GenerateStreamPtr& stream) {
         if (!isGrammarRequested(stream)) {
             stream->clearGrammarObject();
             RTP_LLM_LOG_INFO("stream [%ld] no grammar constraints, bypass grammar queue", stream->streamId());
-            return false;
-        }
-
-        if (grammar_backend_.is_none()) {
-            stream->reportError(ErrorCode::INVALID_PARAMS,
-                            "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not "
-                            "supported when the server is launched with --grammar-backend none");
             return false;
         }
 
@@ -554,10 +594,19 @@ void GrammarManager::workerLoop() {
                          keyBrief(task.key).c_str(),
                          static_cast<int>(task.require_reasoning));
 
-        const auto          t_start = std::chrono::steady_clock::now();
-        GrammarReadyPayload payload;
+        const auto t_start = std::chrono::steady_clock::now();
+
+        // Hold the GIL for the entire task lifecycle: compile, set_value,
+        // and the final drop of `task.promise`. The caller may have already
+        // dropped its shared_future (timeout path), in which case releasing
+        // the last promise reference here destroys the shared state
+        // synchronously on this worker thread. Without GIL the contained
+        // py::object's destructor calls Py_XDECREF and aborts with
+        // "PyThreadState_Get: GIL released".
         try {
             py::gil_scoped_acquire acquire;
+
+            GrammarReadyPayload payload;
             try {
                 py::object grammar = grammar_backend_.attr("compile_now")(
                     py::make_tuple(task.key.key_type, task.key.key_string), task.require_reasoning);
@@ -571,27 +620,34 @@ void GrammarManager::workerLoop() {
                 payload.is_invalid  = true;
                 payload.error_msg   = e.what();
             }
+
+            const auto elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_start)
+                    .count();
+            RTP_LLM_LOG_INFO("grammar worker compile_now done: key=%s, invalid=%d, elapsed_ms=%lld, err=%s",
+                             keyBrief(task.key).c_str(),
+                             static_cast<int>(payload.is_invalid),
+                             static_cast<long long>(elapsed_ms),
+                             payload.error_msg.empty() ? "" : payload.error_msg.c_str());
+
+            try {
+                task.promise->set_value(std::move(payload));
+                RTP_LLM_LOG_INFO("grammar worker promise set_value: key=%s", keyBrief(task.key).c_str());
+            } catch (const std::future_error& fe) {
+                // Promise already satisfied or moved-from — ignore.
+                RTP_LLM_LOG_WARNING(
+                    "grammar worker set_value future_error: key=%s, what=%s", keyBrief(task.key).c_str(), fe.what());
+            }
+
+            // Drop the promise under GIL. If the caller already dropped the
+            // future on timeout, the shared state — and the py::object it
+            // owns — is freed synchronously here, safely under GIL.
+            task.promise.reset();
         } catch (const std::exception& e) {
             // Should only fire if GIL acquire itself throws during shutdown.
-            payload.grammar_obj = py::object();
-            payload.is_invalid  = true;
-            payload.error_msg   = std::string("worker setup error: ") + e.what();
-        }
-        const auto elapsed_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_start).count();
-        RTP_LLM_LOG_INFO("grammar worker compile_now done: key=%s, invalid=%d, elapsed_ms=%lld, err=%s",
-                         keyBrief(task.key).c_str(),
-                         static_cast<int>(payload.is_invalid),
-                         static_cast<long long>(elapsed_ms),
-                         payload.error_msg.empty() ? "" : payload.error_msg.c_str());
-
-        try {
-            task.promise->set_value(std::move(payload));
-            RTP_LLM_LOG_INFO("grammar worker promise set_value: key=%s", keyBrief(task.key).c_str());
-        } catch (const std::future_error& fe) {
-            // Promise already satisfied or moved-from — ignore.
-            RTP_LLM_LOG_WARNING(
-                "grammar worker set_value future_error: key=%s, what=%s", keyBrief(task.key).c_str(), fe.what());
+            RTP_LLM_LOG_WARNING("grammar worker setup error: key=%s, what=%s",
+                                keyBrief(task.key).c_str(),
+                                e.what());
         }
     }
 }

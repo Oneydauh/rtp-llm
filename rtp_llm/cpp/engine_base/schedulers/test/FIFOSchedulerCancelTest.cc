@@ -50,8 +50,7 @@ protected:
                                                pd_sep_config,
                                                parallelism_config,
                                                model_specific_config,
-                                               cache_manager_,
-                                               py::none());
+                                               cache_manager_);
     }
 
     GenerateStreamPtr createStream(const std::vector<int>& input_tokens = {1, 2, 3}) {

@@ -173,6 +173,12 @@ std::future<void> NormalOutputDispatcher::batchAcceptGrammarTokensAsync(const St
     if (!token_ids_cpu.defined())
         return {};
 
+    // Caller (NormalBatchStreamProcessor::dispatch) has already pre-checked that at
+    // least one stream carries a grammar object before invoking us, so by here we
+    // always have Python and a real grammar to accept against. The per-slot
+    // tryGetGrammarObject() may still return empty / None for individual streams
+    // that don't have grammar — checked below.
+
     const size_t token_stride  = token_ids_cpu.size(1);
     int          batch_idx_out = 0;
 
@@ -185,7 +191,10 @@ std::future<void> NormalOutputDispatcher::batchAcceptGrammarTokensAsync(const St
         bool has_beam_search = stream->currentNumBeams() > 1 || stream->nextNumBeams() > 1;
 
         py::object grammar = has_beam_search ? py::none() : stream->tryGetGrammarObject();
-        if (!grammar.is_none()) {
+        // tryGetGrammarObject() may return an empty py::object() (m_ptr=nullptr)
+        // if no grammar was ever set on the stream; skip both that case and the
+        // explicit py::none() case before appending.
+        if (static_cast<bool>(grammar) && !grammar.is_none()) {
             int32_t token_id = token_ids_cpu.data_ptr<int32_t>()[batch_idx_out * token_stride + token_stride - 1];
             bool    is_done  = !stream->isActive();
             triples.append(py::make_tuple(grammar, token_id, is_done));

@@ -22,7 +22,11 @@ public:
                            const ParallelismConfig&               parallelism_config,
                            const ModelSpecificConfig&             model_specific_config,
                            const std::shared_ptr<KVCacheManager>& cache_manager,
-                           py::object                             grammar_backend,
+                           // grammar_backend defaults to empty py::object() so cc_test ctors
+                           // that have no Python interpreter can omit it. py::object() with
+                           // m_ptr=nullptr does NOT touch Python; only a real backend or
+                           // py::none() would.
+                           py::object                             grammar_backend            = py::object(),
                            int                                    grammar_num_workers        = 2,
                            int64_t                                grammar_compile_timeout_ms = 60000,
                            const kmonitor::MetricsReporterPtr     metrics_reporter           = nullptr,

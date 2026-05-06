@@ -101,11 +101,16 @@ public:
                    size_t                                extra_reserve_token_num = 0,
                    bool                                  pert_test               = false);
     virtual ~GenerateStream() {
-        // py::object DECREF must happen under GIL.
-        try {
-            py::gil_scoped_acquire acquire;
-            grammar_obj_ = py::none();
-        } catch (...) {}
+        // grammar_obj_ DECREF must happen under GIL — but only if it's
+        // actually populated. Default-constructed py::object() with
+        // m_ptr=nullptr destructs without touching Python, so cc_tests
+        // that never set a grammar can run with no Python interpreter.
+        if (grammar_obj_ && Py_IsInitialized()) {
+            try {
+                py::gil_scoped_acquire acquire;
+                grammar_obj_ = py::object();
+            } catch (...) {}
+        }
         reportMetric();
         releaseResource();
         stream_magic_ = 0;

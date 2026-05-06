@@ -65,8 +65,7 @@ protected:
                                                pd_sep_config,
                                                parallelism_config,
                                                model_specific_config,
-                                               cache_manager_,
-                                               py::none());
+                                               cache_manager_);
     }
 
     GenerateStreamPtr createStream(const std::vector<int>& input_tokens        = {1, 2, 3},
@@ -248,8 +247,7 @@ TEST_F(FIFOSchedulerAsyncCacheTest, testLoadingCacheStreams_CountedInBatchLimit)
                                                                     pd_sep_config,
                                                                     parallelism_config,
                                                                     model_specific_config,
-                                                                    cache_manager_,
-                                                                    py::none());
+                                                                    cache_manager_);
 
     auto pending_ctx = createPendingAsyncContext();
     EXPECT_CALL(*mock_coord_, asyncRead(_)).WillRepeatedly(Return(std::static_pointer_cast<AsyncContext>(pending_ctx)));

@@ -1007,6 +1007,10 @@ int GenerateStream::reuseBlockSize() const {
     return reuse_length / seq_size_per_block;
 }
 
+// Grammar accessors short-circuit when grammar_obj_ is the default-empty
+// py::object() (m_ptr == nullptr). In that state nothing here touches
+// Python, so cc_test binaries with no embedded interpreter are safe.
+
 void GenerateStream::setGrammarObject(const py::object& grammar) {
     std::lock_guard<std::mutex> lock(*mutex_);
     py::gil_scoped_acquire      acquire;
@@ -1015,26 +1019,29 @@ void GenerateStream::setGrammarObject(const py::object& grammar) {
 
 py::object GenerateStream::grammarObject() const {
     std::lock_guard<std::mutex> lock(*mutex_);
-    py::gil_scoped_acquire      acquire;
     if (!grammar_obj_) {
-        return py::none();
+        return py::object();  // empty; caller must treat as "no grammar"
     }
+    py::gil_scoped_acquire acquire;
     return grammar_obj_;
 }
 
 bool GenerateStream::hasGrammarObject() const {
     std::lock_guard<std::mutex> lock(*mutex_);
-    py::gil_scoped_acquire      acquire;
     if (!grammar_obj_) {
         return false;
     }
+    py::gil_scoped_acquire acquire;
     return !grammar_obj_.is_none();
 }
 
 py::object GenerateStream::tryGetGrammarObject() const {
     std::lock_guard<std::mutex> lock(*mutex_);
-    py::gil_scoped_acquire      acquire;
-    if (!grammar_obj_ || grammar_obj_.is_none()) {
+    if (!grammar_obj_) {
+        return py::object();  // empty; equivalent to "no grammar"
+    }
+    py::gil_scoped_acquire acquire;
+    if (grammar_obj_.is_none()) {
         return py::none();
     }
     return grammar_obj_;
@@ -1042,8 +1049,11 @@ py::object GenerateStream::tryGetGrammarObject() const {
 
 void GenerateStream::clearGrammarObject() {
     std::lock_guard<std::mutex> lock(*mutex_);
-    py::gil_scoped_acquire      acquire;
-    grammar_obj_ = py::none();
+    if (!grammar_obj_) {
+        return;  // already empty, nothing to drop
+    }
+    py::gil_scoped_acquire acquire;
+    grammar_obj_ = py::object();  // empty, not py::none()
 }
 
 void GenerateStream::setSeqLength(int seq_length) {

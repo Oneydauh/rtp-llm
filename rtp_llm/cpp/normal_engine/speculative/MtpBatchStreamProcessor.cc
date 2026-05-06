@@ -516,13 +516,13 @@ void MtpBatchStreamProcessor::applySpecGrammarConstraints(SamplerInputs&       i
                                                           const StreamGroups&  stream_groups,
                                                           const torch::Tensor& draft_token_ids,
                                                           size_t               propose_step) const {
-    py::gil_scoped_acquire acquire;
-
+    // No-GIL pre-check: if no stream has a grammar object set, return without ever
+    // touching Python. hasGrammarObject() short-circuits on m_ptr==nullptr without
+    // taking the GIL, so cc_test runs (no embedded interpreter) take this fast path.
     auto all_streams = stream_groups.allStreams();
     bool has_grammar = false;
     for (auto& stream : all_streams) {
-        py::object grammar = stream->tryGetGrammarObject();
-        if (!grammar.is_none()) {
+        if (stream->hasGrammarObject()) {
             has_grammar = true;
             break;
         }
@@ -530,6 +530,7 @@ void MtpBatchStreamProcessor::applySpecGrammarConstraints(SamplerInputs&       i
     if (!has_grammar) {
         return;
     }
+    py::gil_scoped_acquire acquire;
 
     size_t   score_len = propose_step + 1;
     py::list stream_grammars;
@@ -537,7 +538,8 @@ void MtpBatchStreamProcessor::applySpecGrammarConstraints(SamplerInputs&       i
 
     for (auto& stream : all_streams) {
         py::object grammar = stream->tryGetGrammarObject();
-        if (grammar.is_none()) {
+        bool       has     = static_cast<bool>(grammar) && !grammar.is_none();
+        if (!has) {
             stream_grammars.append(py::make_tuple(py::none(), py::list()));
         } else {
             py::list   draft_tokens;
@@ -558,13 +560,14 @@ void MtpBatchStreamProcessor::applyDraftGrammarConstraints(torch::Tensor&       
                                                            const StreamGroups&  stream_groups,
                                                            const torch::Tensor& draft_tokens_so_far,
                                                            int                  step_idx) const {
-    py::gil_scoped_acquire acquire;
-
+    // No-GIL pre-check: skip the whole path (and the GIL acquire) if no stream
+    // carries grammar. hasGrammarObject() does not touch Python when grammar_obj_
+    // is unset, so cc_test runs without an embedded interpreter take the fast
+    // return path here.
     auto all_streams = stream_groups.allStreams();
     bool has_grammar = false;
     for (auto& stream : all_streams) {
-        py::object grammar = stream->tryGetGrammarObject();
-        if (!grammar.is_none()) {
+        if (stream->hasGrammarObject()) {
             has_grammar = true;
             break;
         }
@@ -572,6 +575,7 @@ void MtpBatchStreamProcessor::applyDraftGrammarConstraints(torch::Tensor&       
     if (!has_grammar) {
         return;
     }
+    py::gil_scoped_acquire acquire;
 
     const int64_t cols = draft_tokens_so_far.size(1);
     py::list      stream_grammars;
@@ -579,7 +583,10 @@ void MtpBatchStreamProcessor::applyDraftGrammarConstraints(torch::Tensor&       
 
     for (auto& stream : all_streams) {
         py::object grammar = stream->tryGetGrammarObject();
-        if (grammar.is_none()) {
+        // tryGetGrammarObject() may return empty py::object() (m_ptr=nullptr) for
+        // streams without grammar; treat that identically to py::none() here.
+        bool has = static_cast<bool>(grammar) && !grammar.is_none();
+        if (!has) {
             stream_grammars.append(py::make_tuple(py::none(), py::list()));
         } else {
             py::list   tokens;
@@ -602,6 +609,18 @@ std::future<void> MtpBatchStreamProcessor::batchAcceptPrefillBonusTokensAsync(
         return {};
     }
 
+    // No-GIL pre-check: skip the GIL acquire entirely if no stream has grammar.
+    bool any_grammar = false;
+    for (auto& stream : stream_groups.allStreams()) {
+        if (stream->hasGrammarObject()) {
+            any_grammar = true;
+            break;
+        }
+    }
+    if (!any_grammar) {
+        return {};
+    }
+
     const size_t token_stride = token_ids_cpu.size(1);
     int          batch_idx    = 0;
 
@@ -613,7 +632,9 @@ std::future<void> MtpBatchStreamProcessor::batchAcceptPrefillBonusTokensAsync(
         auto next_batch_size = stream->nextBatchSize();
 
         py::object grammar = stream->tryGetGrammarObject();
-        if (!grammar.is_none()) {
+        // tryGetGrammarObject() may return empty py::object() (m_ptr=nullptr) for
+        // streams that didn't set a grammar; treat that identically to py::none().
+        if (static_cast<bool>(grammar) && !grammar.is_none()) {
             int32_t token_id =
                 token_ids_cpu.data_ptr<int32_t>()[batch_idx * token_stride + token_stride - 1];
             bool is_done = !stream->isActive();
@@ -667,6 +688,18 @@ std::future<void> MtpBatchStreamProcessor::batchAcceptPrefillBonusTokensAsync(
 std::future<void> MtpBatchStreamProcessor::batchAcceptSpecGrammarTokensAsync(
     const StreamGroups& stream_groups, const speculative::SpeculativeSamplerOutput& spec_output) const {
 
+    // No-GIL pre-check: skip the GIL acquire entirely if no stream has grammar.
+    bool any_grammar = false;
+    for (auto& stream : stream_groups.allStreams()) {
+        if (stream->hasGrammarObject()) {
+            any_grammar = true;
+            break;
+        }
+    }
+    if (!any_grammar) {
+        return {};
+    }
+
     py::gil_scoped_acquire         acquire;
     py::list                       triples;
     std::vector<GenerateStreamPtr> grammar_streams;
@@ -674,7 +707,9 @@ std::future<void> MtpBatchStreamProcessor::batchAcceptSpecGrammarTokensAsync(
     int stream_idx = 0;
     for (auto& stream : stream_groups.allStreams()) {
         py::object grammar = stream->tryGetGrammarObject();
-        if (!grammar.is_none()) {
+        // tryGetGrammarObject() may return empty py::object() (m_ptr=nullptr) for
+        // streams that didn't set a grammar; treat that identically to py::none().
+        if (static_cast<bool>(grammar) && !grammar.is_none()) {
             size_t     accept_len = spec_output.accept_len[stream_idx];
             const int* token_ptr  = spec_output.accept_tokens[stream_idx].data_ptr<int>();
 

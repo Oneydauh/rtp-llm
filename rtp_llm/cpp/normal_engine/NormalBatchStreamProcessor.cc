@@ -32,7 +32,12 @@ NormalBatchStreamProcessor::NormalBatchStreamProcessor(
 
     model_input_gatherer_   = std::make_unique<NormalModelInputGatherer>(model_input_gatherer_config_);
     sampler_input_gatherer_ = std::make_unique<NormalSamplerInputGatherer>();
-    {
+    // Skip the grammar_batch_ops import when Python isn't initialized — cc_test
+    // binaries built without an embedded interpreter never run grammar streams,
+    // so leaving grammar_batch_ops_ as a default-constructed empty py::module_
+    // is safe. The downstream guards in applyGrammarConstraints() and
+    // batchAcceptGrammarTokensAsync() short-circuit before touching it.
+    if (Py_IsInitialized()) {
         py::gil_scoped_acquire acquire;
         grammar_batch_ops_ = py::module_::import("rtp_llm.async_decoder_engine.grammar_batch_ops");
     }
@@ -43,9 +48,23 @@ absl::Status NormalBatchStreamProcessor::dispatch(const StreamGroups& stream_gro
                                                   const MergedOutput& merge_outputs) const {
     auto status = output_dispatcher_->dispatch(stream_groups, merge_outputs);
     if (status.ok()) {
-        const auto&         token_ids     = merge_outputs.sampler_output.token_ids;
-        const torch::Tensor token_ids_cpu = token_ids.defined() ? token_ids.cpu() : torch::Tensor();
-        grammar_accept_future_ = output_dispatcher_->batchAcceptGrammarTokensAsync(stream_groups, token_ids_cpu);
+        // No-GIL pre-check: only invoke the grammar-accept path when at least one
+        // stream actually carries a grammar object. hasGrammarObject() short-circuits
+        // on m_ptr==nullptr without touching Python, so cc_test runs (no embedded
+        // interpreter, no grammars) take this fast path and never call into
+        // batchAcceptGrammarTokensAsync (which assumes Python is ready).
+        bool any_grammar = false;
+        for (auto& stream : stream_groups.allStreams()) {
+            if (stream->hasGrammarObject()) {
+                any_grammar = true;
+                break;
+            }
+        }
+        if (any_grammar) {
+            const auto&         token_ids     = merge_outputs.sampler_output.token_ids;
+            const torch::Tensor token_ids_cpu = token_ids.defined() ? token_ids.cpu() : torch::Tensor();
+            grammar_accept_future_ = output_dispatcher_->batchAcceptGrammarTokensAsync(stream_groups, token_ids_cpu);
+        }
     }
     return status;
 }
@@ -81,23 +100,24 @@ void NormalBatchStreamProcessor::setLogitsProcessorInputs(SamplerInputs&        
 }
 
 void NormalBatchStreamProcessor::applyGrammarConstraints(SamplerInputs& inputs) const {
-    // Fast-path probe without GIL. `py::object::is_none()` is implemented as
-    // `ptr() == Py_None` — a pure C++ pointer compare against a static CPython
-    // singleton, with no refcount / heap / interpreter interaction. That is
-    // GIL-independent. Safety here additionally relies on two invariants:
-    //   (a) `inputs.grammar_objs` was populated upstream on this same
-    //       executor thread by `gatherSamplerInput` and is not concurrently
-    //       mutated during this forward, so there is no data race on the
-    //       stored PyObject* members.
-    //   (b) `gatherSamplerInput` always fills each slot with either
-    //       `py::none()` or a real grammar object — never a default-
-    //       constructed empty handle (nullptr), which `is_none()` would
-    //       (correctly per its spec, but misleadingly for us) report as
-    //       NOT-None and push us into the GIL-held slow path below.
+    // Fast-path probe without GIL. Both `static_cast<bool>(obj)` (m_ptr != nullptr)
+    // and `is_none()` (m_ptr == Py_None) are pure C++ pointer compares — no refcount
+    // / heap / interpreter interaction, so they're safe without the GIL. Safety also
+    // relies on two invariants:
+    //   (a) `inputs.grammar_objs` was populated upstream on this same executor thread
+    //       by `gatherSamplerInput` and is not concurrently mutated during this
+    //       forward, so there is no data race on the stored PyObject* members.
+    //   (b) `gatherSamplerInput` fills each slot with one of:
+    //         - default-empty py::object() (m_ptr=nullptr) → "no grammar"
+    //         - py::none() → "no grammar" (legacy, kept for resilience)
+    //         - real grammar object → "has grammar"
+    //       Both empty and None mean "no grammar" for the purpose of this probe.
+    //       The empty case is what cc_test sees (no embedded interpreter, no stream
+    //       ever sets a grammar); production sees real grammars or None.
     auto& grammar_objs = inputs.grammar_objs;
     bool  has_grammar  = false;
     for (auto& obj : grammar_objs) {
-        if (!obj.is_none()) {
+        if (static_cast<bool>(obj) && !obj.is_none()) {
             has_grammar = true;
             break;
         }

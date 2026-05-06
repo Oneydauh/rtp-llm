@@ -35,6 +35,14 @@ namespace rtp_llm {
 
 class GrammarManagerTest: public DeviceTestBase {
 public:
+    void SetUp() override {
+        DeviceTestBase::SetUp();
+        // This test exercises Python paths (py::exec / py::module_::import for
+        // the fake backend), so we explicitly opt in to the embedded
+        // interpreter. Most other cc_tests don't touch Python.
+        rtp_llm::test_helpers::ensurePythonInterpreterStarted();
+    }
+
     // Build a fresh stream with the given grammar request. `json_schema` is
     // set to drive isGrammarRequested=true; that's all the manager inspects.
     GenerateStreamPtr createGrammarStream(const ModelConfig&     model_config,
@@ -185,10 +193,15 @@ TEST_F(GrammarManagerTest, CacheMissQueuesAndWorkerCompletes) {
     EXPECT_EQ(mgr.size(), 1u);
 
     // Spin-wait on get_ready_grammar_requests for up to 2s.
+    // Release GIL during the wait so the GrammarManager worker can acquire
+    // it for compile_now; otherwise main holds GIL forever and worker hangs.
     std::list<GenerateStreamPtr> ready;
-    for (int i = 0; i < 200 && ready.empty(); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        ready = mgr.get_ready_grammar_requests();
+    {
+        py::gil_scoped_release release;
+        for (int i = 0; i < 200 && ready.empty(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            ready = mgr.get_ready_grammar_requests();
+        }
     }
     ASSERT_EQ(ready.size(), 1u) << "worker failed to complete compile within 2s";
     EXPECT_EQ(ready.front(), stream);
@@ -211,12 +224,15 @@ TEST_F(GrammarManagerTest, InFlightDedupShareCompile) {
     EXPECT_TRUE(mgr.process_req_with_grammar(s2));
     EXPECT_EQ(mgr.size(), 2u);
 
-    // Wait for both to go ready.
+    // Wait for both to go ready. Release GIL so the worker can compile.
     size_t total_ready = 0;
-    for (int i = 0; i < 300 && total_ready < 2; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        auto ready = mgr.get_ready_grammar_requests();
-        total_ready += ready.size();
+    {
+        py::gil_scoped_release release;
+        for (int i = 0; i < 300 && total_ready < 2; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            auto ready = mgr.get_ready_grammar_requests();
+            total_ready += ready.size();
+        }
     }
     EXPECT_EQ(total_ready, 2u);
 
@@ -238,9 +254,12 @@ TEST_F(GrammarManagerTest, InvalidGrammarReportsError) {
     EXPECT_TRUE(mgr.process_req_with_grammar(stream));
 
     std::list<GenerateStreamPtr> ready;
-    for (int i = 0; i < 200 && ready.empty(); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        ready = mgr.get_ready_grammar_requests();
+    {
+        py::gil_scoped_release release;
+        for (int i = 0; i < 200 && ready.empty(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            ready = mgr.get_ready_grammar_requests();
+        }
     }
     ASSERT_EQ(ready.size(), 1u);
     // Stream must have an error status; isActive() returns false.
@@ -261,11 +280,14 @@ TEST_F(GrammarManagerTest, TimeoutFailsStream) {
     // Poll until the manager reports the stream as failed. Must observe
     // failure within a few hundred ms — not wait for full compile.
     std::list<GenerateStreamPtr> ready;
-    for (int i = 0; i < 30; ++i) {  // ~300ms
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        auto cur = mgr.get_ready_grammar_requests();
-        ready.splice(ready.end(), cur);
-        if (!ready.empty()) break;
+    {
+        py::gil_scoped_release release;
+        for (int i = 0; i < 30; ++i) {  // ~300ms
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            auto cur = mgr.get_ready_grammar_requests();
+            ready.splice(ready.end(), cur);
+            if (!ready.empty()) break;
+        }
     }
     ASSERT_EQ(ready.size(), 1u);
     EXPECT_FALSE(stream->isActive());
@@ -307,7 +329,10 @@ TEST_F(GrammarManagerTest, CleanupStreamRemovesFromQueue) {
     EXPECT_EQ(mgr.size(), 0u);
 
     py::gil_scoped_acquire acquire;
-    EXPECT_TRUE(stream->tryGetGrammarObject().is_none())
+    // After cleanup, tryGetGrammarObject() may return either an empty py::object()
+    // (m_ptr=nullptr) or py::none() — both mean "no grammar" for our purposes.
+    py::object g = stream->tryGetGrammarObject();
+    EXPECT_TRUE(!static_cast<bool>(g) || g.is_none())
         << "cleanupStream should clear the stream's grammar object";
 }
 

@@ -36,7 +36,7 @@ TEST_F(FIFOSchedulerTest, testSimple) {
     ParallelismConfig   parallelism_config;
     ModelSpecificConfig model_specific_config;
     FIFOScheduler       scheduler(
-        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager, py::none());
+        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager);
     std::shared_ptr<GenerateInput> query = make_shared<GenerateInput>();
     query->input_ids                     = torch::tensor({1}, torch::kInt32);
     query->generate_config               = make_shared<GenerateConfig>();
@@ -80,7 +80,7 @@ TEST_F(FIFOSchedulerTest, testInitKVCacheLackMem) {
     ParallelismConfig   parallelism_config;
     ModelSpecificConfig model_specific_config;
     FIFOScheduler       scheduler(
-        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager, py::none());
+        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager);
     std::shared_ptr<GenerateInput> query = make_shared<GenerateInput>();
     query->input_ids                     = torch::tensor({1, 2, 3}, torch::kInt32);
     query->generate_config               = make_shared<GenerateConfig>();
@@ -111,7 +111,7 @@ TEST_F(FIFOSchedulerTest, testIncrKVCacheLackMem) {
     ParallelismConfig   parallelism_config;
     ModelSpecificConfig model_specific_config;
     FIFOScheduler       scheduler(
-        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager, py::none());
+        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager);
     std::shared_ptr<GenerateInput> query = make_shared<GenerateInput>();
     query->input_ids                     = torch::tensor({1, 2, 3, 4}, torch::kInt32);
     query->generate_config               = make_shared<GenerateConfig>();
@@ -166,7 +166,7 @@ TEST_F(FIFOSchedulerTest, testInitKVCacheRejectedByReserveBlocks) {
     ParallelismConfig   parallelism_config;
     ModelSpecificConfig model_specific_config;
     FIFOScheduler       scheduler(
-        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager, py::none());
+        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager);
 
     // Need 6 blocks. With reserve=5 blocks and available=10 blocks, init malloc should be rejected.
     std::shared_ptr<GenerateInput> query = make_shared<GenerateInput>();
@@ -215,7 +215,7 @@ TEST_F(FIFOSchedulerTest, testReserveBlocksOnlyAffectInitMallocNotIncrMalloc) {
     ParallelismConfig   parallelism_config;
     ModelSpecificConfig model_specific_config;
     FIFOScheduler       scheduler(
-        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager, py::none());
+        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager);
 
     // Init need 4 blocks, should pass: 10 >= 4 + 5.
     std::shared_ptr<GenerateInput> query = make_shared<GenerateInput>();
@@ -259,7 +259,7 @@ TEST_F(FIFOSchedulerTest, testReuseCache) {
     ParallelismConfig   parallelism_config;
     ModelSpecificConfig model_specific_config;
     FIFOScheduler       scheduler(
-        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager, py::none());
+        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager);
 
     std::shared_ptr<GenerateInput> query = make_shared<GenerateInput>();
     query->input_ids                     = torch::tensor({1, 2, 3, 4, 5}, torch::kInt32);
@@ -331,7 +331,7 @@ TEST_F(FIFOSchedulerTest, testMaxContextBatchSize) {
     ParallelismConfig   parallelism_config;
     ModelSpecificConfig model_specific_config;
     FIFOScheduler       scheduler(
-        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager, py::none());
+        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager);
 
     {
         // test normalcase
@@ -426,7 +426,7 @@ TEST_F(FIFOSchedulerTest, testCheckInputLengthIgnoresBatchSizeFanOut) {
     ParallelismConfig   parallelism_config;
     ModelSpecificConfig model_specific_config;
     FIFOScheduler       scheduler(
-        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager, py::none());
+        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager);
 
     {
         // num_return_sequences fan-out: input_len 7 * batch 20 = 140 > 100, but accepted.
@@ -483,7 +483,7 @@ TEST_F(FIFOSchedulerTest, testBatchEnqueue) {
     ParallelismConfig   parallelism_config;
     ModelSpecificConfig model_specific_config;
     FIFOScheduler       scheduler(
-        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager, py::none());
+        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager);
     vector<GenerateStreamPtr> streams;
     {
         std::shared_ptr<GenerateInput> query = make_shared<GenerateInput>();
@@ -530,7 +530,7 @@ TEST_F(FIFOSchedulerTest, testForceBatchGroupComplete) {
     ParallelismConfig   parallelism_config;
     ModelSpecificConfig model_specific_config;
     FIFOScheduler       scheduler(
-        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager, py::none());
+        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager);
 
     int64_t group_id   = 100;
     int     group_size = 3;
@@ -608,7 +608,7 @@ TEST_F(FIFOSchedulerTest, testForceBatchTimeout) {
     ParallelismConfig   parallelism_config;
     ModelSpecificConfig model_specific_config;
     FIFOScheduler       scheduler(
-        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager, py::none());
+        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager);
 
     int64_t group_id   = 200;
     int     group_size = 3;
@@ -666,7 +666,7 @@ TEST_F(FIFOSchedulerTest, testForceBatchIsolation) {
     ParallelismConfig   parallelism_config;
     ModelSpecificConfig model_specific_config;
     FIFOScheduler       scheduler(
-        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager, py::none());
+        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager);
 
     int64_t group_id   = 300;
     int     group_size = 2;
@@ -744,7 +744,7 @@ TEST_F(FIFOSchedulerTest, testTwoForceBatchGroupsIsolation) {
     ParallelismConfig   parallelism_config;
     ModelSpecificConfig model_specific_config;
     FIFOScheduler       scheduler(
-        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager, py::none());
+        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager);
 
     int64_t group_id_a = 500;
     int64_t group_id_b = 600;
