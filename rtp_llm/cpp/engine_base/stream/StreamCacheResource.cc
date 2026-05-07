@@ -128,10 +128,8 @@ static bool applyP2PSideChannelToStream(const std::shared_ptr<FusedAsyncReadCont
     }
 
     // Apply side-channel data to GenerateStream.
-    // Note: stream->update() internally acquires stream->mutex_ (std::lock_guard), so no
-    // external lock is needed here — there is no data race with concurrent update callers.
     // 1. First token: append to stream
-    if (payload->first_token_id > 0) {
+    if (payload->has_first_token) {
         stream->setIsContextStream(false);
         stream->step();
         auto new_tokens                   = torch::zeros({(int64_t)stream->nextBatchSize(), 1}, torch::kInt32);
@@ -170,17 +168,17 @@ static bool applyP2PSideChannelToStream(const std::shared_ptr<FusedAsyncReadCont
                payload->propose_tokens.data(),
                payload->propose_tokens.size() * sizeof(int));
 
-        const bool has_propose_probs = payload->propose_probs.shape_size() > 0 || !payload->propose_probs.fp16_data().empty()
-                                       || !payload->propose_probs.bf16_data().empty()
-                                       || !payload->propose_probs.fp32_data().empty();
+        const bool has_propose_probs =
+            payload->propose_probs.shape_size() > 0 || !payload->propose_probs.fp16_data().empty()
+            || !payload->propose_probs.bf16_data().empty() || !payload->propose_probs.fp32_data().empty();
         const bool has_propose_hidden =
             payload->propose_hidden.shape_size() > 0 || !payload->propose_hidden.fp16_data().empty()
             || !payload->propose_hidden.bf16_data().empty() || !payload->propose_hidden.fp32_data().empty();
 
-        auto propose_probs_t = has_propose_probs ? TensorPbConvert::pbToTorch(payload->propose_probs)
-                                                 : torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32));
-        auto propose_hidden_t = has_propose_hidden ? TensorPbConvert::pbToTorch(payload->propose_hidden)
-                                                   : torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat16));
+        auto propose_probs_t            = has_propose_probs ? TensorPbConvert::pbToTorch(payload->propose_probs) :
+                                                              torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32));
+        auto propose_hidden_t           = has_propose_hidden ? TensorPbConvert::pbToTorch(payload->propose_hidden) :
+                                                               torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat16));
         sp_output_buffer->all_probs     = propose_probs_t;
         sp_output_buffer->hidden_states = propose_hidden_t;
         sp_output_buffer->tensors_holder.emplace_back(std::move(propose_probs_t));

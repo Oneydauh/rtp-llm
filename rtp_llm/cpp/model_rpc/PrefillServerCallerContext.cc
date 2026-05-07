@@ -21,8 +21,7 @@ PrefillServerCallerContext::~PrefillServerCallerContext() {
     // called until it returns SHUTDOWN to avoid leaking pending async operations.
     void* drain_tag = nullptr;
     bool  drain_ok  = false;
-    while (completion_queue_->Next(&drain_tag, &drain_ok)) {
-    }
+    while (completion_queue_->Next(&drain_tag, &drain_ok)) {}
 }
 
 void PrefillServerCallerContext::cancel() {
@@ -64,42 +63,56 @@ void PrefillServerCallerContext::checkDone() {
         return;
     }
 
-    if (!ok) {
+    if (next_status == grpc::CompletionQueue::NextStatus::SHUTDOWN) {
         finished_ = true;
-        RTP_LLM_LOG_WARNING("PrefillServerCallerContext::checkDone: async next failed, unique_key: %s",
-                            unique_key_.c_str());
-        status_ = grpc::Status(grpc::StatusCode::INTERNAL, "async get next event from grpc completion queue failed");
+        if (!finish_started_) {
+            status_ = grpc::Status(grpc::StatusCode::CANCELLED, "completion queue shutdown");
+        }
         return;
     }
 
-    // StartCall complete: now the stream is ready for the first Read.
     if (got_tag == reinterpret_cast<void*>(0)) {
+        if (!ok) {
+            finished_ = true;
+            RTP_LLM_LOG_WARNING("PrefillServerCallerContext::checkDone: failed to start stream, unique_key: %s",
+                                unique_key_.c_str());
+            status_ = grpc::Status(grpc::StatusCode::INTERNAL, "failed to start async prefill stream");
+            return;
+        }
         if (reader_) {
             reader_->Read(&response_, reinterpret_cast<void*>(1));
         }
         return;
     }
 
-    // Handle Read event
     if (got_tag == reinterpret_cast<void*>(1)) {
-        // Read complete, received first response
-        response_received_ = true;
-        // Check for business errors in response body (error_info)
-        if (response_.has_error_info() && response_.error_info().error_code() != ErrorCodePB::NONE_ERROR) {
-            RTP_LLM_LOG_WARNING(
-                "PrefillServerCallerContext::checkDone: prefill response error, unique_key: %s, error_code: %s, error_message: %s",
-                unique_key_.c_str(),
-                ErrorCodeToString(transRPCErrorCode(response_.error_info().error_code())).c_str(),
-                response_.error_info().error_message().c_str());
+        if (ok) {
+            response_received_ = true;
+            if (response_.has_error_info() && response_.error_info().error_code() != ErrorCodePB::NONE_ERROR) {
+                RTP_LLM_LOG_WARNING(
+                    "PrefillServerCallerContext::checkDone: prefill response error, unique_key: %s, error_code: %s, error_message: %s",
+                    unique_key_.c_str(),
+                    ErrorCodeToString(transRPCErrorCode(response_.error_info().error_code())).c_str(),
+                    response_.error_info().error_message().c_str());
+            }
+            if (reader_) {
+                reader_->Read(&response_, reinterpret_cast<void*>(1));
+            }
+            return;
         }
-        // Start Finish to get final status
+
         if (!finish_started_ && reader_) {
             reader_->Finish(&status_, reinterpret_cast<void*>(2));
             finish_started_ = true;
         }
-    } else if (got_tag == reinterpret_cast<void*>(2)) {
-        // Finish complete
+        return;
+    }
+
+    if (got_tag == reinterpret_cast<void*>(2)) {
         finished_ = true;
+        if (!ok) {
+            status_ = grpc::Status(grpc::StatusCode::INTERNAL, "prefill stream finish event failed");
+        }
         if (!status_.ok()) {
             RTP_LLM_LOG_WARNING(
                 "PrefillServerCallerContext::checkDone: prefill rpc failed, unique_key: %s, prefill_addr: %s, grpc_status: %d(%s)",
@@ -108,7 +121,19 @@ void PrefillServerCallerContext::checkDone() {
                 status_.error_code(),
                 status_.error_message().c_str());
         }
+        return;
     }
+
+    if (!ok) {
+        finished_ = true;
+        RTP_LLM_LOG_WARNING("PrefillServerCallerContext::checkDone: async next failed, unique_key: %s",
+                            unique_key_.c_str());
+        status_ = grpc::Status(grpc::StatusCode::INTERNAL, "async get next event from grpc completion queue failed");
+        return;
+    }
+
+    finished_ = true;
+    status_   = grpc::Status(grpc::StatusCode::INTERNAL, "unexpected grpc completion tag");
 }
 
 }  // namespace rtp_llm

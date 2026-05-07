@@ -384,7 +384,10 @@ grpc::Status P2PConnector::fillResponseWithStreamInfo(const std::shared_ptr<P2PC
 
     // Fill response proto from side-channel data
     auto* payload = response.mutable_payload();
-    payload->set_first_generate_token_id(data.first_token_id);
+    payload->set_has_first_generate_token(data.has_first_token);
+    if (data.has_first_token) {
+        payload->set_first_generate_token_id(data.first_token_id);
+    }
     payload->set_total_reuse_len(data.total_reuse_len);
     payload->set_local_reuse_len(data.local_reuse_len);
     payload->set_remote_reuse_len(data.remote_reuse_len);

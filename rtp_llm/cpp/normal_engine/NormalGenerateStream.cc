@@ -194,7 +194,8 @@ void NormalGenerateStream::updateOutput(const StreamUpdateInfo& update_info) {
                 P2PConnectorResourceEntry::SideChannelData side_data;
                 auto                                       tokens = currentExecuteTokens(0);
                 if (!tokens.empty()) {
-                    side_data.first_token_id = tokens.back();
+                    side_data.has_first_token = true;
+                    side_data.first_token_id  = tokens.back();
                 }
                 side_data.total_reuse_len  = reuseLength();
                 side_data.local_reuse_len  = localReuseLength();
@@ -205,16 +206,16 @@ void NormalGenerateStream::updateOutput(const StreamUpdateInfo& update_info) {
                 }
                 auto sp_output_buffer = getSPOutputBuffer();
                 if (sp_output_buffer) {
-                    auto propose_probs_cpu = sp_output_buffer->all_probs.defined()
-                                                 ? (sp_output_buffer->all_probs.is_cuda()
-                                                        ? sp_output_buffer->all_probs.cpu()
-                                                        : sp_output_buffer->all_probs)
-                                                 : torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32));
-                    auto propose_hidden_cpu = sp_output_buffer->hidden_states.defined()
-                                                  ? (sp_output_buffer->hidden_states.is_cuda()
-                                                         ? sp_output_buffer->hidden_states.cpu()
-                                                         : sp_output_buffer->hidden_states)
-                                                  : torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat16));
+                    auto propose_probs_cpu =
+                        sp_output_buffer->all_probs.defined() ?
+                            (sp_output_buffer->all_probs.is_cuda() ? sp_output_buffer->all_probs.cpu() :
+                                                                     sp_output_buffer->all_probs) :
+                            torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32));
+                    auto propose_hidden_cpu =
+                        sp_output_buffer->hidden_states.defined() ?
+                            (sp_output_buffer->hidden_states.is_cuda() ? sp_output_buffer->hidden_states.cpu() :
+                                                                         sp_output_buffer->hidden_states) :
+                            torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat16));
                     TensorPbConvert::torchToPb(&side_data.propose_probs, propose_probs_cpu);
                     TensorPbConvert::torchToPb(&side_data.propose_hidden, propose_hidden_cpu);
                 }
