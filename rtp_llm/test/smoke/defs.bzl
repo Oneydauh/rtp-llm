@@ -111,8 +111,10 @@ def get_aiter_envs(name, envs):
     return ["AITER_ASM_DIR=../../../../../../../bin/internal_source/rtp_llm/test/smoke/" + name + ".runfiles/pip_gpu_rocm_torch_aiter/site-packages/aiter_meta/hsa/"]
 
 def smoke_test(name, task_info, tags=[], envs=[], gpu_type=[], data=[], smoke_args="",
-               kvcm_envs=[], sleep_time_qr=0, kill_remote=False, concurrency_test=False):
-    smoke_args = ensure_decode_entrance(smoke_args)
+               kvcm_envs=[], sleep_time_qr=0, kill_remote=False, concurrency_test=False,
+               enable_decode_entrance=True):
+    if enable_decode_entrance:
+        smoke_args = ensure_decode_entrance(smoke_args)
     path = '/'.join(task_info.split('/')[:-1])
     data = data + native.glob([path + '/*.pt',
                                path + '/*.jpg',
