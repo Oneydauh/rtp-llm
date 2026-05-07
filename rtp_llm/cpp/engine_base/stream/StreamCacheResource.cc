@@ -127,7 +127,7 @@ static bool applyP2PSideChannelToStream(const std::shared_ptr<FusedAsyncReadCont
         return false;
     }
 
-    // Apply side-channel data to GenerateStream.
+    // Apply side-channel data to GenerateStream; current callers reach here via waitLoadCacheDone() with stream_->mutex_ held.
     // 1. First token: append to stream
     if (payload->has_first_token) {
         stream->setIsContextStream(false);

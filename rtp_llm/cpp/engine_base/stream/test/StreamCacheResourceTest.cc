@@ -91,6 +91,7 @@ protected:
         generate_input->generate_config = generate_config;
         ModelConfig model_config;
         model_config.attn_config.tokens_per_block = 2;
+        model_config.vocab_size                  = 32000;
         RuntimeConfig runtime_config;
         model_config.max_seq_len = 2048;
         stream_                  = std::make_shared<NormalGenerateStream>(
@@ -795,9 +796,10 @@ TEST_F(StreamCacheResourceTest, testApplyP2PSideChannelPreservesZeroFirstToken) 
 
     resource.updateReuseLengthsFromContext(read_ctx);
 
-    auto first_tokens = stream_->currentExecuteTokens(0);
-    ASSERT_FALSE(first_tokens.empty());
-    EXPECT_EQ(first_tokens.back(), 0);
+    EXPECT_EQ(stream_->seqLength(), 7);
+    auto all_tokens = stream_->completeTokenIdsVec(0);
+    ASSERT_EQ(all_tokens.size(), 7);
+    EXPECT_EQ(all_tokens.back(), 0);
 }
 
 TEST_F(StreamCacheResourceTest, testWaitLoadCacheDone_ZeroReuseLen_DoesNotOverwriteExisting) {

@@ -181,9 +181,6 @@ void NormalGenerateStream::updateOutput(const StreamUpdateInfo& update_info) {
     // handoff semantics, so keep them in separate branches.
     if (!finished_ && queryPdSep() && update_info.update_remote_generate
         && resourceContext().role_type == RoleType::PREFILL) {
-        // Keep KV cache alive until decode finishes load cache. Old remote connector
-        // PD flow still relies on this hold/release pairing.
-        holdKVCacheForPDSep();
         auto& rc = resourceContext();
 
         if (rc.decode_entrance) {
@@ -227,7 +224,15 @@ void NormalGenerateStream::updateOutput(const StreamUpdateInfo& update_info) {
                 }
                 rc.cache_manager->notifySideChannelReady(uniqueKey(), side_data);
             }
+            // DP inversion prefill has already produced the only token it is responsible for.
+            // Mark it finished here so the state machine can release resources and persist
+            // local cache for later prefill-side reuse.
+            fillSubGenerateStatus(StreamState::FINISHED);
+            finished_ = true;
         } else {
+            // Keep KV cache alive until decode finishes load cache. Old remote connector
+            // PD flow still relies on this hold/release pairing.
+            holdKVCacheForPDSep();
             // Old remote-connector PD flow relies on GenerateDone being reported here
             // to drive the prefill stream state machine to FINISHED.
             reportEventWithoutLock(StreamEvents::NeedRemoteGenerate);
@@ -235,7 +240,7 @@ void NormalGenerateStream::updateOutput(const StreamUpdateInfo& update_info) {
         }
     }
 
-    bool need_finish_result = needFinish();
+    bool need_finish_result = finished_ || needFinish();
     finished_               = need_finish_result;
     if (finished_) {
         reportEventWithoutLock(StreamEvents::GenerateDone);

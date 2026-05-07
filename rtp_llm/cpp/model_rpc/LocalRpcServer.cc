@@ -1,5 +1,6 @@
 #include <memory>
 #include <chrono>
+#include <thread>
 #include "rtp_llm/cpp/engine_base/stream/GenerateTypes.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
@@ -111,6 +112,12 @@ grpc::Status LocalRpcServer::pollStreamOutput(grpc::ServerContext*             c
             return grpc::Status(grpc::StatusCode::INTERNAL, "request write outputs pb failed");
         }
         if (stream->hasEvent(StreamEvents::NeedRemoteGenerate)) {
+            if (stream->queryPdSep() && stream->resourceContext().role_type == RoleType::PREFILL
+                && stream->resourceContext().decode_entrance) {
+                while (!context->IsCancelled() && !stream->hasError() && stream->getStatus() != StreamState::FINISHED) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
             break;
         }
         if (stream->queryPdSep() && stream->resourceContext().role_type == RoleType::PREFILL) {
@@ -515,9 +522,8 @@ void LocalRpcServer::reportCacheStatusTime(int64_t request_begin_time_us) {
         } else {
             request_case = "unknown";
         }
-        RTP_LLM_LOG_WARNING("execute function failed, peer: %s, request_case: %s",
-                            context->peer().c_str(),
-                            request_case.c_str());
+        RTP_LLM_LOG_WARNING(
+            "execute function failed, peer: %s, request_case: %s", context->peer().c_str(), request_case.c_str());
         const std::string error_msg = "execute function failed, request_case: " + request_case;
         return grpc::Status(grpc::StatusCode::INTERNAL, error_msg);
     }
