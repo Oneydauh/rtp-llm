@@ -8,6 +8,7 @@
 #include "rtp_llm/cpp/cache/connector/p2p/P2PConnectorAsyncContext.h"
 #include "rtp_llm/cpp/config/RoleTypes.h"
 #include "rtp_llm/cpp/engine_base/stream/CompleteTokenIds.h"
+#include "rtp_llm/cpp/model_rpc/TensorPbConvert.h"
 #include <thread>
 #include <torch/extension.h>
 
@@ -168,6 +169,22 @@ static bool applyP2PSideChannelToStream(const std::shared_ptr<FusedAsyncReadCont
         memcpy(sp_output_buffer->tokens.data_ptr<int>(),
                payload->propose_tokens.data(),
                payload->propose_tokens.size() * sizeof(int));
+
+        const bool has_propose_probs = payload->propose_probs.shape_size() > 0 || !payload->propose_probs.fp16_data().empty()
+                                       || !payload->propose_probs.bf16_data().empty()
+                                       || !payload->propose_probs.fp32_data().empty();
+        const bool has_propose_hidden =
+            payload->propose_hidden.shape_size() > 0 || !payload->propose_hidden.fp16_data().empty()
+            || !payload->propose_hidden.bf16_data().empty() || !payload->propose_hidden.fp32_data().empty();
+
+        auto propose_probs_t = has_propose_probs ? TensorPbConvert::pbToTorch(payload->propose_probs)
+                                                 : torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32));
+        auto propose_hidden_t = has_propose_hidden ? TensorPbConvert::pbToTorch(payload->propose_hidden)
+                                                   : torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat16));
+        sp_output_buffer->all_probs     = propose_probs_t;
+        sp_output_buffer->hidden_states = propose_hidden_t;
+        sp_output_buffer->tensors_holder.emplace_back(std::move(propose_probs_t));
+        sp_output_buffer->tensors_holder.emplace_back(std::move(propose_hidden_t));
 
         stream->setSPOutputBuffer(sp_output_buffer);
     }

@@ -1,6 +1,7 @@
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/cpp/cache/connector/p2p/P2PConnectorResourceStore.h"
+#include "rtp_llm/cpp/model_rpc/TensorPbConvert.h"
 
 namespace rtp_llm {
 
@@ -201,6 +202,21 @@ void NormalGenerateStream::updateOutput(const StreamUpdateInfo& update_info) {
                 side_data.memory_reuse_len = memoryReuseLength();
                 if (getContainProposeToken()) {
                     side_data.propose_tokens = getProposeToken();
+                }
+                auto sp_output_buffer = getSPOutputBuffer();
+                if (sp_output_buffer) {
+                    auto propose_probs_cpu = sp_output_buffer->all_probs.defined()
+                                                 ? (sp_output_buffer->all_probs.is_cuda()
+                                                        ? sp_output_buffer->all_probs.cpu()
+                                                        : sp_output_buffer->all_probs)
+                                                 : torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32));
+                    auto propose_hidden_cpu = sp_output_buffer->hidden_states.defined()
+                                                  ? (sp_output_buffer->hidden_states.is_cuda()
+                                                         ? sp_output_buffer->hidden_states.cpu()
+                                                         : sp_output_buffer->hidden_states)
+                                                  : torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat16));
+                    TensorPbConvert::torchToPb(&side_data.propose_probs, propose_probs_cpu);
+                    TensorPbConvert::torchToPb(&side_data.propose_hidden, propose_hidden_cpu);
                 }
                 auto pos_ids = getContextPositionIds();
                 if (pos_ids.defined() && pos_ids.numel() > 0) {
