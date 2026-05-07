@@ -37,6 +37,20 @@ void PrefillServerCallerContext::cancel() {
     finished_ = true;
 }
 
+void PrefillServerCallerContext::handleReadChunkLocked(const GenerateOutputsPB& response) {
+    if (!response_received_) {
+        response_.CopyFrom(response);
+        response_received_ = true;
+    }
+    if (response.has_error_info() && response.error_info().error_code() != ErrorCodePB::NONE_ERROR) {
+        RTP_LLM_LOG_WARNING(
+            "PrefillServerCallerContext::checkDone: prefill response error, unique_key: %s, error_code: %s, error_message: %s",
+            unique_key_.c_str(),
+            ErrorCodeToString(transRPCErrorCode(response.error_info().error_code())).c_str(),
+            response.error_info().error_message().c_str());
+    }
+}
+
 void PrefillServerCallerContext::checkDone() {
     std::unique_lock<std::shared_mutex> lock(state_mutex_);
     if (finished_) {
@@ -80,23 +94,18 @@ void PrefillServerCallerContext::checkDone() {
             return;
         }
         if (reader_) {
-            reader_->Read(&response_, reinterpret_cast<void*>(1));
+            read_response_.Clear();
+            reader_->Read(&read_response_, reinterpret_cast<void*>(1));
         }
         return;
     }
 
     if (got_tag == reinterpret_cast<void*>(1)) {
         if (ok) {
-            response_received_ = true;
-            if (response_.has_error_info() && response_.error_info().error_code() != ErrorCodePB::NONE_ERROR) {
-                RTP_LLM_LOG_WARNING(
-                    "PrefillServerCallerContext::checkDone: prefill response error, unique_key: %s, error_code: %s, error_message: %s",
-                    unique_key_.c_str(),
-                    ErrorCodeToString(transRPCErrorCode(response_.error_info().error_code())).c_str(),
-                    response_.error_info().error_message().c_str());
-            }
+            handleReadChunkLocked(read_response_);
             if (reader_) {
-                reader_->Read(&response_, reinterpret_cast<void*>(1));
+                read_response_.Clear();
+                reader_->Read(&read_response_, reinterpret_cast<void*>(1));
             }
             return;
         }

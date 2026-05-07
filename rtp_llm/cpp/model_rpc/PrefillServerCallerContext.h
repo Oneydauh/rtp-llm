@@ -42,6 +42,7 @@ public:
 
 private:
     friend class PrefillServerCaller;
+    void handleReadChunkLocked(const GenerateOutputsPB& response);
 
     // Metadata
     std::string prefill_addr_;
@@ -56,6 +57,7 @@ private:
     // Request/Response
     GenerateInputPB   request_;
     GenerateOutputsPB response_;
+    GenerateOutputsPB read_response_;
     grpc::Status      status_;
 
     // State
