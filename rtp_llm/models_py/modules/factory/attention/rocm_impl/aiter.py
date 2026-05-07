@@ -1145,12 +1145,18 @@ class AiterPrefillImplPaged(FMHAImplBase):
 
         fmha_params.prefix_lengths = prefix_lengths
 
-        fmha_params.max_seq_len = int(q_lengths.max().item()) if expected_batch > 0 else 0
+        il_cpu = input_lengths if not input_lengths.is_cuda else input_lengths.cpu()
+        pl_src = getattr(attn_inputs, "prefix_lengths", None)
+        if pl_src is not None and pl_src.numel() >= expected_batch:
+            pl_cpu = pl_src[:expected_batch] if not pl_src.is_cuda else pl_src[:expected_batch].cpu()
+        else:
+            pl_cpu = torch.zeros_like(il_cpu)
+        kv_cpu = il_cpu + pl_cpu.to(dtype=il_cpu.dtype)
+        fmha_params.max_seq_len = int(il_cpu.max()) if expected_batch > 0 else 0
         fmha_params.max_seqlen_q = fmha_params.max_seq_len
-        current_max_k = int(kv_lengths.max().item()) if expected_batch > 0 else 0
-        fmha_params.max_seqlen_k = current_max_k
-        fmha_params.token_q_num = int(q_lengths.sum().item())
-        fmha_params.token_kv_num = int(kv_lengths.sum().item())
+        fmha_params.max_seqlen_k = int(kv_cpu.max()) if expected_batch > 0 else 0
+        fmha_params.token_q_num = int(il_cpu.sum())
+        fmha_params.token_kv_num = int(kv_cpu.sum())
 
         kv_block_id = getattr(attn_inputs, "kv_cache_kernel_block_id_device", None)
         if kv_block_id is None:
@@ -1172,13 +1178,12 @@ class AiterPrefillImplPaged(FMHAImplBase):
             prefix_lengths = self.fmha_params.prefix_lengths
             if prefix_lengths is None:
                 prefix_lengths = torch.zeros_like(attn_inputs.input_lengths, dtype=torch.int32)
-            input_lengths = self.fmha_params.cu_seqlens_q[1:] - self.fmha_params.cu_seqlens_q[:-1]
             max_prefix_len = max(
                 0,
                 int(self.fmha_params.max_seqlen_k) - int(self.fmha_params.max_seqlen_q),
             )
             update_prefill_runtime(
-                input_lengths,
+                attn_inputs.input_lengths,
                 self.fmha_params.cu_seqlens_q,
                 self.fmha_params.cu_seqlens_k,
                 prefix_lengths,
