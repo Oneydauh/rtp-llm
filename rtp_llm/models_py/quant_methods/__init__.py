@@ -1,5 +1,7 @@
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig, QuantizeMethodBase
 from rtp_llm.models_py.quant_methods.fp8 import (
+    Fp8BlockDequantLinearMethod,
+    Fp8BlockLinearMethod,
     Fp8BlockOnlineLinearMethod,
     Fp8LinearMethod,
     Fp8OnlineLinearMethod,
@@ -14,5 +16,7 @@ __all__ = [
     "Fp8OnlineLinearMethod",
     "Fp8PerChannelOnlineLinearMethod",
     "Fp8BlockOnlineLinearMethod",
+    "Fp8BlockLinearMethod",
+    "Fp8BlockDequantLinearMethod",
     "UnquantizedLinearMethod",
 ]

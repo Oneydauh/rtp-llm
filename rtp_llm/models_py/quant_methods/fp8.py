@@ -690,3 +690,100 @@ class Fp8BlockOnlineLinearMethod(QuantizeMethodBase):
         if bias is not None:
             output = output + bias.to(out_dtype)
         return output.view(*output_shape)
+
+
+@register_quant_method("fp8_block")
+class Fp8BlockLinearMethod(Fp8BlockOnlineLinearMethod):
+    """Already-quantized FP8 per-block (128x128) ckpt loader.
+
+    ckpt provides:
+      - weight: float8_e4m3fn [N, K]
+      - weight_scale_inv: fp32 [ceil(N/128), ceil(K/128)]
+
+    Unlike the online sibling (which loads BF16 and quantizes at load time),
+    the weight is ALREADY fp8 + block-scaled. create_weights allocates the fp8
+    weight plus a `weight_scale_inv` parameter; the parallel-linear load path
+    (linear.py) TP-slices / shard-merges that block grid. process_weights_after_
+    loading simply renames `weight_scale_inv` -> `weight_scale` so the inherited
+    apply() (DeepGEMM fp8_gemm_nt, which reads `weight` + `weight_scale`) runs
+    identically to the online path — see TestFp8BlockForward.
+    """
+
+    def create_weights(
+        self,
+        layer,
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **kwargs,
+    ):
+        weight = nn.Parameter(
+            torch.empty(output_size, input_size, dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        layer.register_parameter("weight", weight)
+
+        n_blocks = (output_size + self.BLOCK - 1) // self.BLOCK
+        k_blocks = (input_size + self.BLOCK - 1) // self.BLOCK
+        layer.register_parameter(
+            "weight_scale_inv",
+            nn.Parameter(
+                torch.ones(n_blocks, k_blocks, dtype=torch.float32),
+                requires_grad=False,
+            ),
+        )
+
+    def process_weights_after_loading(self, layer):
+        # The weight is already fp8; just expose the block scale under the name
+        # the inherited apply() expects (`weight_scale`), mirroring the online
+        # sibling's post-load contract.
+        scale = layer.weight_scale_inv.data
+        del layer.weight_scale_inv
+        layer.register_parameter(
+            "weight_scale",
+            nn.Parameter(scale.contiguous(), requires_grad=False),
+        )
+
+
+def _dequant_block_to_bf16(
+    weight: torch.Tensor, scale_inv: torch.Tensor, block: int = 128
+) -> torch.Tensor:
+    """Dequantize a DeepSeek FP8 per-block (128x128) weight [N,K] to bf16.
+
+    scale_inv is the standard [ceil(N/128), ceil(K/128)] block grid. Expand it
+    to full [N, K] (cropping any partial trailing block) and scale.
+    """
+    n, k = weight.shape
+    s = scale_inv.to(torch.float32)
+    s = s.repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)
+    s = s[:n, :k]
+    return (weight.to(torch.float32) * s).to(torch.bfloat16)
+
+
+@register_quant_method("fp8_block_dequant")
+class Fp8BlockDequantLinearMethod(Fp8BlockLinearMethod):
+    """Already-quantized FP8 per-block ckpt, DEQUANTIZED to bf16 at load.
+
+    Same ckpt contract as Fp8BlockLinearMethod (fp8 weight + weight_scale_inv,
+    block-aware TP / shard-merge handled in linear.py), but
+    process_weights_after_loading expands the block scale and converts the
+    weight back to bf16, so apply() is a plain F.linear (no DeepGEMM).
+
+    For models whose downstream math needs bf16 weights or that must match a
+    bf16 reference — e.g. DeepSeek-V3.2's MLA, where the absorb path derives
+    kc/vc via torch.bmm (no fp8 kernel) and fp8 GEMM would diverge from the
+    validated bf16 baseline. The routed experts keep fp8 separately.
+    """
+
+    def process_weights_after_loading(self, layer):
+        bf16 = _dequant_block_to_bf16(
+            layer.weight.data, layer.weight_scale_inv.data, self.BLOCK
+        )
+        del layer.weight
+        layer.register_parameter(
+            "weight", nn.Parameter(bf16.contiguous(), requires_grad=False)
+        )
+        del layer.weight_scale_inv
+
+    def apply(self, layer, x: torch.Tensor, bias: Optional[torch.Tensor] = None):
+        return torch.nn.functional.linear(x, layer.weight, bias)

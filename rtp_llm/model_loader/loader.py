@@ -93,6 +93,42 @@ class ModelLoader:
         self._load_dynamic_weights(weights, device)
         # load eplb weight
         self._init_eplb_weight(weights, device)
+        # [DUMP_WEIGHTS] temporary debug hook — set DUMP_WEIGHTS=/path to enable
+        import os as _o
+        _dd = _o.environ.get("DUMP_WEIGHTS")
+        if _dd:
+            import hashlib as _h, json as _j, torch as _t
+            tp_rank = getattr(self._load_config, "tp_rank", 0)
+            out = {}
+            for k, v in weights.global_weights.items():
+                t = v.detach()
+                f32 = t.to(_t.float32).cpu().contiguous()
+                out[f"global.{k}"] = {
+                    "src": "old_loader",
+                    "shape": list(t.shape),
+                    "dtype": str(t.dtype),
+                    "mean": float(f32.mean()),
+                    "std":  float(f32.std()),
+                    "absmax": float(f32.abs().max()),
+                    "md5":  _h.md5(f32.numpy().tobytes()).hexdigest(),
+                }
+            for layer_idx, layer_dict in enumerate(weights.weights):
+                for k, v in (layer_dict or {}).items():
+                    t = v.detach()
+                    f32 = t.to(_t.float32).cpu().contiguous()
+                    out[f"layer{layer_idx}.{k}"] = {
+                        "src": "old_loader",
+                        "shape": list(t.shape),
+                        "dtype": str(t.dtype),
+                        "mean": float(f32.mean()),
+                        "std":  float(f32.std()),
+                        "absmax": float(f32.abs().max()),
+                        "md5":  _h.md5(f32.numpy().tobytes()).hexdigest(),
+                    }
+            _o.makedirs(_dd, exist_ok=True)
+            with open(f"{_dd}/rank{tp_rank}.json", "w") as f:
+                _j.dump(out, f, indent=2, sort_keys=True)
+            logging.info(f"[DUMP_WEIGHTS] old_loader dumped {len(out)} tensors to {_dd}/rank{tp_rank}.json")
         return weights
 
     def load_lora_weights(self, adapter_name: str, lora_path: str, device: str = "cpu"):

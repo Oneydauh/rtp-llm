@@ -8,6 +8,10 @@ from rtp_llm.models_py.quant_methods.base import QuantizationConfig, QuantizeMet
 
 class LinearBase(nn.Module):
 
+    # FP8 per-block (DeepSeek-style) quantization block size, used when
+    # TP-slicing / shard-merging `weight_scale_inv` block grids.
+    _FP8_BLOCK = 128
+
     def __init__(
         self,
         input_size: int,
@@ -49,7 +53,7 @@ class LinearBase(nn.Module):
         # and after every weight shard is in place. Doing the work here (rather
         # than at the end of load_weights) is required for streaming dispatch:
         # MergedColumnParallelLinear / QKVParallelLinear receive their shards on
-        # separate _default_load_weights ticks, so a per-tick call would quantize
+        # separate RtpModule.load_weights ticks, so a per-tick call would quantize
         # before all shards arrived (corrupt scale) and then re-quantize an
         # already-fp8 weight on the next tick (kernel dispatch failure).
         if getattr(self, "_post_load_done", False):
@@ -116,6 +120,12 @@ class ColumnParallelLinear(LinearBase):
                     tensor.numel() > 1
                     and tensor.shape[0] == self.output_size_per_partition * self.tp_size
                 ):
+                    tensor = self._split_weight(tensor, dim=0)
+            elif param_name == "weight_scale_inv":
+                # FP8 per-block scale grid [ceil(N/128), ceil(K/128)]: TP-slice
+                # along the output-block dim (dim 0), matching the column split
+                # of `weight`.
+                if self.tp_size > 1:
                     tensor = self._split_weight(tensor, dim=0)
 
             if tensor.shape != param.shape:
@@ -198,6 +208,12 @@ class RowParallelLinear(LinearBase):
                     and tensor.shape[-1] == self.input_size_per_partition * self.tp_size
                 ):
                     tensor = self._split_weight(tensor, dim=-1)
+            elif param_name == "weight_scale_inv":
+                # FP8 per-block scale grid [ceil(N/128), ceil(K/128)]: TP-slice
+                # along the input-block dim (dim 1), matching the row split of
+                # `weight`.
+                if self.tp_size > 1:
+                    tensor = self._split_weight(tensor, dim=1)
 
             if tensor.shape != param.shape:
                 raise ValueError(
@@ -272,6 +288,22 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 if shard_id < 0:
                     # Un-sharded param (e.g. already-merged ckpt) — full copy.
                     param.data.copy_(tensor)
+                    continue
+
+                if param_name == "weight_scale_inv":
+                    # FP8 per-block scale grid [out_blocks, in_blocks]. Each
+                    # shard (gate/up) ships its own grid; place this shard's
+                    # block-rows at its block offset. shard_size is in weight
+                    # rows, so /128 gives this shard's block-row count.
+                    blocks_per_shard = shard_size // self._FP8_BLOCK
+                    if (
+                        self.tp_size > 1
+                        and tensor.shape[0] == blocks_per_shard * self.tp_size
+                    ):
+                        start = self.tp_rank * blocks_per_shard
+                        tensor = tensor.narrow(0, start, blocks_per_shard).contiguous()
+                    offset = shard_id * blocks_per_shard
+                    param.data[offset : offset + blocks_per_shard].copy_(tensor)
                     continue
 
                 # Per-shard non-weight param (e.g. per-channel weight_scale).
@@ -461,6 +493,20 @@ class QKVParallelLinear(ColumnParallelLinear):
         # Auxiliary per-shard params (per-channel weight_scale, input_scale, ...).
         param = getattr(self, param_name, None)
         if param is None or not isinstance(param, nn.Parameter):
+            return
+
+        if param_name == "weight_scale_inv":
+            # FP8 per-block grid for this q/k/v shard: TP-slice along the
+            # output(head)-block dim, then place at the shard's block offset
+            # in the merged [total_blocks, in_blocks] grid.
+            blk = self._FP8_BLOCK
+            if self.tp_size > 1:
+                heads_pp = max(1, num_heads // self.tp_size)
+                rows = heads_pp * self.head_dim
+                start_blk = (self.tp_rank * rows) // blk
+                tensor = tensor.narrow(0, start_blk, rows // blk).contiguous()
+            off_blk = offset // blk
+            param.data[off_blk : off_blk + tensor.shape[0]].copy_(tensor)
             return
 
         if param.numel() == 1:

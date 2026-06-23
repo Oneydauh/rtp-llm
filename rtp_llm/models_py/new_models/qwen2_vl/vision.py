@@ -6,12 +6,11 @@ import torch.nn as nn
 from rtp_llm.models_py.layers.conv import Conv3dLayer
 from rtp_llm.models_py.layers.linear import ColumnParallelLinear, RowParallelLinear
 from rtp_llm.models_py.layers.norm import LayerNorm
-from rtp_llm.models_py.module_base import rtp_module
+from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 
 
-@rtp_module
-class Qwen2VisionPatchEmbed(nn.Module):
+class Qwen2VisionPatchEmbed(RtpModule):
 
     def __init__(
         self,
@@ -38,8 +37,7 @@ class Qwen2VisionPatchEmbed(nn.Module):
         return x
 
 
-@rtp_module
-class Qwen2VisionMLP(nn.Module):
+class Qwen2VisionMLP(RtpModule):
 
     def __init__(
         self,
@@ -79,8 +77,7 @@ class Qwen2VisionMLP(nn.Module):
         return x
 
 
-@rtp_module
-class Qwen2VisionAttn(nn.Module):
+class Qwen2VisionAttn(RtpModule):
 
     def __init__(
         self,
@@ -132,8 +129,7 @@ class Qwen2VisionAttn(nn.Module):
         return x
 
 
-@rtp_module
-class Qwen2VisionBlock(nn.Module):
+class Qwen2VisionBlock(RtpModule):
 
     def __init__(
         self,
@@ -172,8 +168,7 @@ class Qwen2VisionBlock(nn.Module):
         return x
 
 
-@rtp_module
-class Qwen2VisionPatchMerger(nn.Module):
+class Qwen2VisionPatchMerger(RtpModule):
 
     def __init__(
         self,
@@ -226,8 +221,7 @@ class Qwen2VisionPatchMerger(nn.Module):
         return x
 
 
-@rtp_module
-class Qwen2VisionTransformer(nn.Module):
+class Qwen2VisionTransformer(RtpModule):
 
     def __init__(self, vit_config: dict, load_config: Any):
         super().__init__()

@@ -379,6 +379,14 @@ class BaseModel(object):
         self.model_weights_loader = loader
         self.py_eplb = None
         logging.info("NewModelLoader: model loaded successfully")
+        # Multimodal models: vision weights are already inside py_model; let the
+        # model build a thin mm_part that reuses them (default no-op).
+        self._init_multimodal_for_new_loader()
+
+    def _init_multimodal_for_new_loader(self):
+        """Hook for new-loader multimodal models to wire up their mm_part by
+        reusing the already-loaded ``py_model.visual``. Default: no-op."""
+        pass
 
     def _get_quant_type(self) -> str:
         # Each QuantizationConfig subclass (in rtp_llm/config/quant_config.py)

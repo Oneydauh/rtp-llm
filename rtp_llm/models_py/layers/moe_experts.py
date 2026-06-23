@@ -774,11 +774,18 @@ class BaseMoEExperts(nn.Module):
     def _maybe_build_fused_moe(self):
         if self.fused_moe is not None:
             return
+        # MoEConfigAdapter.quant_config must be the CONFIG-side QuantizationConfig
+        # (rtp_llm.config.quant_config, exposing is_quanted()/get_method()), which
+        # the strategy resolver and the DeepEP wrapper rely on. self._quant_config
+        # is the models_py runtime QuantizationConfig (only quant_type) used to
+        # pick the expert quant family — passing it here makes the DeepEP
+        # low-latency path crash on quant_config.is_quanted(). Use the model's
+        # config-side quant_config instead.
         adapter = MoEConfigAdapter(
             model_config=self._model_config,
             parallelism_config=self._parallelism_config,
             moe_config=self._moe_config,
-            quant_config=self._quant_config,
+            quant_config=getattr(self._model_config, "quant_config", None),
             enable_cuda_graph=False,
         )
         weights_dict = self._build_weights_dict()

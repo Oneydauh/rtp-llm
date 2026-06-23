@@ -12,14 +12,13 @@ from rtp_llm.models_py.layers.linear import (
 )
 from rtp_llm.models_py.layers.norm import RMSNorm
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
-from rtp_llm.models_py.module_base import rtp_module
+from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 from rtp_llm.models_py.weight_mapper import WeightsMapper
 from rtp_llm.ops.compute_ops import LayerKVCache, PyModelInputs, PyModelOutputs
 
 
-@rtp_module
-class Qwen3MLP(nn.Module):
+class Qwen3MLP(RtpModule):
 
     def __init__(
         self,
@@ -64,8 +63,7 @@ class Qwen3MLP(nn.Module):
         return x
 
 
-@rtp_module
-class Qwen3Attention(nn.Module):
+class Qwen3Attention(RtpModule):
     """Qwen3 dense attention.
 
     Differs from Qwen2 attention by:
@@ -155,8 +153,7 @@ class Qwen3Attention(nn.Module):
         return output
 
 
-@rtp_module
-class Qwen3DecoderLayer(nn.Module):
+class Qwen3DecoderLayer(RtpModule):
 
     def __init__(
         self,
@@ -274,7 +271,6 @@ def _extract_config_values(model_config: Any, load_config: Any):
     )
 
 
-@rtp_module
 class Qwen3ForCausalLM(GptModelBase):
 
     WEIGHTS_MAPPER = WeightsMapper(
@@ -298,9 +294,7 @@ class Qwen3ForCausalLM(GptModelBase):
                 yield name, tensor
 
         mapped_iter = self.WEIGHTS_MAPPER.apply(_track(weights_iter))
-        from rtp_llm.models_py.module_base import _default_load_weights
-
-        _default_load_weights(self, mapped_iter)
+        super().load_weights(mapped_iter)
 
         # Qwen3 small variants (e.g. Qwen3-0.6B) tie lm_head to embed_tokens.
         # Mirror HF transformers: when no lm_head.weight is in the ckpt, copy

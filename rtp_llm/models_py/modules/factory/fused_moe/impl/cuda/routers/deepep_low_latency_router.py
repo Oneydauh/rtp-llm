@@ -25,6 +25,23 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.quant_config import (
 from rtp_llm.models_py.modules.factory.fused_moe.defs.type import RouterType
 from rtp_llm.models_py.utils.arch import get_sm
 
+# Debug: set DUMP_DEEPEP (or reuse DUMP_MOE) to dump per-stage absmax of the
+# deepep LL router once per router instance (first forward). Writes to BOTH a
+# file ($DUMP_DEEPEP/rankN.txt) AND the logger (grep "DEEPEP_DBG" in the log),
+# so it surfaces regardless of file-path/cwd confusion.
+import logging as _logging
+
+_DUMP_DEEPEP = os.environ.get("DUMP_DEEPEP") or os.environ.get("DUMP_MOE")
+_deepep_dbg_logger = _logging.getLogger(__name__)
+
+
+def _amax(t) -> float:
+    try:
+        return float(t.detach().float().abs().max().item())
+    except Exception:
+        return -1.0
+
+
 # DeepEP kernels quantize dispatch inputs in 128 element chunks.
 DEEPEP_QUANT_BLOCK_SIZE = 128
 # DeepEP Low-Latency supports hidden sizes
@@ -214,6 +231,14 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
             a1, topk_ids, topk_weights
         )
 
+        if _DUMP_DEEPEP and not getattr(self, "_dbg_done", False):
+            self._dbg_prepare = (
+                f"a1.shape={tuple(a1.shape)} a1.absmax={_amax(a1):.4f} "
+                f"tp_in.shape={tuple(tp_dispatch_input.shape)} "
+                f"tp_in.absmax={_amax(tp_dispatch_input):.4f} "
+                f"tw.absmax={_amax(tp_topk_weights):.4f}"
+            )
+
         # Prepare dispatch basic arguments
         dispatch_args = {
             "x": tp_dispatch_input,
@@ -315,9 +340,38 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
 
         # Normal finalize
         combined_x = self._normal_finalize(combine_args)
+        # Keep a reference for debug stats but DO NOT sync here: the combine may
+        # be async, and forcing .item() before the gather can deadlock. The
+        # all_gather below (a collective) materializes it; read absmax after.
+        _pre_gather_ref = combined_x if _DUMP_DEEPEP else None
+        _pre_gather_shape = tuple(combined_x.shape)
 
         # Finalize post tp gather
         combined_x = self._finalize_post_tp_gather(combined_x, extra_finalize_args)
+
+        if _DUMP_DEEPEP and not getattr(self, "_dbg_done", False):
+            self._dbg_done = True
+            try:
+                rank = torch.distributed.get_rank()
+            except Exception:
+                rank = 0
+            line = (
+                f"tp_size={self.config.tp_size} tp_rank={self.config.tp_rank} "
+                f"ep_size={self.config.ep_size} | {getattr(self, '_dbg_prepare', '')} | "
+                f"combine_pre_gather.shape={_pre_gather_shape} "
+                f"combine_pre_gather.absmax={_amax(_pre_gather_ref):.4f} "
+                f"final.shape={tuple(combined_x.shape)} final.absmax={_amax(combined_x):.4f}"
+            )
+            # Always log (shows in the captured log via grep DEEPEP_DBG).
+            _deepep_dbg_logger.warning("[DEEPEP_DBG] rank%d %s", rank, line)
+            # Best-effort file too; never let a path issue break the forward.
+            try:
+                os.makedirs(_DUMP_DEEPEP, exist_ok=True)
+                with open(os.path.join(_DUMP_DEEPEP, f"rank{rank}.txt"), "a") as f:
+                    f.write(line + "\n")
+            except Exception as _e:
+                _deepep_dbg_logger.warning("[DEEPEP_DBG] file write failed: %s", _e)
+
         # reset handle
         self._handle = None
 

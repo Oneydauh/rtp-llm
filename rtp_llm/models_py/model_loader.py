@@ -226,8 +226,45 @@ class NewModelLoader:
         method = self._resolve_load_method()
         logger.info(f"NewModelLoader using load method: {method}")
         if method == LoadMethod.FASTSAFETENSORS:
-            return self._load_via_fastsafetensors()
-        return self._load_via_scratch()
+            model = self._load_via_fastsafetensors()
+        else:
+            model = self._load_via_scratch()
+        # [DUMP_WEIGHTS] temporary debug hook — set DUMP_WEIGHTS=/path to enable
+        import os as _o
+        _dd = _o.environ.get("DUMP_WEIGHTS")
+        if _dd:
+            import hashlib as _h, json as _j
+            tp_rank = getattr(self.load_config, "tp_rank", 0)
+            out = {}
+            for name, p in model.named_parameters():
+                t = p.detach()
+                f32 = t.to(torch.float32).cpu().contiguous()
+                out[name] = {
+                    "src": "new_loader",
+                    "shape": list(t.shape),
+                    "dtype": str(t.dtype),
+                    "mean": float(f32.mean()),
+                    "std":  float(f32.std()),
+                    "absmax": float(f32.abs().max()),
+                    "md5":  _h.md5(f32.numpy().tobytes()).hexdigest(),
+                }
+            for name, b in model.named_buffers():
+                t = b.detach()
+                f32 = t.to(torch.float32).cpu().contiguous()
+                out[f"buffer:{name}"] = {
+                    "src": "new_loader",
+                    "shape": list(t.shape),
+                    "dtype": str(t.dtype),
+                    "mean": float(f32.mean()),
+                    "std":  float(f32.std()),
+                    "absmax": float(f32.abs().max()),
+                    "md5":  _h.md5(f32.numpy().tobytes()).hexdigest(),
+                }
+            _o.makedirs(_dd, exist_ok=True)
+            with open(f"{_dd}/rank{tp_rank}.json", "w") as f:
+                _j.dump(out, f, indent=2, sort_keys=True)
+            logger.info(f"[DUMP_WEIGHTS] new_loader dumped {len(out)} tensors to {_dd}/rank{tp_rank}.json")
+        return model
 
     def _load_via_scratch(self) -> nn.Module:
         import time

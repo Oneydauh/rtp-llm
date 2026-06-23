@@ -411,10 +411,9 @@ class Fp8BlockWiseQuantConfig(QuantizationConfig):
 
     def get_runtime_method_key(self) -> str:
         # Online path: BF16 ckpt -> 128x128 block-quantized fp8 at load time.
-        # Already-quantized FP8_PER_BLOCK ckpts (is_quanted=True) need a
-        # separate method class; return "" so the new loader rejects them
-        # explicitly rather than falling back to per-tensor.
-        return "fp8_block_online" if not self.is_quanted() else ""
+        # Already-quantized FP8_PER_BLOCK ckpts (is_quanted=True) load via the
+        # "fp8_block" LinearMethod (fp8 weight + weight_scale_inv, DeepGEMM).
+        return "fp8_block_online" if not self.is_quanted() else "fp8_block"
 
     @classmethod
     def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":

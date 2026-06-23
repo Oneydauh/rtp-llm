@@ -24,7 +24,7 @@ from rtp_llm.models_py.layers.linear import ColumnParallelLinear
 from rtp_llm.models_py.layers.moe_experts import BaseMoEExperts
 from rtp_llm.models_py.layers.norm import RMSNorm
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
-from rtp_llm.models_py.module_base import rtp_module
+from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.modules import FusedMoeFactory, SelectTopk
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
     MoEConfigAdapter,
@@ -285,8 +285,7 @@ class Qwen3Experts(BaseMoEExperts):
         return weights_dict
 
 
-@rtp_module
-class Qwen3MoeBlock(nn.Module):
+class Qwen3MoeBlock(RtpModule):
     """Routed-expert MoE block (Qwen3-MoE has no shared expert)."""
 
     def __init__(
@@ -364,8 +363,7 @@ class Qwen3MoeBlock(nn.Module):
         return self.experts(hidden_states, topk_weights, topk_ids)
 
 
-@rtp_module
-class Qwen3MoeDecoderLayer(nn.Module):
+class Qwen3MoeDecoderLayer(RtpModule):
 
     def __init__(
         self,
@@ -529,7 +527,6 @@ def _extract_moe_config_values(model_config: Any, load_config: Any) -> Dict[str,
     )
 
 
-@rtp_module
 class Qwen3MoeForCausalLM(GptModelBase):
 
     WEIGHTS_MAPPER = WeightsMapper(prefix_mapping={"model.": ""})
@@ -551,9 +548,7 @@ class Qwen3MoeForCausalLM(GptModelBase):
                 yield name, tensor
 
         mapped_iter = self.WEIGHTS_MAPPER.apply(_track(weights_iter))
-        from rtp_llm.models_py.module_base import _default_load_weights
-
-        _default_load_weights(self, mapped_iter)
+        super().load_weights(mapped_iter)
 
         if not has_lm_head:
             logging.info(
