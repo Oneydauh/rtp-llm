@@ -100,24 +100,17 @@ class QWen3_VL(QWen2_VL):
             "tie_word_embeddings", config_json.get("tie_word_embeddings", False)
         )
 
-        # M-RoPE. Qwen3-VL natively uses *interleaved* M-RoPE; the C++ Mrope
-        # kernel currently implements the non-interleaved (Qwen2-VL) layout, so
-        # image-token positions are approximate (text positions are exact since
-        # t==h==w there). The engine only generates the 3D mrope position ids
-        # when the model is multimodal (mm_position_ids_style != 0); with the
-        # new-loader multimodal path wired (see _init_multimodal below) those
-        # positions are provided, so RopeStyle::Mrope (7) is safe. Interleaved
-        # M-RoPE is a step-2 accuracy fix.
-        config.mm_model_config.mm_position_ids_style = 2
+        # M-RoPE is NOT yet plumbed on the *new-loader py fmha* path: the 3D
+        # (t/h/w) combo_position_ids the Mrope kernel needs are not fed into the
+        # py model's attention (only the old-loader C++ forward path plumbs
+        # them). Setting RopeStyle::Mrope (7) there makes the rope kernel read
+        # invalid positions -> CUBLAS_STATUS_EXECUTION_FAILED at the next GEMM.
+        # Until step 2 plumbs 3D position ids into the py path, use plain 1D
+        # rope: text positions are exact, image-token positions are approximate.
+        config.mm_model_config.mm_position_ids_style = 0
         rope_config = config.attn_config.rope_config
-        rope_config.style = 7
+        rope_config.style = 1
         rope_config.base = int(tc["rope_theta"])
-        rope_scaling = tc.get("rope_scaling", {}) or {}
-        mrope_section = rope_scaling.get("mrope_section", [24, 20, 20])
-        rope_config.index_factor = len(mrope_section)
-        rope_config.mrope_dim1 = mrope_section[0]
-        rope_config.mrope_dim2 = mrope_section[1]
-        rope_config.mrope_dim3 = mrope_section[2]
         rope_config.dim = int(config.attn_config.size_per_head)
 
 

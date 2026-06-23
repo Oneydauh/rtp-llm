@@ -12,9 +12,6 @@ Key design:
     MergedColumnParallelLinear + RowParallelLinear.
 """
 
-import hashlib
-import json
-import os
 from typing import Any, Dict, Optional
 
 import torch
@@ -30,24 +27,6 @@ from rtp_llm.models_py.layers.moe_experts import BaseMoEExperts
 from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.modules import GroupTopK, SelectTopk
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
-
-# Debug hook: set DUMP_MOE=/path to dump per-layer MoE component stats (routed
-# experts output + shared expert output, both reduced to the FULL/unsharded
-# form) on the first forward (prefill). Compare EP=1 (correct) vs EP=2 (buggy)
-# runs layer-by-layer to localize which component first diverges.
-_DUMP_MOE = os.environ.get("DUMP_MOE")
-
-
-def _moe_tensor_stats(t: torch.Tensor) -> Dict[str, Any]:
-    f32 = t.detach().to(torch.float32).cpu().contiguous()
-    return {
-        "shape": list(t.shape),
-        "dtype": str(t.dtype),
-        "mean": float(f32.mean()),
-        "std": float(f32.std()),
-        "absmax": float(f32.abs().max()),
-        "md5": hashlib.md5(f32.numpy().tobytes()).hexdigest(),
-    }
 
 
 class DeepSeekV32Experts(BaseMoEExperts):
@@ -191,7 +170,6 @@ class DeepSeekV32MoEBlock(RtpModule):
         correction_bias: bool = False,
     ):
         super().__init__()
-        self.layer_idx = layer_idx
         self.tp_size = tp_size
         self.ep_size = ep_size
         self.top_k = top_k
@@ -286,61 +264,11 @@ class DeepSeekV32MoEBlock(RtpModule):
             self.select_topk(router_logits_fp32, topk_ids, topk_weights)
 
         experts_output = self.experts(hidden_states, topk_weights, topk_ids)
-        routed_only = experts_output
 
-        shared_raw = None
         if self.shared_experts is not None:
-            shared_raw = self.shared_experts(hidden_states)
-            shared_output = shared_raw
+            shared_output = self.shared_experts(hidden_states)
             if self.tp_size > 1 and self.ep_size > 1:
                 shared_output = all_reduce(shared_output, group=Group.TP)
             experts_output = experts_output + shared_output
 
-        if _DUMP_MOE:
-            self._maybe_dump_moe(hidden_states, routed_only, shared_raw)
-
         return experts_output
-
-    def _maybe_dump_moe(
-        self,
-        hidden_in: torch.Tensor,
-        routed_only: torch.Tensor,
-        shared_raw: Optional[torch.Tensor],
-    ) -> None:
-        # Dump only the first forward (prefill) per layer to keep files small.
-        if getattr(self, "_moe_dumped", False):
-            return
-        self._moe_dumped = True
-
-        # Reduce both components to the FULL (unsharded) form so EP=1 and EP=2
-        # dumps are directly comparable:
-        #   - routed: partial (TP-sharded) when ep<=1; already full (DeepEP
-        #     combined) when ep>1.
-        #   - shared: always TP-sharded (built with tp_size), so always reduce.
-        routed_full = routed_only
-        if self.tp_size > 1 and self.ep_size <= 1:
-            routed_full = all_reduce(routed_only.clone(), group=Group.TP)
-        shared_full = None
-        if shared_raw is not None:
-            shared_full = shared_raw
-            if self.tp_size > 1:
-                shared_full = all_reduce(shared_raw.clone(), group=Group.TP)
-
-        try:
-            rank = torch.distributed.get_rank()
-        except Exception:
-            rank = 0
-        out = {
-            "layer_idx": self.layer_idx,
-            "ep_size": self.ep_size,
-            "tp_size": self.tp_size,
-            "hidden_in": _moe_tensor_stats(hidden_in),
-            "routed_full": _moe_tensor_stats(routed_full),
-        }
-        if shared_full is not None:
-            out["shared_full"] = _moe_tensor_stats(shared_full)
-
-        os.makedirs(_DUMP_MOE, exist_ok=True)
-        path = os.path.join(_DUMP_MOE, f"rank{rank}_layer{self.layer_idx}.json")
-        with open(path, "w") as f:
-            json.dump(out, f, indent=2, sort_keys=True)
