@@ -1,4 +1,5 @@
 import functools
+import logging
 from typing import Any, Dict, List, Union
 
 from transformers import AutoTokenizer
@@ -11,9 +12,25 @@ class BaseTokenizer:
         self.init_tokenizer(tokenizer_path, self.config_json)
 
     def init_tokenizer(self, tokenizer_path: str, config_json: Dict[str, Any]):
-        self.tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_path, trust_remote_code=True, verbose=False, use_fast=True
         )
+        # transformers 4.57.x can silently return a bare `False` (not a tokenizer)
+        # when fast-tokenizer conversion fails for a sentencepiece-only checkpoint
+        # (has tokenizer.model but no tokenizer.json). Detect that and fall back to
+        # the slow tokenizer, which loads correctly. No-op for normal checkpoints
+        # that ship a real fast tokenizer.
+        if not hasattr(tokenizer, "encode"):
+            logging.warning(
+                "AutoTokenizer(use_fast=True) returned %r for %s; "
+                "retrying with use_fast=False",
+                tokenizer,
+                tokenizer_path,
+            )
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_path, trust_remote_code=True, use_fast=False
+            )
+        self.tokenizer = tokenizer
 
     def encode(self, prompt: str, **kwargs):
         return self.tokenizer.encode(prompt, **kwargs)

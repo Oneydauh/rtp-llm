@@ -45,7 +45,13 @@ class LoadConfig:
         try:
             from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 
-            return QuantizationConfig(quant_type=self.quant_type)
+            # 走法1:把旧 config/quant_config.py 解析出的富对象透传为 source_config，
+            # 供新 loader 的 method 读取 dynamic / ignore / group_size 等结构化字段，
+            # 而不在新 loader 重复解析 ckpt。base_model 经 quant_source_config 注入。
+            return QuantizationConfig(
+                quant_type=self.quant_type,
+                source_config=getattr(self, "quant_source_config", None),
+            )
         except ImportError:
             return None
 
@@ -231,9 +237,12 @@ class NewModelLoader:
             model = self._load_via_scratch()
         # [DUMP_WEIGHTS] temporary debug hook — set DUMP_WEIGHTS=/path to enable
         import os as _o
+
         _dd = _o.environ.get("DUMP_WEIGHTS")
         if _dd:
-            import hashlib as _h, json as _j
+            import hashlib as _h
+            import json as _j
+
             tp_rank = getattr(self.load_config, "tp_rank", 0)
             out = {}
             for name, p in model.named_parameters():
@@ -244,9 +253,9 @@ class NewModelLoader:
                     "shape": list(t.shape),
                     "dtype": str(t.dtype),
                     "mean": float(f32.mean()),
-                    "std":  float(f32.std()),
+                    "std": float(f32.std()),
                     "absmax": float(f32.abs().max()),
-                    "md5":  _h.md5(f32.numpy().tobytes()).hexdigest(),
+                    "md5": _h.md5(f32.numpy().tobytes()).hexdigest(),
                 }
             for name, b in model.named_buffers():
                 t = b.detach()
@@ -256,14 +265,16 @@ class NewModelLoader:
                     "shape": list(t.shape),
                     "dtype": str(t.dtype),
                     "mean": float(f32.mean()),
-                    "std":  float(f32.std()),
+                    "std": float(f32.std()),
                     "absmax": float(f32.abs().max()),
-                    "md5":  _h.md5(f32.numpy().tobytes()).hexdigest(),
+                    "md5": _h.md5(f32.numpy().tobytes()).hexdigest(),
                 }
             _o.makedirs(_dd, exist_ok=True)
             with open(f"{_dd}/rank{tp_rank}.json", "w") as f:
                 _j.dump(out, f, indent=2, sort_keys=True)
-            logger.info(f"[DUMP_WEIGHTS] new_loader dumped {len(out)} tensors to {_dd}/rank{tp_rank}.json")
+            logger.info(
+                f"[DUMP_WEIGHTS] new_loader dumped {len(out)} tensors to {_dd}/rank{tp_rank}.json"
+            )
         return model
 
     def _load_via_scratch(self) -> nn.Module:
@@ -433,9 +444,22 @@ class NewModelLoader:
 
         model_type = self._get_model_type()
         if model_type not in MODEL_REGISTRY:
+            # Provide helpful diagnostic when registry is empty or model missing
+            diag = ""
+            if not MODEL_REGISTRY:
+                try:
+                    from rtp_llm.models_py import _IMPORT_ERRORS
+
+                    if _IMPORT_ERRORS:
+                        diag = (
+                            " Model import errors during initialization: "
+                            + "; ".join(f"{k}: {v}" for k, v in _IMPORT_ERRORS.items())
+                        )
+                except (ImportError, AttributeError):
+                    diag = " (Package initialization may have failed entirely.)"
             raise ValueError(
                 f"Model type '{model_type}' not found in registry. "
-                f"Available: {list(MODEL_REGISTRY.keys())}"
+                f"Available: {list(MODEL_REGISTRY.keys())}.{diag}"
             )
         model_cls = MODEL_REGISTRY[model_type]
         model = model_cls(self.model_config, self.load_config)

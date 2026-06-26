@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
+from rtp_llm.models_py.layers.activation import silu_and_mul
 from rtp_llm.models_py.layers.embedding import ParallelLMHead, VocabParallelEmbedding
 from rtp_llm.models_py.layers.linear import (
     MergedColumnParallelLinear,
@@ -55,9 +56,8 @@ class Qwen3MLP(RtpModule):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)
-        gate, up = gate_up.chunk(2, dim=-1)
-        x = torch.nn.functional.silu(gate) * up
-        x = self.down_proj(x)
+        act = silu_and_mul(gate_up)
+        x = self.down_proj(act)
         if self.tp_size > 1:
             x = all_reduce(x, group=Group.TP)
         return x

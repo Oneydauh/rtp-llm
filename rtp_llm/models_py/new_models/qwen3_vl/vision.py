@@ -113,7 +113,9 @@ class Qwen3VLVisionAttention(RtpModule):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=True, dtype=params_dtype)
+        self.qkv = nn.Linear(
+            hidden_size, 3 * hidden_size, bias=True, dtype=params_dtype
+        )
         self.proj = nn.Linear(hidden_size, hidden_size, bias=True, dtype=params_dtype)
 
     def forward(
@@ -233,8 +235,9 @@ class Qwen3VLVisionPatchMerger(RtpModule):
 
 
 class Qwen3VLVisionTransformer(RtpModule):
-    def __init__(self, vit_config: dict, load_config: Any):
+    def __init__(self, model_config: Any, load_config: Any):
         super().__init__()
+        vit_config = self._get_vit_config(model_config)
         hidden_size = vit_config.get("hidden_size", 1024)
         num_heads = vit_config.get("num_heads", 16)
         depth = vit_config.get("depth", 24)
@@ -250,7 +253,9 @@ class Qwen3VLVisionTransformer(RtpModule):
         )
         self.hidden_size = hidden_size
 
-        params_dtype = getattr(load_config, "compute_dtype", torch.bfloat16) or torch.bfloat16
+        params_dtype = (
+            getattr(load_config, "compute_dtype", torch.bfloat16) or torch.bfloat16
+        )
 
         self.patch_embed = Qwen3VLVisionPatchEmbed(
             in_channels=in_channels,
@@ -295,6 +300,30 @@ class Qwen3VLVisionTransformer(RtpModule):
                 for _ in range(len(self.deepstack_visual_indexes))
             ]
         )
+
+    # ---- config helpers -----------------------------------------------------
+    @staticmethod
+    def _get_vit_config(model_config) -> dict:
+        mm = getattr(model_config, "mm_related_params", None)
+        if mm is not None and getattr(mm, "config", None):
+            return mm.config
+        if hasattr(model_config, "vision_config"):
+            return model_config.vision_config
+        if isinstance(model_config, dict):
+            return model_config.get("vision_config", {})
+        return {
+            "hidden_size": 1024,
+            "num_heads": 16,
+            "depth": 24,
+            "intermediate_size": 4096,
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "in_channels": 3,
+            "spatial_merge_size": 2,
+            "out_hidden_size": 2560,
+            "num_position_embeddings": 2304,
+            "deepstack_visual_indexes": [5, 11, 17],
+        }
 
     # ---- positional helpers -------------------------------------------------
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:

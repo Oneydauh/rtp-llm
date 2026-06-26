@@ -163,7 +163,6 @@ class QuantizationConfig(ABC):
 
         if quant_config is None:
             return None
-
         group_size = quant_config["group_size"] if "group_size" in quant_config else 0
         bits = quant_config["bits"] if "bits" in quant_config else 0
         if quant_method == "fp8":
@@ -226,11 +225,19 @@ class QuantizationConfig(ABC):
             quark_weights_config = quant_config["global_quant_config"]["weight"]
             if quark_weights_config["dtype"] == "fp8_e4m3":
                 bits = 8
+            elif quark_weights_config["dtype"] == "fp4":
+                bits = 4
             if (
                 quark_weights_config["dtype"] == "fp8_e4m3"
                 and quark_weights_config["qscheme"] == "per_channel"
             ):
                 quant_method = Fp8PerChannelQuarkQuantConfig.get_method()
+            if (
+                quark_weights_config["dtype"] == "fp4"
+                and quark_weights_config["qscheme"] == "per_group"
+            ):
+                quant_method = MXFp4QuarkQuantConfig.get_method()
+                group_size = quark_weights_config["group_size"]
 
         if quant_method == "modelopt":
             config_groups = quant_config["config_groups"]
@@ -514,8 +521,14 @@ class Fp8PerChannelCompressedQuantConfig(CompressedTensorsQuantConfig):
 
 
 class QuarkQuantConfig(QuantizationConfig):
-    def __init__(self, bits: int = 0, is_quanted: bool = False):
-        super().__init__(bits=bits, group_size=0, is_quanted=is_quanted)
+    def __init__(
+        self,
+        bits: int = 0,
+        group_size: int = 0,
+        is_quanted: bool = False,
+        **kwargs: Any,
+    ):
+        super().__init__(bits=bits, group_size=group_size, is_quanted=is_quanted)
 
     @classmethod
     def get_method(cls) -> str:
@@ -530,7 +543,7 @@ class QuarkQuantConfig(QuantizationConfig):
 
     @classmethod
     def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
-        return QuarkQuantConfig()
+        return QuarkQuantConfig(**config)
 
 
 class Fp8PerChannelQuarkQuantConfig(QuarkQuantConfig):
@@ -563,6 +576,38 @@ class Fp8PerChannelQuarkQuantConfig(QuarkQuantConfig):
     @classmethod
     def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
         return Fp8PerChannelQuarkQuantConfig(**config)
+
+
+class MXFp4QuarkQuantConfig(QuarkQuantConfig):
+    def __init__(
+        self,
+        bits: int = 4,
+        group_size: int = 0,
+        is_quanted: bool = False,
+        **kwargs: Any,
+    ):
+        super().__init__(bits=bits, group_size=group_size, is_quanted=is_quanted)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "QuarkMXFP4"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "mxfp4-quark"
+
+    def get_supported_act_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16, torch.float8_e4m3fn]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return MXFp4QuarkQuantConfig(**config)
 
 
 class SmoothQuantConfig(QuantizationConfig):
@@ -643,6 +688,10 @@ class AWQConfig(QuantizationConfig):
 
     @classmethod
     def get_method(cls) -> str:
+        return "awq"
+
+    def get_runtime_method_key(self) -> str:
+        # 新 loader 据此从 _LINEAR_METHOD_REGISTRY 找 AWQLinearMethod。
         return "awq"
 
     @classmethod
@@ -813,6 +862,9 @@ DEFAULT_FP8_PER_CHANNEL_COMPRESSED_QUANT_CONFIG = Fp8PerChannelCompressedQuantCo
 DEFAULT_FP8_PER_CHANNEL_QUARK_QUANT_CONFIG = Fp8PerChannelQuarkQuantConfig(
     bits=8, is_quanted=False
 )
+DEFAULT_QUARK_MXFP4_QUANT_CONFIG = MXFp4QuarkQuantConfig(
+    bits=4, group_size=32, is_quanted=False
+)
 DEFAULT_MODELOPT_FP4_QUANT_CONFIG = ModelOptFp4Config(
     bits=4, group_size=16, is_quanted=False
 )
@@ -832,6 +884,7 @@ preset_quant_config = {
     "FP8_PER_BLOCK": DEFAULT_FP8_BLOCK_WISE_QUANT_CONFIG,
     "FP8_PER_CHANNEL_COMPRESSED": DEFAULT_FP8_PER_CHANNEL_COMPRESSED_QUANT_CONFIG,
     "FP8_PER_CHANNEL_QUARK": DEFAULT_FP8_PER_CHANNEL_QUARK_QUANT_CONFIG,
+    "QUARKMXFP4": DEFAULT_QUARK_MXFP4_QUANT_CONFIG,
     "MODELOPT_FP4": DEFAULT_MODELOPT_FP4_QUANT_CONFIG,
     "W4A8_INT4_PER_CHANNEL": DEFAULT_W4A8_INT4_PER_CHANNEL_QUANT_CONFIG,
     "W4A8_INT4_PER_CHANNEL_COMPRESSED": (

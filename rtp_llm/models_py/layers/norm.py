@@ -3,6 +3,8 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 
+_RMSNORM_FALLBACK_WARNED = False
+
 
 class RMSNorm(nn.Module):
 
@@ -25,6 +27,30 @@ class RMSNorm(nn.Module):
                 self.weight.data.copy_(tensor)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 默认走 rtp 融合 rmsnorm（与旧 loader modules.RMSNorm 一致）；
+        # CUDA/ROCm 上 is_cuda 均为 True，rtp_llm_ops 按 arch 编译为对应后端 kernel。
+        # 非 CUDA / kernel 不可用时回退 eager fp32（可移植）。
+        if x.is_cuda:
+            try:
+                from rtp_llm.ops.compute_ops import rtp_llm_ops
+
+                orig_shape = x.shape
+                # 融合 kernel 按最后一维归一；reshape 成 2D 以兼容 q_norm/k_norm 的
+                # [tokens, heads, head_dim] 三维输入。
+                x2d = x.reshape(-1, orig_shape[-1]).contiguous()
+                out = torch.empty_like(x2d)
+                stream_id = torch.cuda.current_stream().cuda_stream
+                rtp_llm_ops.rmsnorm(out, x2d, self.weight.data, self.eps, stream_id)
+                return out.reshape(orig_shape)
+            except Exception as e:  # 失败回退 eager，且告警一次
+                global _RMSNORM_FALLBACK_WARNED
+                if not _RMSNORM_FALLBACK_WARNED:
+                    _RMSNORM_FALLBACK_WARNED = True
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "[RMSNorm] 融合 rmsnorm 不可用，回退 eager fp32: %s", e
+                    )
         input_dtype = x.dtype
         x = x.to(torch.float32)
         variance = x.pow(2).mean(-1, keepdim=True)

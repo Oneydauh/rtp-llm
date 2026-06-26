@@ -255,10 +255,24 @@ def _extract_config_values(
     if not has_e_score_correction and config_json:
         has_e_score_correction = config_json.get("topk_method") == "noaux_tc"
 
-    # Indexer rope style
-    rope_interleave = _get(model_config, "rope_interleave", True)
+    # Rope interleave style.
+    # The old loader sets these on model_config.attn_config.rope_config
+    # (is_neox_style / indexer_is_neox_style), NOT as direct attributes on
+    # model_config.  So _get(model_config, "rope_interleave", ...) returns the
+    # default.  Read from config_json to get the raw value — this matters for
+    # GLM-5 which may set rope_interleave=False / indexer_rope_interleave=True.
+    rope_interleave = _get(model_config, "rope_interleave", None)
+    if rope_interleave is None and config_json:
+        rope_interleave = config_json.get("rope_interleave", True)
+    if rope_interleave is None:
+        rope_interleave = True
     is_neox_style = not rope_interleave
-    indexer_rope_interleave = _get(model_config, "indexer_rope_interleave", False)
+
+    indexer_rope_interleave = _get(model_config, "indexer_rope_interleave", None)
+    if indexer_rope_interleave is None and config_json:
+        indexer_rope_interleave = config_json.get("indexer_rope_interleave", False)
+    if indexer_rope_interleave is None:
+        indexer_rope_interleave = False
     indexer_is_neox_style = not indexer_rope_interleave
 
     # Parallelism
@@ -345,6 +359,16 @@ class DeepSeekV32ForCausalLM(GptModelBase):
 
     WEIGHTS_MAPPER = WeightsMapper(prefix_mapping={"model.": ""})
 
+    @staticmethod
+    def _read_config_json(ckpt_path: str) -> Dict[str, Any]:
+        """Read config.json from ckpt path.
+
+        Overridable by subclasses (e.g. DeepSeek VL V2 merges the nested
+        ``language_config`` section into the top-level dict so that
+        _extract_config_values can find MLA / MoE fields).
+        """
+        return _read_config_json(ckpt_path)
+
     def load_weights(self, weights):
         if isinstance(weights, dict):
             weights_iter = iter(weights.items())
@@ -396,7 +420,9 @@ class DeepSeekV32ForCausalLM(GptModelBase):
         # Read config.json early — _extract_config_values needs it to
         # resolve fields that old-loader's _create_config overwrites on
         # model_config (e.g. inter_size).
-        config_json = _read_config_json(ckpt_path)
+        # _read_config_json is overridable so multimodal variants (e.g.
+        # DeepSeek VL V2) can merge nested sub-configs into the top level.
+        config_json = self._read_config_json(ckpt_path)
 
         cfg = _extract_config_values(model_config, load_config, config_json)
 

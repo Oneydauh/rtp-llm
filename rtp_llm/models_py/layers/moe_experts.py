@@ -159,6 +159,21 @@ class BaseMoEExperts(nn.Module):
         self._moe_config = moe_config
         self._quant_config = quant_config
 
+        # 统一派发（与 LinearBase 对称）:按层类型从 quant_config 取 MoE 量化方法。
+        # 拿到 FusedMoEMethodBase → 委托给它（见 _init_buffers / _dispatch_scale /
+        # process_weights_after_loading / _build_weights_dict 里的 if 分支）;
+        # 拿到 None（当前 fp8/unquantized 尚未注册 MoE 方法）→ 走内置 _quant_family
+        # 逻辑,行为与改动前完全一致。
+        self.quant_method = (
+            quant_config.get_quant_method(self) if quant_config is not None else None
+        )
+        if layer_idx == 0:
+            logger.info(
+                "[BaseMoEExperts] layer_idx=0 quant_method=%s "
+                "(None=走内置 _quant_family;否则走 method 委托)",
+                type(self.quant_method).__name__ if self.quant_method else None,
+            )
+
         self._init_buffers(params_dtype)
 
         self.fused_moe: Optional[nn.Module] = None
@@ -171,6 +186,16 @@ class BaseMoEExperts(nn.Module):
 
     def _init_buffers(self, params_dtype: torch.dtype):
         """Allocate w13/w2 parameter buffers based on quantization family."""
+        if self.quant_method is not None:
+            # 委托给统一派发拿到的 MoE 量化方法（Step B 起 fp8 走这条）。
+            self.quant_method.create_weights(
+                self,
+                self.num_local_experts,
+                self.hidden_size,
+                self.moe_inter_tp,
+                params_dtype,
+            )
+            return
         E = self.num_local_experts
         M_tp = self.moe_inter_tp
         H = self.hidden_size
@@ -308,6 +333,18 @@ class BaseMoEExperts(nn.Module):
         e.g. ``65.gate_proj.weight``, ``65.gate_proj.weight_scale``.
         """
         for name, tensor in weights.items():
+            # Stacked (fused-experts) ckpt format: a single 3D tensor holds all
+            # experts, e.g. Qwen3-VL-MoE ships ``experts.gate_up_proj`` [E,H,2M]
+            # and ``experts.down_proj`` [E,M,H]. Split per-expert and reuse the
+            # per-expert copy helpers (which do TP-slice + EP remap).
+            base = name.split(".")[0]
+            if (
+                base in ("gate_up_proj", "down_proj")
+                and hasattr(tensor, "dim")
+                and tensor.dim() == 3
+            ):
+                self._load_stacked_experts(base, tensor)
+                continue
             parts = name.split(".")
             if len(parts) < 3:
                 continue
@@ -361,6 +398,38 @@ class BaseMoEExperts(nn.Module):
                     self._logged_first_scale = True
                 self._dispatch_scale(local_expert_id, proj, param_name, tensor)
 
+    def _load_stacked_experts(self, base: str, tensor: torch.Tensor):
+        """Load a stacked fused-experts tensor (one 3D tensor for all experts).
+
+        Layouts (HF Qwen3-VL-MoE, [E, in, out]):
+          * ``gate_up_proj``: [E, H, 2M]，最后一维 2M = [gate(M) | up(M)]。
+            每个专家转置 + 切 gate/up，得到 per-expert [M, H]，复用 ``_copy_gate_or_up``
+            (它把 up 放 w13 前半、gate 放后半,与旧 loader ``transpose_stack_moe_w1`` 一致)。
+          * ``down_proj``: [E, M, H]，转置成 [H, M] 复用 ``_copy_down``。
+        ``_copy_*`` 内部负责 TP 切分；``_remap_expert_id`` 负责 EP 选本地专家。
+        """
+        E = tensor.shape[0]
+        if base == "gate_up_proj":
+            M = tensor.shape[2] // 2
+            for g in range(E):
+                local_id = self._remap_expert_id(g)
+                if local_id is None:
+                    continue
+                e = tensor[g]  # [H, 2M]
+                gate_e = e[:, :M].t().contiguous()  # [M, H]
+                up_e = e[:, M:].t().contiguous()  # [M, H]
+                self._copy_gate_or_up(local_id, gate_e, gate=True)
+                self._copy_gate_or_up(local_id, up_e, gate=False)
+                self._loaded_count += 2
+        else:  # down_proj
+            for g in range(E):
+                local_id = self._remap_expert_id(g)
+                if local_id is None:
+                    continue
+                d = tensor[g].t().contiguous()  # [M, H] -> [H, M]
+                self._copy_down(local_id, d)
+                self._loaded_count += 1
+
     def _dispatch_weight(self, local_id: int, proj: str, tensor: torch.Tensor):
         """Route a weight tensor to the correct buffer position."""
         if proj == "gate_proj":
@@ -381,6 +450,9 @@ class BaseMoEExperts(nn.Module):
         Handles FP8 per-tensor, per-channel, per-block natively.
         Override in subclass for additional quantization types.
         """
+        if self.quant_method is not None:
+            self.quant_method.dispatch_scale(self, local_id, proj, param_name, tensor)
+            return
         qf = self._quant_family
 
         # Online families allocate BF16 buffers and quantize at post-load. If
@@ -511,6 +583,10 @@ class BaseMoEExperts(nn.Module):
         Handles FP8 scale fusion natively.  Override in subclass for
         additional quantization types; always call super() at the end.
         """
+        if self.quant_method is not None:
+            self.quant_method.process_weights_after_loading(self)
+            self._maybe_build_fused_moe()
+            return
         qf = self._quant_family
         if qf == "fp8_per_tensor":
             self._fuse_fp8_per_tensor_scales()
@@ -759,7 +835,9 @@ class BaseMoEExperts(nn.Module):
             W.moe_w1: self.w13.data,
             W.moe_w2: self.w2.data,
         }
-        if self._quant_family in (
+        if self.quant_method is not None:
+            self.quant_method.add_weight_tensors(self, weights_dict)
+        elif self._quant_family in (
             "fp8_per_tensor",
             "fp8_per_channel",
             "fp8_per_block",

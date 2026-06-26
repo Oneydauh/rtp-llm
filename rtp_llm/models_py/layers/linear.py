@@ -127,6 +127,11 @@ class ColumnParallelLinear(LinearBase):
                 # of `weight`.
                 if self.tp_size > 1:
                     tensor = self._split_weight(tensor, dim=0)
+            elif param_name in ("qweight", "qzeros", "scales"):
+                # AWQ(w4a16):qweight[in, out//8] / qzeros[g, out//8] / scales[g, out]
+                # —— 输出维都是 dim1,ColumnParallel 切输出 → 切 dim1。
+                if self.tp_size > 1:
+                    tensor = self._split_weight(tensor, dim=1)
 
             if tensor.shape != param.shape:
                 raise ValueError(
@@ -214,6 +219,11 @@ class RowParallelLinear(LinearBase):
                 # `weight`.
                 if self.tp_size > 1:
                     tensor = self._split_weight(tensor, dim=1)
+            elif param_name in ("qweight", "qzeros", "scales"):
+                # AWQ(w4a16):qweight[in, out//8] / qzeros[g, out//8] / scales[g, out]
+                # —— 输入维都是 dim0,RowParallel 切输入 → 切 dim0。
+                if self.tp_size > 1:
+                    tensor = self._split_weight(tensor, dim=0)
 
             if tensor.shape != param.shape:
                 raise ValueError(
@@ -288,6 +298,30 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 if shard_id < 0:
                     # Un-sharded param (e.g. already-merged ckpt) — full copy.
                     param.data.copy_(tensor)
+                    continue
+
+                if param_name in ("qweight", "qzeros", "scales"):
+                    # AWQ(w4a16):输出维是 dim1;qweight/qzeros 以 pack_factor 压缩,
+                    # scales 不压缩。每个 shard(gate/up)沿 dim1 TP 切 + 按 shard 偏移拼入。
+                    pf = (
+                        1
+                        if param_name == "scales"
+                        else getattr(self.quant_method, "PACK_FACTOR", 8)
+                    )
+                    shard_cols = shard_size // pf
+                    if (
+                        self.tp_size > 1
+                        and tensor.shape[1] == shard_cols * self.tp_size
+                    ):
+                        start = self.tp_rank * shard_cols
+                        tensor = tensor.narrow(1, start, shard_cols).contiguous()
+                    if tensor.shape[1] != shard_cols:
+                        raise ValueError(
+                            f"[AWQ merged] {self.prefix}.{param_name} shard={shard_id}: "
+                            f"dim1={tensor.shape[1]} != expected {shard_cols}"
+                        )
+                    off = shard_id * shard_cols
+                    param.data[:, off : off + shard_cols].copy_(tensor)
                     continue
 
                 if param_name == "weight_scale_inv":
@@ -477,6 +511,30 @@ class QKVParallelLinear(ColumnParallelLinear):
                 self.kv_size,
                 self.q_size + self.kv_size,
             )
+
+        if param_name in ("qweight", "qzeros", "scales"):
+            # AWQ(w4a16):输出维是 dim1;qweight/qzeros 以 pack_factor 压缩。
+            # q/k/v 各自的 size、offset 在 dim1 上换算(压缩参数 //pf)。
+            param = getattr(self, param_name, None)
+            if param is None or not isinstance(param, nn.Parameter):
+                return
+            pf = (
+                1
+                if param_name == "scales"
+                else getattr(self.quant_method, "PACK_FACTOR", 8)
+            )
+            cols = size // pf
+            off_cols = offset // pf
+            if self.tp_size > 1 and tensor.shape[1] == cols * self.tp_size:
+                start = self.tp_rank * cols
+                tensor = tensor.narrow(1, start, cols).contiguous()
+            if tensor.shape[1] != cols:
+                raise ValueError(
+                    f"[AWQ QKV] {self.prefix}.{param_name}/{qkv_key}: "
+                    f"dim1={tensor.shape[1]} != expected {cols}"
+                )
+            param.data[:, off_cols : off_cols + cols].copy_(tensor)
+            return
 
         if param_name == "weight":
             split = self._split_qkv(tensor, num_heads, self.head_dim)
