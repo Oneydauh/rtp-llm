@@ -1,3 +1,4 @@
+import inspect
 import logging
 import os
 import re
@@ -462,6 +463,13 @@ class NewModelLoader:
                 f"Available: {list(MODEL_REGISTRY.keys())}.{diag}"
             )
         model_cls = MODEL_REGISTRY[model_type]
+        logger.info(
+            "NewModelLoader registry hit: model_type=%s cls=%s module=%s file=%s",
+            model_type,
+            model_cls.__qualname__,
+            model_cls.__module__,
+            inspect.getfile(model_cls),
+        )
         model = model_cls(self.model_config, self.load_config)
         logger.info(f"Created model: {model_cls.__name__} (type={model_type})")
         return model

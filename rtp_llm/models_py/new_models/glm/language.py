@@ -1016,10 +1016,22 @@ def _extract_glm4_moe_config_values(
             "routed_scaling_factor", routed_scaling_factor
         )
 
-    # Correction bias — detect from topk_method in config.json
+    # Correction bias — detect from topk_method or scoring_func in config.json.
+    # GLM-4.5 models use sigmoid scoring with correction bias but do NOT set
+    # topk_method or scoring_func in their config.json. The old loader detects
+    # this by probing weight keys directly. For the new loader, we default to
+    # True for glm4_moe (extra param is harmless if weight is absent) and also
+    # check topk_method/scoring_func for other model types sharing this code.
     has_e_score_correction = _get(model_config, "has_e_score_correction", False)
     if not has_e_score_correction and config_json:
-        has_e_score_correction = config_json.get("topk_method") == "noaux_tc"
+        topk_method = config_json.get("topk_method", "")
+        scoring_func_str = config_json.get("scoring_func", "")
+        model_type_str = config_json.get("model_type", "")
+        has_e_score_correction = (
+            topk_method == "noaux_tc"
+            or scoring_func_str == "sigmoid"
+            or model_type_str == "glm4_moe"
+        )
 
     # Parallelism
     tp_size = getattr(load_config, "tp_size", 1)

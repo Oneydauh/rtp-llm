@@ -54,11 +54,19 @@ class LanguageCppEngine(BaseEngine):
             )
         ):
             # 新 loader（py-model）LOCAL 模式：vit 已由新 loader 加载进
-            # py_model.visual.vit；把它注入 mm 流水线复用，避免再用旧 loader
-            # （CkptDatabase + weight_info）重复加载一份 vit、重复占显存。
-            # 旧 loader / 非 VL：py_model 无 visual → 取到 None → 保持原加载方式。
+            # py_model.visual。部分 wrapper 暴露 .vit，Qwen3-VL 直接把 visual
+            # 作为可执行视觉塔；两种都注入 mm 流水线复用，避免旧 loader
+            # （CkptDatabase + weight_info）再加载一份 vit、重复占显存。
             py_model = getattr(self.model, "py_model", None)
-            injected_vit = getattr(getattr(py_model, "visual", None), "vit", None)
+            visual = getattr(py_model, "visual", None)
+            injected_vit = getattr(visual, "vit", visual)
+            if injected_vit is not None:
+                logging.info(
+                    "Inject new-loader visual module into multimodal mixin: "
+                    "type=%s module=%s",
+                    type(injected_vit).__name__,
+                    type(injected_vit).__module__,
+                )
             self.mm_process_engine = (
                 MultimodalMixinFactory.create_multimodal_process_engine(
                     model_config=self.model.model_config,

@@ -197,10 +197,30 @@ class QuantizationConfig:
         return []
 
     def is_layer_ignored(self, prefix: str) -> bool:
-        """模块名（prefix）是否在 ignore 列表里 → 该模块不量化。"""
+        """模块名（prefix）是否在 ignore 列表里 → 该模块不量化。
+
+        采用点边界（.）分段前缀匹配与 fnmatch 通配符支持，避免子串包含匹配（如 gate 误伤 gate_proj）。
+        """
         if not prefix or not self.ignored_layers:
             return False
-        return any(pat and pat in prefix for pat in self.ignored_layers)
+
+        for pat in self.ignored_layers:
+            if not pat:
+                continue
+            # 1. 通配符模式匹配
+            if "*" in pat or "?" in pat:
+                import fnmatch
+
+                if fnmatch.fnmatch(prefix, pat) or fnmatch.fnmatch(prefix, f"{pat}.*"):
+                    return True
+            # 2. 精确点分割路径前缀匹配
+            else:
+                prefix_parts = prefix.split(".")
+                pat_parts = pat.split(".")
+                if len(pat_parts) <= len(prefix_parts):
+                    if prefix_parts[: len(pat_parts)] == pat_parts:
+                        return True
+        return False
 
     @staticmethod
     def _is_moe_layer(layer) -> bool:

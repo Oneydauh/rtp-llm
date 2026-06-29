@@ -305,7 +305,14 @@ class DeepepNormalRouterFp8PerTensor(DeepepNormalRouterBase):
         resolver = MoeConfigResolver()
         quant_method = resolver.get_quant_method(config)
         checker.check(
-            quant_method in ["FP8_PER_TENSOR_COMPRESSED", "FP8_DYNAMIC_PER_TENSOR"]
+            quant_method
+            in [
+                "FP8_PER_TENSOR_COMPRESSED",
+                "FP8_DYNAMIC_PER_TENSOR",
+                "FP8_PER_CHANNEL_COMPRESSED",
+                "FP8_PER_CHANNEL_QUARK",
+                "FP8_PER_CHANNEL_QUARK_COMPRESSED",
+            ]
         )
 
 

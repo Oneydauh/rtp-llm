@@ -511,9 +511,8 @@ class Fp8PerChannelCompressedQuantConfig(CompressedTensorsQuantConfig):
 
     def get_runtime_method_key(self) -> str:
         # Online path: BF16 ckpt -> per-output-channel fp8 at load time.
-        # Pre-quantized compressed-tensors ckpts (is_quanted=True) need a
-        # separate method class; "" means new loader does not support them yet.
-        return "fp8_per_channel_online" if not self.is_quanted() else ""
+        # Pre-quantized compressed-tensors ckpts (is_quanted=True) use fp8_per_channel method.
+        return "fp8_per_channel_online" if not self.is_quanted() else "fp8_per_channel"
 
     @classmethod
     def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":

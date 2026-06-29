@@ -216,7 +216,7 @@ def cutlass_moe_mm_fp8_scaled(
 ) -> None:
 
     assert per_act_token == True
-    assert per_out_ch == False
+    assert per_out_ch in (True, False)
 
     E, N, _ = w.shape
     M, K = aq.shape

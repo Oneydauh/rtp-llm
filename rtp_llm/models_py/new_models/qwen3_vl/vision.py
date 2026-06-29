@@ -245,6 +245,9 @@ class Qwen3VLVisionTransformer(RtpModule):
         patch_size = vit_config.get("patch_size", 16)
         temporal_patch_size = vit_config.get("temporal_patch_size", 2)
         in_channels = vit_config.get("in_channels", 3)
+        self.patch_size = patch_size
+        self.temporal_patch_size = temporal_patch_size
+        self.in_channels = in_channels
         self.spatial_merge_size = vit_config.get("spatial_merge_size", 2)
         out_hidden_size = vit_config.get("out_hidden_size", 2560)
         self.num_position_embeddings = vit_config.get("num_position_embeddings", 2304)
@@ -300,6 +303,20 @@ class Qwen3VLVisionTransformer(RtpModule):
                 for _ in range(len(self.deepstack_visual_indexes))
             ]
         )
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.patch_embed.proj.weight.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self.patch_embed.proj.weight.device
+
+    def get_dtype(self) -> torch.dtype:
+        return self.dtype
+
+    def get_device(self) -> torch.device:
+        return self.device
 
     # ---- config helpers -----------------------------------------------------
     @staticmethod
