@@ -153,20 +153,43 @@ def _get_fastsafetensors_weights(
     ckpt_files: List[str], device: str
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     from fastsafetensors import ParallelLoader, SingleGroup
+    from rtp_llm.model_loader.per_expert_parallel_loader import PerExpertParallelLoader
+    from safetensors import safe_open
 
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         pg = torch.distributed.group.WORLD
     else:
         pg = SingleGroup()
 
-    loader = ParallelLoader(
+    stacked_key_config = {}
+    if ckpt_files:
+        try:
+            with safe_open(ckpt_files[0], framework="pt") as f:
+                for key in f.keys():
+                    if ("mlp.experts.gate_up_proj" in key or "mlp.experts.down_proj" in key) and "experts.weight" not in key:
+                        slice_ = f.get_slice(key)
+                        if len(slice_.shape) == 3:
+                            template = key.replace("experts.gate_up_proj", "experts.{expert_id}.gate_up_proj") \
+                                          .replace("experts.down_proj", "experts.{expert_id}.down_proj")
+                            stacked_key_config[key] = template
+        except Exception as e:
+            logging.warning(f"Failed to auto-detect stacked keys for PerExpertParallelLoader: {e}")
+
+    loader_kwargs = dict(
         pg=pg,
         hf_weights_files=sorted(ckpt_files),
         use_tqdm_on_load=True,
         device=device,
-        bbuf_size_kb=1024 * 1024 * 2,
+        bbuf_size_kb=1024 * 256,  # Optimized from 2GB to 256MB to save GPU memory headroom
         use_shm=True,
     )
+
+    if stacked_key_config:
+        logging.info(f"FST per-expert parallel loader enabled for {len(stacked_key_config)} stacked keys: {list(stacked_key_config.keys())}")
+        loader = PerExpertParallelLoader(stacked_key_config, **loader_kwargs)
+    else:
+        loader = ParallelLoader(**loader_kwargs)
+
     try:
         yield from loader.iterate_weights()
     finally:
@@ -297,6 +320,9 @@ class NewModelLoader:
         model.to(self.device)
         logger.info(f"model.to({self.device}) took {time.time() - t1:.2f}s")
 
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         self._run_post_load_hooks(model)
         self._log_peak_gpu_memory()
         return model
@@ -324,6 +350,9 @@ class NewModelLoader:
         t1 = time.time()
         model.load_weights(weights_iter)
         logger.info(f"model.load_weights() took {time.time() - t1:.2f}s")
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         self._run_post_load_hooks(model)
         self._log_peak_gpu_memory()

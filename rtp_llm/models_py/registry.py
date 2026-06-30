@@ -49,6 +49,10 @@ _LAZY_MODEL_REGISTRY: Dict[str, Tuple[str, str]] = {
         "rtp_llm.models_py.new_models.deepseek_v3_mtp",
         "DeepSeekV32MTPForCausalLM",
     ),
+    "llama": (
+        "rtp_llm.models_py.new_models.llama",
+        "LlamaForCausalLM",
+    ),
 }
 
 
