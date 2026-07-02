@@ -326,6 +326,19 @@ class BaseModel(object):
             fmha_config=getattr(self.hw_kernel_config, "fmha_config", None),
             device_resource_config=self.device_resource_config,
             moe_config=self.moe_config,
+            force_cpu_load_weights=self.force_cpu_load_weights,
+        )
+        quant_source_config = getattr(load_config, "quant_source_config", None)
+        logging.info(
+            "[NewModelLoader][quant] quant_type=%s source_config=%s "
+            "weight_block_size=%s",
+            load_config.quant_type,
+            (
+                type(quant_source_config).__name__
+                if quant_source_config is not None
+                else None
+            ),
+            getattr(quant_source_config, "weight_block_size", None),
         )
 
         loader = NewModelLoader(
@@ -408,10 +421,26 @@ class BaseModel(object):
         """
         from rtp_llm.utils.model_weight import W
 
+        layer_prefix = r"(?:(?:language_model|model)\.)?(?:model\.)?layers\.(\d+)\."
         patterns = [
-            (re.compile(r"layers\.(\d+)\.mlp\.experts\.w13$"), W.moe_w1),
-            (re.compile(r"layers\.(\d+)\.mlp\.experts\.w2$"), W.moe_w2),
-            (re.compile(r"layers\.(\d+)\.mlp\.gate\.weight$"), W.moe_gate),
+            # Qwen-style MoE blocks.
+            (re.compile(layer_prefix + r"mlp\.experts\.w13$"), W.moe_w1),
+            (re.compile(layer_prefix + r"mlp\.experts\.w2$"), W.moe_w2),
+            (re.compile(layer_prefix + r"mlp\.gate\.weight$"), W.moe_gate),
+            # MiniMax-M3 uses block_sparse_moe and may be wrapped by the VL
+            # top-level language_model module.
+            (
+                re.compile(layer_prefix + r"block_sparse_moe\.experts\.w13$"),
+                W.moe_w1,
+            ),
+            (
+                re.compile(layer_prefix + r"block_sparse_moe\.experts\.w2$"),
+                W.moe_w2,
+            ),
+            (
+                re.compile(layer_prefix + r"block_sparse_moe\.gate\.weight$"),
+                W.moe_gate,
+            ),
         ]
         out: Dict[int, Dict[str, torch.Tensor]] = {}
         for name, param in module.named_parameters():
@@ -420,6 +449,15 @@ class BaseModel(object):
                 if m:
                     out.setdefault(int(m.group(1)), {})[w_key] = param.data
                     break
+        for layer_id, weights in out.items():
+            missing = [key for key in (W.moe_w1, W.moe_w2) if key not in weights]
+            if missing:
+                logging.warning(
+                    "[EPLB][new_loader] MoE layer %d missing weights for C++ "
+                    "ModelWeights: %s",
+                    layer_id,
+                    missing,
+                )
         return out
 
     @staticmethod
@@ -427,19 +465,63 @@ class BaseModel(object):
         return bool(re.search(r"layers\.\d+", name))
 
     @staticmethod
+    def _is_mm_weight(name: str) -> bool:
+        return any(
+            part in name
+            for part in (
+                "vision_tower",
+                "visual",
+                "multi_modal_projector",
+                "mm_projector",
+                "patch_merge_mlp",
+            )
+        )
+
+    @staticmethod
     def _is_final_norm(name: str) -> bool:
         if BaseModel._in_layers(name):
             return False
         if "lm_head" in name:
             return False
-        return "norm" in name or "layernorm" in name
+        if BaseModel._is_mm_weight(name):
+            return False
+
+        parts = name.split(".")
+        if parts[-1] not in ("weight", "bias"):
+            return False
+
+        norm_name = parts[-2] if len(parts) >= 2 else ""
+        if norm_name in ("norm", "ln_f", "final_layernorm", "final_norm"):
+            return True
+        if norm_name in ("layernorm", "layer_norm") and len(parts) <= 3:
+            return True
+        return False
+
+    @staticmethod
+    def _global_weight_priority(name: str) -> Tuple[int, int]:
+        parts = name.split(".")
+        if parts[0] == "language_model":
+            return (0, len(parts))
+        if parts[0] in ("model", "transformer"):
+            return (1, len(parts))
+        return (2, len(parts))
 
     def _extract_global_weights(
         self, module: torch.nn.Module
     ) -> Dict[str, torch.Tensor]:
         rules: List[Tuple[Any, str]] = [
-            (lambda n: "embed_token" in n and not self._in_layers(n), "embedding"),
-            (lambda n: "lm_head" in n and "weight" in n.split(".")[-1], "lm_head"),
+            (
+                lambda n: n.endswith(("embed_tokens.weight", "embed_token.weight"))
+                and not self._in_layers(n)
+                and not self._is_mm_weight(n),
+                "embedding",
+            ),
+            (
+                lambda n: n.endswith("lm_head.weight")
+                and not self._in_layers(n)
+                and not self._is_mm_weight(n),
+                "lm_head",
+            ),
             (
                 lambda n: self._is_final_norm(n) and n.split(".")[-1] == "weight",
                 "final_layernorm.gamma",
@@ -460,17 +542,28 @@ class BaseModel(object):
         ]
 
         result: Dict[str, torch.Tensor] = {}
-        assigned_keys: set = set()
+        candidates: Dict[str, List[Tuple[str, torch.Tensor]]] = {}
 
         for name, param in module.named_parameters():
             for matcher, w_key in rules:
-                if w_key in assigned_keys:
-                    continue
                 if matcher(name):
-                    result[w_key] = param.data
-                    assigned_keys.add(w_key)
-                    logging.info(f"Global weight mapped: {name} -> {w_key}")
+                    candidates.setdefault(w_key, []).append((name, param.data))
                     break
+
+        for w_key, matched in candidates.items():
+            name, tensor = sorted(
+                matched, key=lambda item: self._global_weight_priority(item[0])
+            )[0]
+            result[w_key] = tensor
+            if len(matched) > 1:
+                logging.info(
+                    "Global weight mapped: %s -> %s, skipped candidates=%s",
+                    name,
+                    w_key,
+                    [candidate for candidate, _ in matched if candidate != name],
+                )
+            else:
+                logging.info(f"Global weight mapped: {name} -> {w_key}")
 
         return result
 

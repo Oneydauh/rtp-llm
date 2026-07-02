@@ -61,6 +61,15 @@ class LinearBase(nn.Module):
         self.quant_method.process_weights_after_loading(self)
         self._post_load_done = True
 
+    def _fp8_scale_block_size(self):
+        return getattr(
+            self.quant_config, "weight_block_size", [self._FP8_BLOCK, self._FP8_BLOCK]
+        )
+
+    @staticmethod
+    def _ceil_div(x: int, y: int) -> int:
+        return (x + y - 1) // y
+
 
 class ColumnParallelLinear(LinearBase):
 
@@ -122,11 +131,22 @@ class ColumnParallelLinear(LinearBase):
                 ):
                     tensor = self._split_weight(tensor, dim=0)
             elif param_name == "weight_scale_inv":
-                # FP8 per-block scale grid [ceil(N/128), ceil(K/128)]: TP-slice
-                # along the output-block dim (dim 0), matching the column split
-                # of `weight`.
                 if self.tp_size > 1:
                     tensor = self._split_weight(tensor, dim=0)
+            elif param_name in ("scales", "zeros"):
+                if (
+                    tensor.dim() == 1
+                    and tensor.shape[0] == self.output_size_per_partition * self.tp_size
+                ):
+                    if self.tp_size > 1:
+                        tensor = self._split_weight(tensor, dim=0)
+                elif (
+                    tensor.dim() > 1
+                    and tensor.shape[-1]
+                    == self.output_size_per_partition * self.tp_size
+                ):
+                    if self.tp_size > 1:
+                        tensor = self._split_weight(tensor, dim=-1)
             elif param_name in ("qweight", "qzeros", "scales"):
                 # AWQ(w4a16):qweight[in, out//8] / qzeros[g, out//8] / scales[g, out]
                 # —— 输出维都是 dim1,ColumnParallel 切输出 → 切 dim1。
@@ -214,11 +234,15 @@ class RowParallelLinear(LinearBase):
                 ):
                     tensor = self._split_weight(tensor, dim=-1)
             elif param_name == "weight_scale_inv":
-                # FP8 per-block scale grid [ceil(N/128), ceil(K/128)]: TP-slice
-                # along the input-block dim (dim 1), matching the row split of
-                # `weight`.
                 if self.tp_size > 1:
                     tensor = self._split_weight(tensor, dim=1)
+            elif param_name == "g_idx":
+                if self.tp_size > 1:
+                    tensor = self._split_weight(tensor, dim=0)
+            elif param_name in ("scales", "zeros"):
+                if tensor.dim() > 1 and tensor.shape[0] > 1:
+                    if self.tp_size > 1:
+                        tensor = self._split_weight(tensor, dim=0)
             elif param_name in ("qweight", "qzeros", "scales"):
                 # AWQ(w4a16):qweight[in, out//8] / qzeros[g, out//8] / scales[g, out]
                 # —— 输入维都是 dim0,RowParallel 切输入 → 切 dim0。
@@ -328,8 +352,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     # FP8 per-block scale grid [out_blocks, in_blocks]. Each
                     # shard (gate/up) ships its own grid; place this shard's
                     # block-rows at its block offset. shard_size is in weight
-                    # rows, so /128 gives this shard's block-row count.
-                    blocks_per_shard = shard_size // self._FP8_BLOCK
+                    # rows, so convert through the quant config's N block.
+                    block_n, _ = self._fp8_scale_block_size()
+                    blocks_per_shard = self._ceil_div(shard_size, block_n)
                     if (
                         self.tp_size > 1
                         and tensor.shape[0] == blocks_per_shard * self.tp_size

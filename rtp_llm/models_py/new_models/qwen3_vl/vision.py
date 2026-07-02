@@ -78,6 +78,16 @@ class Qwen3VLVisionRotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
+    def process_weights_after_loading(self):
+        dim = self.inv_freq.numel() * 2
+        theta = 10000.0
+        device = self.inv_freq.device
+        dtype = self.inv_freq.dtype
+        inv_freq = 1.0 / (
+            theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+        )
+        self.inv_freq.data.copy_(inv_freq.to(dtype))
+
     def forward(self, seqlen: int) -> torch.Tensor:
         seq = torch.arange(
             seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype

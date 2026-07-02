@@ -10,10 +10,12 @@ from rtp_llm.models_py.quant_methods.fp8 import (
     Fp8PerChannelOnlineLinearMethod,
 )
 from rtp_llm.models_py.quant_methods.fp8_moe import Fp8MoEMethod
+from rtp_llm.models_py.quant_methods.gptq import GPTQLinearMethod
 from rtp_llm.models_py.quant_methods.unquantized import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
+from rtp_llm.models_py.quant_methods.weight_only import WeightOnlyLinearMethod
 
 __all__ = [
     "QuantizeMethodBase",
@@ -26,6 +28,8 @@ __all__ = [
     "Fp8BlockDequantLinearMethod",
     "Fp8MoEMethod",
     "AWQLinearMethod",
+    "GPTQLinearMethod",
+    "WeightOnlyLinearMethod",
     "UnquantizedLinearMethod",
     "UnquantizedFusedMoEMethod",
 ]

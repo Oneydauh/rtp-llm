@@ -24,7 +24,6 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from rtp_llm.model_loader.model_weight_info import ModelWeights
 from rtp_llm.models_py.distributed.collective_torch import Group, all_gather, all_reduce
 from rtp_llm.models_py.layers.embedding import ParallelLMHead, VocabParallelEmbedding
 from rtp_llm.models_py.layers.linear import (
@@ -417,6 +416,11 @@ class Qwen3NextGatedDeltaNet(RtpModule):
         attn_tp_size = (
             parallelism_config.get_attn_tp_size() if parallelism_config else tp_size
         )
+        attn_tp_rank = (
+            parallelism_config.get_attn_tp_rank() if parallelism_config else tp_rank
+        )
+        self.attn_tp_size = attn_tp_size
+        self.attn_tp_rank = attn_tp_rank
         self.local_num_k_heads = linear_attn_config.linear_num_key_heads // attn_tp_size
         self.local_num_v_heads = (
             linear_attn_config.linear_num_value_heads // attn_tp_size
@@ -486,7 +490,9 @@ class Qwen3NextGatedDeltaNet(RtpModule):
             if param_name == "weight" and "in_proj_qkvz" in name:
                 # Single-file format (qwen3_next)
                 reordered = reorder_qkvz([tensor], la_cfg)
-                self.in_proj_qkvz_w.data.copy_(reordered.T.contiguous())
+                self.in_proj_qkvz_w.data.copy_(
+                    self._split_qkvz_t(reordered.T.contiguous())
+                )
             elif (
                 param_name == "weight"
                 and "in_proj_qkv" in name
@@ -500,7 +506,7 @@ class Qwen3NextGatedDeltaNet(RtpModule):
                 self._maybe_merge_qkvz()
             elif param_name == "weight" and "in_proj_ba" in name:
                 reordered = reorder_ba([tensor], la_cfg)
-                self.in_proj_ba_w.data.copy_(reordered.T.contiguous())
+                self.in_proj_ba_w.data.copy_(self._split_ba_t(reordered.T.contiguous()))
             elif (
                 param_name == "weight"
                 and "in_proj_b" in name
@@ -512,25 +518,26 @@ class Qwen3NextGatedDeltaNet(RtpModule):
                 self._pending_a = tensor
                 self._maybe_merge_ba()
             elif param_name == "weight" and "out_proj" in name:
-                self.out_proj_w.data.copy_(tensor.T.contiguous())
+                self.out_proj_w.data.copy_(
+                    self._split_out_proj_t(tensor.T.contiguous())
+                )
             elif param_name == "weight" and "norm" in name:
                 # Linear Attention norm uses identity (NOT plus_one) in old loader
-                self.norm_w.data.copy_(tensor)
+                self.norm_w.data.copy_(self._split_head_tensor(tensor))
             elif param_name == "weight" and "conv1d" in name:
-                self.conv1d_w.data.copy_(
-                    tensor.squeeze(1) if tensor.dim() == 3 else tensor
-                )
+                conv = tensor.squeeze(1) if tensor.dim() == 3 else tensor
+                self.conv1d_w.data.copy_(self._split_conv1d(conv))
             elif param_name == "bias" and "dt" in name:
-                self.dt_bias.data.copy_(tensor)
+                self.dt_bias.data.copy_(self._split_head_tensor(tensor))
             elif param_name in ("A_log", "a_log"):
-                self.a_log.data.copy_(tensor)
+                self.a_log.data.copy_(self._split_head_tensor(tensor))
 
     def _maybe_merge_qkvz(self):
         if hasattr(self, "_pending_qkv") and hasattr(self, "_pending_z"):
             merged = merge_qkvz_transpose_reorder(
                 [self._pending_qkv, self._pending_z], self.linear_attn_config
             )
-            self.in_proj_qkvz_w.data.copy_(merged)
+            self.in_proj_qkvz_w.data.copy_(self._split_qkvz_t(merged))
             del self._pending_qkv
             del self._pending_z
 
@@ -539,9 +546,94 @@ class Qwen3NextGatedDeltaNet(RtpModule):
             merged = merge_ba_transpose_reorder(
                 [self._pending_b, self._pending_a], self.linear_attn_config
             )
-            self.in_proj_ba_w.data.copy_(merged)
+            self.in_proj_ba_w.data.copy_(self._split_ba_t(merged))
             del self._pending_b
             del self._pending_a
+
+    def _split_qkvz_t(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.shape == self.in_proj_qkvz_w.shape:
+            return tensor
+        q_size = self.head_k_dim * self.linear_attn_config.linear_num_key_heads
+        k_size = q_size
+        v_size = self.head_v_dim * self.linear_attn_config.linear_num_value_heads
+        q, k, v, z = torch.split(tensor, [q_size, k_size, v_size, v_size], dim=1)
+        local_k = self.head_k_dim * self.local_num_k_heads
+        local_v = self.head_v_dim * self.local_num_v_heads
+        k_start = local_k * self.attn_tp_rank
+        v_start = local_v * self.attn_tp_rank
+        return torch.cat(
+            [
+                q[:, k_start : k_start + local_k],
+                k[:, k_start : k_start + local_k],
+                v[:, v_start : v_start + local_v],
+                z[:, v_start : v_start + local_v],
+            ],
+            dim=1,
+        ).contiguous()
+
+    def _split_ba_t(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.shape == self.in_proj_ba_w.shape:
+            return tensor
+        b, a = torch.split(
+            tensor,
+            [
+                self.linear_attn_config.linear_num_value_heads,
+                self.linear_attn_config.linear_num_value_heads,
+            ],
+            dim=1,
+        )
+        local = self.local_num_v_heads
+        start = local * self.attn_tp_rank
+        return torch.cat(
+            [b[:, start : start + local], a[:, start : start + local]], dim=1
+        ).contiguous()
+
+    def _split_out_proj_t(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.shape == self.out_proj_w.shape:
+            return tensor
+        out_dim = self.head_v_dim * self.linear_attn_config.linear_num_value_heads
+        if tensor.shape[0] != out_dim:
+            return tensor
+        local = self.head_v_dim * self.local_num_v_heads
+        start = local * self.attn_tp_rank
+        return tensor[start : start + local, :].contiguous()
+
+    def _split_head_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.shape == self.dt_bias.shape or tensor.shape == self.a_log.shape:
+            return tensor
+        if tensor.shape == self.norm_w.shape:
+            return tensor
+        if tensor.shape[0] != self.linear_attn_config.linear_num_value_heads:
+            return tensor
+        local = self.local_num_v_heads
+        start = local * self.attn_tp_rank
+        return tensor[start : start + local].contiguous()
+
+    def _split_conv1d(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.shape == self.conv1d_w.shape:
+            return tensor
+        if tensor.dim() != 2:
+            return tensor
+        q_size = self.head_k_dim * self.linear_attn_config.linear_num_key_heads
+        k_size = q_size
+        v_size = self.head_v_dim * self.linear_attn_config.linear_num_value_heads
+        if tensor.shape[0] == q_size + k_size + v_size:
+            q, k, v = torch.split(tensor, [q_size, k_size, v_size], dim=0)
+            local_k = self.head_k_dim * self.local_num_k_heads
+            local_v = self.head_v_dim * self.local_num_v_heads
+            k_start = local_k * self.attn_tp_rank
+            v_start = local_v * self.attn_tp_rank
+            tensor = torch.cat(
+                [
+                    q[k_start : k_start + local_k],
+                    k[k_start : k_start + local_k],
+                    v[v_start : v_start + local_v],
+                ],
+                dim=0,
+            )
+        return (
+            tensor.T.contiguous() if tensor.T.shape == self.conv1d_w.shape else tensor
+        )
 
     def process_weights_after_loading(self):
         """Fuse qkvz + ba into a single weight for efficient GEMM (BF16 only)."""

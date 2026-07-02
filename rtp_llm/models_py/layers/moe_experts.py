@@ -117,13 +117,13 @@ class BaseMoEExperts(nn.Module):
                 ep_size,
             )
 
-        # EP mode: routed experts are NOT TP-sharded. Validate divisibility
-        # only for pure-TP mode (ep_size==1).
-        effective_tp = 1 if ep_size > 1 else tp_size
-        if moe_intermediate_size % effective_tp != 0:
+        # EP selects the local expert subset; TP still shards each expert's
+        # intermediate dimension when tp_size > 1. This is required for
+        # topologies where ep_size == tp_size == world_size.
+        if moe_intermediate_size % tp_size != 0:
             raise ValueError(
                 f"moe_intermediate_size {moe_intermediate_size} not divisible "
-                f"by effective tp_size {effective_tp}"
+                f"by tp_size {tp_size}"
             )
 
         self.num_experts = num_experts
@@ -133,16 +133,8 @@ class BaseMoEExperts(nn.Module):
         self.ep_rank = ep_rank
         self.layer_idx = layer_idx
 
-        # EP mode: routed experts are NOT TP-sharded (each rank holds
-        # complete expert weights). Only pure-TP mode (ep_size==1) shards
-        # the expert hidden dimension.  This mirrors the original loader's
-        # moe_pure_tp_mode = (tp_size > 1 and ep_size == 1).
-        if ep_size > 1:
-            self.tp_size = 1
-            self.tp_rank = 0
-        else:
-            self.tp_size = tp_size
-            self.tp_rank = tp_rank
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
         self.moe_inter_tp = moe_intermediate_size // self.tp_size
 
         # EP: compute local expert range
@@ -847,6 +839,20 @@ class BaseMoEExperts(nn.Module):
         ):
             weights_dict[W.moe_s1] = self.w13_scale
             weights_dict[W.moe_s2] = self.w2_scale
+        exported_device = getattr(self._model_config, "exported_device", None)
+        if exported_device is not None:
+            for name in (W.moe_w1, W.moe_w2, W.moe_s1, W.moe_s2):
+                tensor = weights_dict.get(name)
+                if tensor is None:
+                    continue
+                # Old MoeAtomicWeight postprocess routes MoE weights/scales
+                # through exported_device before constructing the executor.
+                # Per-tensor FP8 scales are 1D and do not encode gate/up rows.
+                if tensor.dim() == 1:
+                    continue
+                weights_dict[name] = exported_device.shuffle_moe_weight(
+                    tensor, self._model_config.data_type, name
+                )
         return weights_dict
 
     def _maybe_build_fused_moe(self):

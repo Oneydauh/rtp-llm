@@ -63,7 +63,13 @@ class RtpModule(nn.Module):
             if hasattr(module, name):
                 param = getattr(module, name)
                 if isinstance(param, nn.Parameter):
-                    param.data.copy_(tensor)
+                    try:
+                        param.data.copy_(tensor)
+                    except RuntimeError as e:
+                        raise RuntimeError(
+                            f"Error copying weight to parameter '{name}' in module '{module.__class__.__name__}': "
+                            f"target shape is {list(param.shape)}, source shape is {list(tensor.shape)}. Original error: {e}"
+                        ) from e
 
     def _groupby_prefix(
         self, weights: Iterator[Tuple[str, torch.Tensor]]

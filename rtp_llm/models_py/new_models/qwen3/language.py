@@ -124,6 +124,30 @@ class Qwen3Attention(RtpModule):
         )
 
     def _apply_qk_norm(self, qkv: torch.Tensor) -> torch.Tensor:
+        if qkv.is_cuda and qkv.dim() == 2:
+            import flashinfer
+
+            m, n = qkv.shape
+            qkv_view = qkv.reshape(
+                m,
+                self.num_heads_per_partition + self.num_kv_heads_per_partition * 2,
+                self.head_dim,
+            )
+            q = qkv_view[:, : self.num_heads_per_partition, :]
+            k = qkv_view[
+                :,
+                self.num_heads_per_partition : self.num_heads_per_partition
+                + self.num_kv_heads_per_partition,
+                :,
+            ]
+            flashinfer.norm.rmsnorm(
+                q, self.q_norm.weight.data, eps=self.q_norm.eps, out=q
+            )
+            flashinfer.norm.rmsnorm(
+                k, self.k_norm.weight.data, eps=self.k_norm.eps, out=k
+            )
+            return qkv_view.reshape(m, n)
+
         prefix_shape = qkv.shape[:-1]
         q = qkv[..., : self.q_size].reshape(
             *prefix_shape, self.num_heads_per_partition, self.head_dim
@@ -254,6 +278,7 @@ def _extract_config_values(model_config: Any, load_config: Any):
     tp_rank = getattr(load_config, "tp_rank", 0)
     quant_config = getattr(load_config, "quant_config", None)
     params_dtype = getattr(load_config, "compute_dtype", torch.float16)
+    enable_fp32_lm_head = getattr(model_config, "enable_fp32_lm_head", True)
 
     return dict(
         hidden_size=hidden_size,
@@ -268,6 +293,7 @@ def _extract_config_values(model_config: Any, load_config: Any):
         tp_rank=tp_rank,
         quant_config=quant_config,
         params_dtype=params_dtype,
+        lm_head_params_dtype=torch.float32 if enable_fp32_lm_head else params_dtype,
     )
 
 
@@ -357,7 +383,7 @@ class Qwen3ForCausalLM(GptModelBase):
             hidden_size=cfg["hidden_size"],
             tp_size=cfg["tp_size"],
             tp_rank=cfg["tp_rank"],
-            params_dtype=cfg["params_dtype"],
+            params_dtype=cfg["lm_head_params_dtype"],
         )
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:

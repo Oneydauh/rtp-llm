@@ -68,6 +68,13 @@ class DeepepNormalRouterBase(FusedMoeDataRouter):
         self.num_dispatchers = config.world_size // config.tp_size
         self.rank_expert_offset = self.ep_rank * self.expert_num_per_rank
         self.top_k = config.moe_topk_group
+        source_block_size = getattr(
+            config.quant_config, "weight_block_size", [128, 128]
+        )
+        self.scale_ue8m0 = is_deep_gemm_e8m0_used() and list(source_block_size) == [
+            128,
+            128,
+        ]
         deepep_config = DeepepWrapperConfig.from_config_adapter(self.config)
         self.deepep_buffer_wrapper = DeepEPWrapper.get_instance(deepep_config)
         assert (
@@ -257,13 +264,13 @@ class DeepepNormalRouterBase(FusedMoeDataRouter):
     def _do_quant_fp8_per_block(
         self, a1: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if is_deep_gemm_e8m0_used():
+        if self.scale_ue8m0:
             return sgl_per_token_group_quant_fp8(
                 a1,
                 128,
                 column_major_scales=True,
                 scale_tma_aligned=True,
-                scale_ue8m0=True,
+                scale_ue8m0=self.scale_ue8m0,
             )
         else:
             return trt_fp8_quantize_128(a1, False)

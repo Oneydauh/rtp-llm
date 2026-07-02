@@ -13,7 +13,8 @@
 ckpt 验证。回退某子族:从下面 `@register_moe_quant_method` 移除对应 key → 走内置。
 """
 
-from typing import Any, Dict
+import logging
+from typing import Any, Dict, List
 
 import torch
 import torch.nn as nn
@@ -23,6 +24,8 @@ from rtp_llm.models_py.quant_methods.base import (
     register_moe_quant_method,
 )
 from rtp_llm.utils.model_weight import W
+
+logger = logging.getLogger(__name__)
 
 # 与 BaseMoEExperts 一致的 fp8 常量（也可经 layer 取，这里就近定义保持自洽）。
 _FP8_E4M3_MAX: float = 448.0
@@ -50,6 +53,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: Any = None):
         self.quant_config = quant_config
 
+    @staticmethod
+    def _ceil_div(x: int, y: int) -> int:
+        return (x + y - 1) // y
+
+    def _weight_block_size(self, layer) -> List[int]:
+        return list(
+            getattr(
+                getattr(layer, "_quant_config", None),
+                "weight_block_size",
+                getattr(self.quant_config, "weight_block_size", [128, 128]),
+            )
+        )
+
     # ------------------------------------------------------------------ #
     #  create_weights ← _init_buffers 的 fp8/online 分支
     # ------------------------------------------------------------------ #
@@ -66,6 +82,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         qf = layer._quant_family
         dt = torch.float8_e4m3fn
         BS = layer._FP8_BLOCK_SIZE
+        block_n, block_k = self._weight_block_size(layer)
 
         if qf == "fp8_per_tensor":
             layer.w13 = nn.Parameter(
@@ -108,16 +125,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2 = nn.Parameter(
                 torch.empty(E, H, M_tp, dtype=dt), requires_grad=False
             )
-            nb = (M_tp + BS - 1) // BS
+            nb = self._ceil_div(M_tp, block_n)
+            hb = self._ceil_div(H, block_k)
+            h_nb = self._ceil_div(H, block_n)
+            k_nb = self._ceil_div(M_tp, block_k)
             layer._n_scale_blocks_per_proj = nb
-            layer.register_buffer(
-                "w13_scale",
-                torch.zeros(E, 2 * nb, (H + BS - 1) // BS, dtype=torch.float32),
-            )
-            layer.register_buffer(
-                "w2_scale",
-                torch.zeros(E, (H + BS - 1) // BS, nb, dtype=torch.float32),
-            )
+            layer._k_scale_blocks_per_proj = k_nb
+            layer._fp8_moe_weight_block_size = [block_n, block_k]
+            if [block_n, block_k] == [BS, BS]:
+                layer.register_buffer(
+                    "w13_scale",
+                    torch.zeros(E, 2 * nb, hb, dtype=torch.float32),
+                )
+                layer.register_buffer(
+                    "w2_scale",
+                    torch.zeros(E, h_nb, k_nb, dtype=torch.float32),
+                )
+            else:
+                # Source MXFP8 scales can be much larger than the execution
+                # format. Keep them as plain CPU tensors so model.to(cuda)
+                # does not move all source scales before post-load requant.
+                layer.w13_scale = torch.zeros(E, 2 * nb, hb, dtype=torch.float32)
+                layer.w2_scale = torch.zeros(E, h_nb, k_nb, dtype=torch.float32)
 
         elif qf in (
             "fp8_per_tensor_online",
@@ -142,15 +171,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     "w2_scale", torch.zeros(E, H, dtype=torch.float32)
                 )
             else:  # fp8_per_block_online
-                nb = (M_tp + BS - 1) // BS
+                nb = self._ceil_div(M_tp, block_n)
+                hb = self._ceil_div(H, block_k)
+                h_nb = self._ceil_div(H, block_n)
+                k_nb = self._ceil_div(M_tp, block_k)
                 layer._n_scale_blocks_per_proj = nb
+                layer._k_scale_blocks_per_proj = k_nb
+                layer._fp8_moe_weight_block_size = [block_n, block_k]
                 layer.register_buffer(
                     "w13_scale",
-                    torch.zeros(E, 2 * nb, (H + BS - 1) // BS, dtype=torch.float32),
+                    torch.zeros(E, 2 * nb, hb, dtype=torch.float32),
                 )
                 layer.register_buffer(
                     "w2_scale",
-                    torch.zeros(E, (H + BS - 1) // BS, nb, dtype=torch.float32),
+                    torch.zeros(E, h_nb, k_nb, dtype=torch.float32),
                 )
         else:
             raise ValueError(f"Fp8MoEMethod 不支持的 quant_family: {qf!r}")
@@ -205,16 +239,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer._down_ch_scales.data[expert_id].copy_(scale)
 
     def _copy_block_scale(self, layer, expert_id, proj, tensor):
-        BS = layer._FP8_BLOCK_SIZE
+        block_n, block_k = getattr(
+            layer, "_fp8_moe_weight_block_size", [layer._FP8_BLOCK_SIZE] * 2
+        )
         nb = layer._n_scale_blocks_per_proj
         if proj in ("gate_proj", "up_proj"):
-            start_block = (layer.tp_rank * layer.moe_inter_tp) // BS
+            start_block = (layer.tp_rank * layer.moe_inter_tp) // block_n
             sliced = tensor.narrow(0, start_block, nb).contiguous()
             row_start = nb if proj == "gate_proj" else 0
             layer.w13_scale.data[expert_id, row_start : row_start + nb].copy_(sliced)
         elif proj == "down_proj":
-            start_block = (layer.tp_rank * layer.moe_inter_tp) // BS
-            sliced = tensor.narrow(1, start_block, nb).contiguous()
+            start_block = (layer.tp_rank * layer.moe_inter_tp) // block_k
+            k_nb = getattr(layer, "_k_scale_blocks_per_proj", nb)
+            sliced = tensor.narrow(1, start_block, k_nb).contiguous()
             layer.w2_scale.data[expert_id].copy_(sliced)
 
     # ------------------------------------------------------------------ #
@@ -232,37 +269,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._online_per_channel(layer)
         elif qf == "fp8_per_block_online":
             self._online_per_block(layer)
-        # fp8_per_block（已量化）无需后处理。
+        elif qf == "fp8_per_block":
+            self._requant_per_block_if_needed(layer)
 
     def _fuse_per_tensor(self, layer):
-        from rtp_llm.models_py.quant_methods.fp8 import _resolve_per_tensor_quant
-
-        per_tensor_quant = _resolve_per_tensor_quant()
         M_tp = layer.moe_inter_tp
-        device = layer.w13.data.device
-        new_w13 = torch.empty_like(layer.w13.data, dtype=torch.float8_e4m3fn)
-        new_w2 = torch.empty_like(layer.w2.data, dtype=torch.float8_e4m3fn)
 
         for e in range(layer.num_local_experts):
             up_s = float(layer._up_scales[e].item())
             gate_s = float(layer._gate_scales[e].item())
             down_s = float(layer._down_scales[e].item())
+            max_s = max(up_s, gate_s)
 
-            up_bf16 = layer.w13.data[e, :M_tp].float() * up_s
-            gate_bf16 = layer.w13.data[e, M_tp:].float() * gate_s
-            w13_bf16 = torch.cat([up_bf16, gate_bf16], dim=0).contiguous()
+            # Keep old-loader compatibility with StaticFp8QuantWeight._postprocess:
+            # its shard loop never advances `start`, so both conditional rescale
+            # attempts operate on the first half of moe_w1.
+            for shard_s in (up_s, gate_s):
+                if shard_s != max_s:
+                    half = layer.w13.data[e, :M_tp].to(torch.float16) * shard_s
+                    layer.w13.data[e, :M_tp] = (half / max_s).to(torch.float8_e4m3fn)
+            layer.w13_scale[e] = max_s
+            layer.w2_scale[e] = down_s
 
-            qw13, sc13 = per_tensor_quant(w13_bf16)
-            new_w13[e].copy_(qw13)
-            layer.w13_scale[e] = sc13.view(-1)[0]
-
-            w2_bf16 = layer.w2.data[e].float() * down_s
-            qw2, sc2 = per_tensor_quant(w2_bf16.contiguous())
-            new_w2[e].copy_(qw2)
-            layer.w2_scale[e] = sc2.view(-1)[0]
-
-        layer.w13 = nn.Parameter(new_w13.to(device), requires_grad=False)
-        layer.w2 = nn.Parameter(new_w2.to(device), requires_grad=False)
         del layer._gate_scales
         del layer._up_scales
         del layer._down_scales
@@ -277,20 +305,31 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         del layer._down_ch_scales
 
     def _online_per_tensor(self, layer):
-        from rtp_llm.models_py.quant_methods.fp8 import _resolve_per_tensor_quant
+        from rtp_llm.models_py.quant_methods.fp8 import (
+            _resolve_per_tensor_quant,
+            cpu_per_tensor_quant_like_legacy,
+        )
 
         per_tensor_quant = _resolve_per_tensor_quant()
         E = layer.num_local_experts
         device = layer.w13.data.device
         new_w13 = torch.empty_like(layer.w13.data, dtype=torch.float8_e4m3fn)
         new_w2 = torch.empty_like(layer.w2.data, dtype=torch.float8_e4m3fn)
+        force_cpu_quant = bool(
+            getattr(layer, "_new_loader_force_cpu_load_weights", False)
+        )
 
         for e in range(E):
-            qw, sc = per_tensor_quant(layer.w13.data[e].contiguous())
+            quant = (
+                cpu_per_tensor_quant_like_legacy
+                if force_cpu_quant
+                else per_tensor_quant
+            )
+            qw, sc = quant(layer.w13.data[e].contiguous())
             new_w13[e].copy_(qw)
             layer.w13_scale[e] = sc.view(-1)[0]
 
-            qw, sc = per_tensor_quant(layer.w2.data[e].contiguous())
+            qw, sc = quant(layer.w2.data[e].contiguous())
             new_w2[e].copy_(qw)
             layer.w2_scale[e] = sc.view(-1)[0]
 
@@ -355,6 +394,89 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         layer.w13 = nn.Parameter(new_w13.to(device), requires_grad=False)
         layer.w2 = nn.Parameter(new_w2.to(device), requires_grad=False)
+
+    def _requant_per_block_if_needed(self, layer):
+        block_size = getattr(
+            layer, "_fp8_moe_weight_block_size", [layer._FP8_BLOCK_SIZE] * 2
+        )
+        from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
+            is_deep_gemm_e8m0_used,
+        )
+
+        if list(block_size) == [layer._FP8_BLOCK_SIZE, layer._FP8_BLOCK_SIZE]:
+            if not is_deep_gemm_e8m0_used():
+                return
+
+            from rtp_llm.models_py.kernels.cuda.fp8_kernel.fp8_kernel import (
+                requant_weight_ue8m0,
+            )
+
+            layer.w13.data, layer.w13_scale = requant_weight_ue8m0(
+                layer.w13.data.contiguous(),
+                layer.w13_scale.to(layer.w13.device, non_blocking=True).contiguous(),
+            )
+            layer.w2.data, layer.w2_scale = requant_weight_ue8m0(
+                layer.w2.data.contiguous(),
+                layer.w2_scale.to(layer.w2.device, non_blocking=True).contiguous(),
+            )
+            logger.info(
+                "[Fp8MoEMethod] requantized MoE fp8 block scales to UE8M0: "
+                "w13=%s w13_scale=%s/%s w2=%s w2_scale=%s/%s",
+                tuple(layer.w13.shape),
+                layer.w13_scale.dtype,
+                tuple(layer.w13_scale.shape),
+                tuple(layer.w2.shape),
+                layer.w2_scale.dtype,
+                tuple(layer.w2_scale.shape),
+            )
+            return
+
+        from rtp_llm.models_py.kernels.cuda.fp8_kernel.fp8_kernel import (
+            block_quant_dequant,
+            per_block_cast_to_fp8,
+        )
+
+        def requant_weight_fp8_block_float(weight, weight_scale):
+            weight_dequant = block_quant_dequant(
+                weight,
+                weight_scale,
+                list(block_size),
+                torch.bfloat16,
+            )
+            return per_block_cast_to_fp8(weight_dequant, use_ue8m0=False)
+
+        src_w13_scale = layer.w13_scale
+        src_w2_scale = layer.w2_scale
+        new_w13_scale = []
+        new_w2_scale = []
+        device = layer.w13.device
+        for e in range(layer.num_local_experts):
+            w, s = requant_weight_fp8_block_float(
+                layer.w13.data[e].contiguous(),
+                src_w13_scale[e].to(device, non_blocking=True).contiguous(),
+            )
+            layer.w13.data[e].copy_(w)
+            new_w13_scale.append(s)
+            del w
+            w, s = requant_weight_fp8_block_float(
+                layer.w2.data[e].contiguous(),
+                src_w2_scale[e].to(device, non_blocking=True).contiguous(),
+            )
+            layer.w2.data[e].copy_(w)
+            new_w2_scale.append(s)
+            del w
+
+        layer.w13_scale = torch.stack(new_w13_scale, dim=0).contiguous()
+        layer.w2_scale = torch.stack(new_w2_scale, dim=0).contiguous()
+        logger.info(
+            "[Fp8MoEMethod] requantized MoE fp8 block scales from %s to [128, 128]: "
+            "w13=%s w13_scale=%s w2=%s w2_scale=%s",
+            block_size,
+            tuple(layer.w13.shape),
+            tuple(layer.w13_scale.shape),
+            tuple(layer.w2.shape),
+            tuple(layer.w2_scale.shape),
+        )
 
     # ------------------------------------------------------------------ #
     #  add_weight_tensors ← _build_weights_dict 的 fp8 scale 注入

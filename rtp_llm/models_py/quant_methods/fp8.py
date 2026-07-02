@@ -1,5 +1,5 @@
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 try:
     from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
         per_block_cast_to_fp8,
+        requant_weight_ue8m0,
         scaled_fp8_per_tensor_quant,
         scaled_fp8_per_token_quant,
         sgl_per_token_group_quant_fp8,
@@ -37,6 +38,7 @@ except (
         "fp8 kernel imports unavailable: %s (will fall back to lazy import)", e
     )
     per_block_cast_to_fp8 = None
+    requant_weight_ue8m0 = None
     scaled_fp8_per_tensor_quant = None
     scaled_fp8_per_token_quant = None
     sgl_per_token_group_quant_fp8 = None
@@ -68,6 +70,24 @@ def _resolve_per_tensor_quant():
     return scaled_fp8_per_tensor_quant
 
 
+def cpu_per_tensor_quant_like_legacy(
+    input: torch.Tensor, output: Optional[torch.Tensor] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """CPU fallback matching old loader's dynamic FP8 per-tensor quantization."""
+    device = input.device
+    from rtp_llm.model_loader.dynamic_fp8_quant_weight import (
+        quantize_weight_to_fp8 as legacy_quantize_weight_to_fp8,
+    )
+
+    quant, scale = legacy_quantize_weight_to_fp8(input.detach().to("cpu"))
+    quant = quant.to(device)
+    scale = scale.reshape(1).to(device)
+    if output is not None:
+        output.copy_(quant)
+        quant = output
+    return quant, scale
+
+
 def _resolve_per_token_quant():
     """Return scaled_fp8_per_token_quant, lazy-importing on a hoist miss."""
     global scaled_fp8_per_token_quant
@@ -90,6 +110,18 @@ def _resolve_per_block_cast():
 
         per_block_cast_to_fp8 = _fn
     return per_block_cast_to_fp8
+
+
+def _resolve_requant_weight_ue8m0():
+    """Return requant_weight_ue8m0, lazy-importing on a hoist miss."""
+    global requant_weight_ue8m0
+    if requant_weight_ue8m0 is None:
+        from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
+            requant_weight_ue8m0 as _fn,
+        )
+
+        requant_weight_ue8m0 = _fn
+    return requant_weight_ue8m0
 
 
 def _resolve_sgl_per_token_group_quant():
@@ -247,12 +279,18 @@ class Fp8OnlineLinearMethod(QuantizeMethodBase):
 
     def process_weights_after_loading(self, layer):
         weight = layer.weight.data
-        # _load_via_scratch loads ckpt to CPU; quant kernel needs CUDA.
-        if not weight.is_cuda:
-            weight = weight.to(f"cuda:{torch.cuda.current_device()}")
         assert weight.ndim == 2, f"expected 2D weight, got {weight.shape}"
 
-        fp8_weight, scale = _resolve_per_tensor_quant()(weight)
+        if bool(getattr(layer, "_new_loader_force_cpu_load_weights", False)):
+            fp8_weight, scale = cpu_per_tensor_quant_like_legacy(weight)
+            if not fp8_weight.is_cuda:
+                fp8_weight = fp8_weight.to(f"cuda:{torch.cuda.current_device()}")
+                scale = scale.to(fp8_weight.device)
+        else:
+            # _load_via_scratch loads ckpt to CPU; quant kernel needs CUDA.
+            if not weight.is_cuda:
+                weight = weight.to(f"cuda:{torch.cuda.current_device()}")
+            fp8_weight, scale = _resolve_per_tensor_quant()(weight)
 
         # nn.Parameter dtype is immutable; rebind both attributes so the
         # post-load model.to(device) sees a consistent (cuda, fp8/fp32) pair.
@@ -599,10 +637,14 @@ class Fp8BlockOnlineLinearMethod(QuantizeMethodBase):
             weight = weight.to(f"cuda:{torch.cuda.current_device()}")
         assert weight.ndim == 2, f"expected 2D weight, got {weight.shape}"
 
-        # per_block_cast_to_fp8 returns:
-        #   fp8_weight: [N, K] float8_e4m3fn (sliced back to original shape)
-        #   scale:      [ceil(N/128), ceil(K/128)] float32
-        fp8_weight, scale = _resolve_per_block_cast()(weight, use_ue8m0=False)
+        # Match the legacy W8A8 per-block online loader exactly. The CUDA helper
+        # below is also DeepGEMM-derived, but the smoke baseline was produced by
+        # the Python loader-side quantizer.
+        from rtp_llm.model_loader.per_block_fp8_quant_weight import (
+            per_block_cast_to_fp8 as legacy_per_block_cast_to_fp8,
+        )
+
+        fp8_weight, scale = legacy_per_block_cast_to_fp8(weight, self.BLOCK)
 
         del layer.weight
         layer.register_parameter(
@@ -650,13 +692,16 @@ class Fp8BlockOnlineLinearMethod(QuantizeMethodBase):
         output_shape = list(x.shape[:-1]) + [N]
 
         # Online per-token-group activation quant (group_size=128).
+        scale_ue8m0 = getattr(layer, "weight_scale", None) is not None and (
+            layer.weight_scale.dtype == torch.int32
+        )
         qinput, x_scales = _resolve_sgl_per_token_group_quant()(
             input_2d,
             group_size=self.BLOCK,
             eps=1e-4,
             column_major_scales=True,
             scale_tma_aligned=True,
-            scale_ue8m0=False,
+            scale_ue8m0=scale_ue8m0,
         )
 
         output = torch.empty(M, N, dtype=out_dtype, device=input_2d.device)
@@ -665,7 +710,7 @@ class Fp8BlockOnlineLinearMethod(QuantizeMethodBase):
             (layer.weight, layer.weight_scale),
             output,
             c=None,
-            disable_ue8m0_cast=True,
+            disable_ue8m0_cast=not scale_ue8m0,
         )
 
         if not Fp8BlockOnlineLinearMethod._apply_logged:
@@ -709,6 +754,8 @@ class Fp8BlockLinearMethod(Fp8BlockOnlineLinearMethod):
     identically to the online path — see TestFp8BlockForward.
     """
 
+    _create_logged: bool = False
+
     def create_weights(
         self,
         layer,
@@ -723,8 +770,27 @@ class Fp8BlockLinearMethod(Fp8BlockOnlineLinearMethod):
         )
         layer.register_parameter("weight", weight)
 
-        n_blocks = (output_size + self.BLOCK - 1) // self.BLOCK
-        k_blocks = (input_size + self.BLOCK - 1) // self.BLOCK
+        block_n, block_k = getattr(
+            layer.quant_config, "weight_block_size", [self.BLOCK, self.BLOCK]
+        )
+        if not Fp8BlockLinearMethod._create_logged:
+            logger.info(
+                "[Fp8BlockLinearMethod] create_weights prefix=%r quant_type=%s "
+                "source_config=%s weight_block_size=%s input=%d output=%d",
+                getattr(layer, "prefix", "?"),
+                getattr(layer.quant_config, "quant_type", None),
+                (
+                    type(getattr(layer.quant_config, "source_config", None)).__name__
+                    if getattr(layer.quant_config, "source_config", None) is not None
+                    else None
+                ),
+                getattr(layer.quant_config, "weight_block_size", None),
+                input_size,
+                output_size,
+            )
+            Fp8BlockLinearMethod._create_logged = True
+        n_blocks = (output_size + block_n - 1) // block_n
+        k_blocks = (input_size + block_k - 1) // block_k
         layer.register_parameter(
             "weight_scale_inv",
             nn.Parameter(
@@ -737,7 +803,27 @@ class Fp8BlockLinearMethod(Fp8BlockOnlineLinearMethod):
         # The weight is already fp8; just expose the block scale under the name
         # the inherited apply() expects (`weight_scale`), mirroring the online
         # sibling's post-load contract.
-        scale = layer.weight_scale_inv.data
+        block_size = getattr(
+            layer.quant_config, "weight_block_size", [self.BLOCK, self.BLOCK]
+        )
+        if list(block_size) != [self.BLOCK, self.BLOCK]:
+            from rtp_llm.models_py.kernels.cuda.fp8_kernel.fp8_kernel import (
+                block_quant_dequant,
+            )
+
+            weight_dequant = block_quant_dequant(
+                layer.weight.data,
+                layer.weight_scale_inv.data,
+                list(block_size),
+                torch.bfloat16,
+            )
+            weight, scale = _resolve_per_block_cast()(weight_dequant, use_ue8m0=False)
+            del layer.weight
+            layer.register_parameter(
+                "weight", nn.Parameter(weight.contiguous(), requires_grad=False)
+            )
+        else:
+            scale = layer.weight_scale_inv.data
         del layer.weight_scale_inv
         layer.register_parameter(
             "weight_scale",

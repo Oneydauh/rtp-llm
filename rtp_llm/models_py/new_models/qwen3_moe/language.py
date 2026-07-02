@@ -22,7 +22,8 @@ from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
 from rtp_llm.models_py.layers.embedding import ParallelLMHead, VocabParallelEmbedding
 from rtp_llm.models_py.layers.linear import ColumnParallelLinear
 from rtp_llm.models_py.layers.moe_experts import BaseMoEExperts
-from rtp_llm.models_py.layers.norm import RMSNorm
+from rtp_llm.models_py.layers.norm import RMSNorm, RMSResNorm
+from rtp_llm.models_py.model_desc.block_map import select_block_map_for_layer
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
 from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.modules import FusedMoeFactory, SelectTopk
@@ -309,6 +310,10 @@ class Qwen3MoeBlock(RtpModule):
         self.tp_size = tp_size
         self.ep_size = ep_size
         self.top_k = top_k
+        dp_size = int(getattr(parallelism_config, "dp_size", 1))
+        moe_pure_tp_mode = tp_size > 1 and dp_size == 1 and ep_size == 1
+        experts_tp_size = tp_size if moe_pure_tp_mode else 1
+        experts_tp_rank = tp_rank if moe_pure_tp_mode else 0
 
         # Router: tiny BF16 linear from hidden -> num_experts. NOT TP-sharded
         # (output dim is num_experts, small). compressed-tensors `ignore` list
@@ -328,8 +333,8 @@ class Qwen3MoeBlock(RtpModule):
             num_experts=num_experts,
             hidden_size=hidden_size,
             moe_intermediate_size=moe_intermediate_size,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            tp_size=experts_tp_size,
+            tp_rank=experts_tp_rank,
             ep_size=ep_size,
             ep_rank=ep_rank,
             params_dtype=params_dtype,
@@ -377,6 +382,8 @@ class Qwen3MoeDecoderLayer(RtpModule):
         layer_idx: int,
         tp_size: int,
         tp_rank: int,
+        attn_tp_size: int,
+        attn_tp_rank: int,
         ep_size: int,
         ep_rank: int,
         model_config: Any,
@@ -387,7 +394,7 @@ class Qwen3MoeDecoderLayer(RtpModule):
         rms_norm_eps: float,
     ):
         super().__init__()
-        self.input_layernorm = RMSNorm(
+        self.input_layernorm = RMSResNorm(
             hidden_size, eps=rms_norm_eps, params_dtype=params_dtype
         )
         # Reuse dense Qwen3 attention: same qk_norm + bias=False contract.
@@ -397,13 +404,13 @@ class Qwen3MoeDecoderLayer(RtpModule):
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             layer_idx=layer_idx,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            tp_size=attn_tp_size,
+            tp_rank=attn_tp_rank,
             quant_config=quant_config,
             params_dtype=params_dtype,
             rms_norm_eps=rms_norm_eps,
         )
-        self.post_attention_layernorm = RMSNorm(
+        self.post_attention_layernorm = RMSResNorm(
             hidden_size, eps=rms_norm_eps, params_dtype=params_dtype
         )
         self.mlp = Qwen3MoeBlock(
@@ -426,23 +433,20 @@ class Qwen3MoeDecoderLayer(RtpModule):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor,
         fmha_impl: Any,
         kv_cache: Optional[LayerKVCache] = None,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(hidden_states, fmha_impl, kv_cache)
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         if self.mlp.ep_size <= 1 and self.mlp.tp_size > 1:
             # TP-only mode: MoE FFN inner-dim is TP-sharded; reduce across TP ranks.
             # EP mode: FusedMoe executor handles EP combine (all_to_all / all_gather)
             # internally, so no extra all_reduce is needed here.
             hidden_states = all_reduce(hidden_states, group=Group.TP)
-        hidden_states = residual + hidden_states
-        return hidden_states
+        return hidden_states, residual
 
 
 def _extract_moe_config_values(model_config: Any, load_config: Any) -> Dict[str, Any]:
@@ -503,6 +507,15 @@ def _extract_moe_config_values(model_config: Any, load_config: Any) -> Dict[str,
     params_dtype = getattr(load_config, "compute_dtype", torch.bfloat16)
     parallelism_config = getattr(load_config, "parallelism_config", None)
     moe_config = getattr(load_config, "moe_config", None)
+    enable_fp32_lm_head = getattr(model_config, "enable_fp32_lm_head", True)
+    if parallelism_config is not None and hasattr(
+        parallelism_config, "get_attn_tp_size"
+    ):
+        attn_tp_size = int(parallelism_config.get_attn_tp_size())
+        attn_tp_rank = int(parallelism_config.get_attn_tp_rank())
+    else:
+        attn_tp_size = tp_size
+        attn_tp_rank = tp_rank
 
     return dict(
         hidden_size=hidden_size,
@@ -517,10 +530,13 @@ def _extract_moe_config_values(model_config: Any, load_config: Any) -> Dict[str,
         rms_norm_eps=rms_norm_eps,
         tp_size=tp_size,
         tp_rank=tp_rank,
+        attn_tp_size=attn_tp_size,
+        attn_tp_rank=attn_tp_rank,
         ep_size=ep_size,
         ep_rank=ep_rank,
         quant_config=quant_config,
         params_dtype=params_dtype,
+        lm_head_params_dtype=torch.float32 if enable_fp32_lm_head else params_dtype,
         model_config=model_config,
         parallelism_config=parallelism_config,
         moe_config=moe_config,
@@ -576,8 +592,8 @@ class Qwen3MoeForCausalLM(GptModelBase):
         self.embed_tokens = VocabParallelEmbedding(
             vocab_size=cfg["vocab_size"],
             embedding_dim=cfg["hidden_size"],
-            tp_size=cfg["tp_size"],
-            tp_rank=cfg["tp_rank"],
+            tp_size=cfg["attn_tp_size"],
+            tp_rank=cfg["attn_tp_rank"],
             params_dtype=cfg["params_dtype"],
         )
         self.layers = nn.ModuleList(
@@ -593,6 +609,8 @@ class Qwen3MoeForCausalLM(GptModelBase):
                     layer_idx=i,
                     tp_size=cfg["tp_size"],
                     tp_rank=cfg["tp_rank"],
+                    attn_tp_size=cfg["attn_tp_size"],
+                    attn_tp_rank=cfg["attn_tp_rank"],
                     ep_size=cfg["ep_size"],
                     ep_rank=cfg["ep_rank"],
                     model_config=cfg["model_config"],
@@ -605,7 +623,7 @@ class Qwen3MoeForCausalLM(GptModelBase):
                 for i in range(cfg["num_layers"])
             ]
         )
-        self.norm = RMSNorm(
+        self.norm = RMSResNorm(
             cfg["hidden_size"],
             eps=cfg["rms_norm_eps"],
             params_dtype=cfg["params_dtype"],
@@ -613,9 +631,9 @@ class Qwen3MoeForCausalLM(GptModelBase):
         self.lm_head = ParallelLMHead(
             vocab_size=cfg["vocab_size"],
             hidden_size=cfg["hidden_size"],
-            tp_size=cfg["tp_size"],
-            tp_rank=cfg["tp_rank"],
-            params_dtype=cfg["params_dtype"],
+            tp_size=cfg["attn_tp_size"],
+            tp_rank=cfg["attn_tp_rank"],
+            params_dtype=cfg["lm_head_params_dtype"],
         )
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
@@ -623,11 +641,14 @@ class Qwen3MoeForCausalLM(GptModelBase):
         hidden_states = self.embed_tokens(input_ids)
         if fmha_impl is None:
             fmha_impl = self.prepare_fmha_impl(inputs)
+        residual = torch.zeros_like(hidden_states)
         for i, layer in enumerate(self.layers):
-            hidden_states = layer(
+            select_block_map_for_layer(inputs.attention_inputs, i)
+            hidden_states, residual = layer(
                 hidden_states,
+                residual,
                 fmha_impl,
                 kv_cache=self.kv_cache.get_layer_cache(i) if self.kv_cache else None,
             )
-        hidden_states = self.norm(hidden_states)
+        hidden_states, _ = self.norm(hidden_states, residual)
         return PyModelOutputs(hidden_states, fmha_impl.fmha_params)

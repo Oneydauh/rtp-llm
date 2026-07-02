@@ -1,4 +1,4 @@
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -56,6 +56,60 @@ class RMSNorm(nn.Module):
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
         return (self.weight * x).to(input_dtype)
+
+
+class RMSResNorm(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        params_dtype: torch.dtype = torch.float16,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.weight = nn.Parameter(
+            torch.ones(hidden_size, dtype=params_dtype), requires_grad=False
+        )
+
+    def load_weights(self, weights: Dict[str, torch.Tensor]):
+        for name, tensor in weights.items():
+            if "weight" in name:
+                self.weight.data.copy_(tensor)
+
+    def forward(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if hidden_states.is_cuda:
+            try:
+                from rtp_llm.ops.compute_ops import rtp_llm_ops
+
+                orig_shape = hidden_states.shape
+                hidden_2d = hidden_states.reshape(-1, orig_shape[-1]).contiguous()
+                residual_2d = residual.reshape(-1, orig_shape[-1]).contiguous()
+                stream_id = torch.cuda.current_stream().cuda_stream
+                rtp_llm_ops.fused_add_rmsnorm(
+                    hidden_2d, residual_2d, self.weight.data, self.eps, stream_id
+                )
+                return hidden_2d.reshape(orig_shape), residual_2d.reshape(orig_shape)
+            except Exception as e:
+                global _RMSNORM_FALLBACK_WARNED
+                if not _RMSNORM_FALLBACK_WARNED:
+                    _RMSNORM_FALLBACK_WARNED = True
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "[RMSResNorm] 融合 fused_add_rmsnorm 不可用，回退 eager fp32: %s",
+                        e,
+                    )
+
+        residual = hidden_states + residual
+        input_dtype = residual.dtype
+        x = residual.to(torch.float32)
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        return (self.weight * x).to(input_dtype), residual
 
 
 class LayerNorm(nn.Module):

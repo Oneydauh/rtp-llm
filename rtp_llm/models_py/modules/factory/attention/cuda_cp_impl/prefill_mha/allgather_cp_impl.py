@@ -54,8 +54,14 @@ class PCPAllGatherAttnOp:
         super().__init__()
         self.attn_inputs = attn_inputs
         self.attn_configs = attn_configs
-        self.num_qo_heads = attn_configs.head_num
-        self.num_kv_heads = attn_configs.kv_head_num
+        cp_size = getattr(parallelism_config, "tp_size", 1) or 1
+        attn_tp_size = (
+            parallelism_config.get_attn_tp_size()
+            if hasattr(parallelism_config, "get_attn_tp_size")
+            else cp_size
+        )
+        self.num_qo_heads = attn_configs.head_num // attn_tp_size
+        self.num_kv_heads = max(1, attn_configs.kv_head_num // attn_tp_size)
         self.head_dim = attn_configs.size_per_head
         self.backend = backend
         self.kv_layout = kv_layout
@@ -67,7 +73,7 @@ class PCPAllGatherAttnOp:
         self.cp_info = attn_inputs.context_parallel_info
 
         self.prefill_cp_rank = parallelism_config.tp_rank
-        self.prefill_cp_size = parallelism_config.tp_size
+        self.prefill_cp_size = cp_size
 
         self.seq_size_per_block = attn_configs.tokens_per_block
 

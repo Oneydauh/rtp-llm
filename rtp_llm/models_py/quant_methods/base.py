@@ -185,6 +185,9 @@ class QuantizationConfig:
             if ignored_layers is not None
             else self._extract_ignored(source_config)
         )
+        self.weight_block_size = getattr(source_config, "weight_block_size", None)
+        if self.weight_block_size is None:
+            self.weight_block_size = [128, 128]
 
     @staticmethod
     def _extract_ignored(source_config: Any) -> List[str]:

@@ -14,6 +14,14 @@ _LAZY_MODEL_REGISTRY: Dict[str, Tuple[str, str]] = {
         "rtp_llm.models_py.new_models.deepseek_v3",
         "DeepSeekV32ForCausalLM",
     ),
+    "deepseek2": (
+        "rtp_llm.models_py.new_models.deepseek_v3",
+        "DeepSeekV32ForCausalLM",
+    ),
+    "deepseek3": (
+        "rtp_llm.models_py.new_models.deepseek_v3",
+        "DeepSeekV32ForCausalLM",
+    ),
     "glm_5": ("rtp_llm.models_py.new_models.deepseek_v3", "DeepSeekV32ForCausalLM"),
     "chatglm4": ("rtp_llm.models_py.new_models.glm", "ChatGLMForCausalLM"),
     "chatglm2": ("rtp_llm.models_py.new_models.glm", "ChatGLMForCausalLM"),
@@ -23,12 +31,36 @@ _LAZY_MODEL_REGISTRY: Dict[str, Tuple[str, str]] = {
     "glm4_moe": ("rtp_llm.models_py.new_models.glm", "Glm4MoeForCausalLM"),
     # Qwen 语言模型
     "qwen_2": ("rtp_llm.models_py.new_models.qwen2_vl.language", "Qwen2ForCausalLM"),
+    "qwen_2_embedding": (
+        "rtp_llm.models_py.new_models.qwen2_vl.language",
+        "Qwen2ForCausalLM",
+    ),
+    "qwen_tool": (
+        "rtp_llm.models_py.new_models.qwen2_vl.language",
+        "Qwen2ForCausalLM",
+    ),
     "qwen_3": ("rtp_llm.models_py.new_models.qwen3", "Qwen3ForCausalLM"),
     "qwen_3_tool": ("rtp_llm.models_py.new_models.qwen3", "Qwen3ForCausalLM"),
     "qwen_3_moe": ("rtp_llm.models_py.new_models.qwen3_moe", "Qwen3MoeForCausalLM"),
     "qwen3_coder_moe": (
         "rtp_llm.models_py.new_models.qwen3_moe",
         "Qwen3MoeForCausalLM",
+    ),
+    "qwen35_moe": (
+        "rtp_llm.models_py.new_models.qwen3_next",
+        "Qwen35MoeForCausalLM",
+    ),
+    "qwen35_dense": (
+        "rtp_llm.models_py.new_models.qwen3_next",
+        "Qwen35DenseForCausalLM",
+    ),
+    "qwen3_next": (
+        "rtp_llm.models_py.new_models.qwen3_next",
+        "Qwen3NextForCausalLM",
+    ),
+    "qwen_3_moe_eagle3": (
+        "rtp_llm.models_py.new_models.qwen3_next",
+        "Qwen3MoeEagle3ForCausalLM",
     ),
     # Qwen 多模态
     "qwen2_vl": (
@@ -43,8 +75,25 @@ _LAZY_MODEL_REGISTRY: Dict[str, Tuple[str, str]] = {
         "rtp_llm.models_py.new_models.qwen3_vl_moe",
         "Qwen3VLMoeForConditionalGeneration",
     ),
+    "kimi_linear": (
+        "rtp_llm.models_py.new_models.kimi_linear",
+        "KimiLinearForCausalLM",
+    ),
+    # MiniMax
+    "minimax_m3_vl": (
+        "rtp_llm.models_py.new_models.minimax_m3.model",
+        "MiniMaxM3VLForConditionalGeneration",
+    ),
     # MTP
     "qwen_2-mtp": ("rtp_llm.models_py.new_models.qwen2_mtp", "Qwen2MTPForCausalLM"),
+    "qwen35_moe_mtp": (
+        "rtp_llm.models_py.new_models.qwen3_next",
+        "Qwen35MoeMTPForCausalLM",
+    ),
+    "qwen3_next_mtp": (
+        "rtp_llm.models_py.new_models.qwen3_next",
+        "Qwen3NextMTPForCausalLM",
+    ),
     "deepseek-v3-mtp": (
         "rtp_llm.models_py.new_models.deepseek_v3_mtp",
         "DeepSeekV32MTPForCausalLM",

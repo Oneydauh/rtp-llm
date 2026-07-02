@@ -10,6 +10,24 @@ import torch
 _SILU_FALLBACK_WARNED = False
 
 
+def swigluoai_and_mul(
+    gate_up: torch.Tensor,
+    alpha: float = 1.702,
+    limit: float = 7.0,
+) -> torch.Tensor:
+    """OpenAI SwiGLU variant used by MiniMax-M3.
+
+    ``gate_up`` is laid out as [gate, up]. The activation is
+    ``gate * sigmoid(alpha * gate) * (up + 1)`` with the same clipping used by
+    the GPT-OSS/MiniMax config family.
+    """
+    d = gate_up.shape[-1] // 2
+    gate, up = gate_up[..., :d].float(), gate_up[..., d:].float()
+    gate = torch.clamp(gate, max=limit)
+    up = torch.clamp(up, min=-limit, max=limit)
+    return (gate * torch.sigmoid(alpha * gate) * (up + 1.0)).to(gate_up.dtype)
+
+
 def silu_and_mul(gate_up: torch.Tensor) -> torch.Tensor:
     """SiLU(gate) * up。
 
