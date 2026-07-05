@@ -57,6 +57,9 @@ class Qwen3Experts(BaseMoEExperts):
     # ------------------------------------------------------------------ #
 
     def _init_buffers(self, params_dtype: torch.dtype):
+        if self.quant_method is not None:
+            super()._init_buffers(params_dtype)
+            return
         E = self.num_local_experts
         M_tp = self.moe_inter_tp
         H = self.hidden_size
@@ -162,6 +165,9 @@ class Qwen3Experts(BaseMoEExperts):
     # ------------------------------------------------------------------ #
 
     def process_weights_after_loading(self):
+        if self.quant_method is not None:
+            super().process_weights_after_loading()
+            return
         qf = self._quant_family
         if qf == "fp4":
             self._fp4_merge_scales()
@@ -271,6 +277,8 @@ class Qwen3Experts(BaseMoEExperts):
     # ------------------------------------------------------------------ #
 
     def _build_weights_dict(self) -> Dict[str, torch.Tensor]:
+        if self.quant_method is not None:
+            return super()._build_weights_dict()
         weights_dict = super()._build_weights_dict()
         qf = self._quant_family
         if qf == "w4a8":

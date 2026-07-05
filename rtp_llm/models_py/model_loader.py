@@ -458,6 +458,76 @@ class NewModelLoader:
             logger.info(
                 f"[DUMP_WEIGHTS] new_loader dumped {len(out)} tensors to {_dd}/rank{tp_rank}.json"
             )
+        _slice_dir = _o.environ.get("DUMP_TENSOR_SLICES")
+        if _slice_dir:
+            import json as _j
+
+            def _tensor_slice_info(t):
+                flat = t.detach().reshape(-1)
+                n = flat.numel()
+                if n == 0:
+                    return {
+                        "shape": list(t.shape),
+                        "dtype": str(t.dtype),
+                        "samples": [],
+                    }
+                idx = set(range(min(16, n)))
+                mid = n // 2
+                idx.update(range(max(0, mid - 8), min(n, mid + 8)))
+                idx.update(range(max(0, n - 16), n))
+                if n > 32:
+                    step = max(1, n // 32)
+                    idx.update(range(0, n, step))
+                idx = sorted(idx)
+                vals = flat[idx].to(torch.float32).cpu().tolist()
+                coord_samples = []
+                shape = list(t.shape)
+                if shape:
+                    choices = []
+                    for dim in shape:
+                        dim_choices = {0, dim // 2, dim - 1}
+                        if dim > 1:
+                            dim_choices.add(1)
+                            dim_choices.add(dim - 2)
+                        choices.append(sorted(x for x in dim_choices if 0 <= x < dim))
+                    coords = [[]]
+                    for dim_choices in choices:
+                        coords = [
+                            prefix + [x] for prefix in coords for x in dim_choices
+                        ]
+                    if len(coords) > 160:
+                        step = max(1, len(coords) // 160)
+                        coords = coords[::step][:160]
+                    coord_values = [t[tuple(c)] for c in coords]
+                    coord_values = (
+                        torch.stack([v.reshape(()) for v in coord_values])
+                        .to(torch.float32)
+                        .cpu()
+                        .tolist()
+                    )
+                    coord_samples = [
+                        {"idx": c, "value": v} for c, v in zip(coords, coord_values)
+                    ]
+                return {
+                    "shape": shape,
+                    "dtype": str(t.dtype),
+                    "idx": idx,
+                    "samples": vals,
+                    "coord_samples": coord_samples,
+                }
+
+            tp_rank = getattr(self.load_config, "tp_rank", 0)
+            out = {}
+            for name, p in model.named_parameters():
+                out[name] = _tensor_slice_info(p)
+            for name, b in model.named_buffers():
+                out[f"buffer:{name}"] = _tensor_slice_info(b)
+            _o.makedirs(_slice_dir, exist_ok=True)
+            with open(f"{_slice_dir}/rank{tp_rank}.json", "w") as f:
+                _j.dump(out, f, separators=(",", ":"), sort_keys=True)
+            logger.info(
+                f"[DUMP_TENSOR_SLICES] new_loader dumped {len(out)} tensors to {_slice_dir}/rank{tp_rank}.json"
+            )
         return model
 
     def _load_via_scratch(self) -> nn.Module:

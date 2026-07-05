@@ -114,6 +114,10 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         """流式加载期:把一个 scale/meta 张量路由到对应 buffer。默认忽略。"""
         return None
 
+    def dispatch_weight(self, layer, local_id: int, proj: str, param_name: str, tensor):
+        """流式加载期:让量化方法接管非标准权重张量。返回 True 表示已处理。"""
+        return False
+
     def add_weight_tensors(self, layer, weights_dict: Dict[str, Any]) -> None:
         """把量化 scale 等加进喂给 FusedMoeFactory 的权重字典。默认不加。"""
         return None

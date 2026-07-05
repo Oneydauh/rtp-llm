@@ -15,6 +15,7 @@ from rtp_llm.models_py.quant_methods.unquantized import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
+from rtp_llm.models_py.quant_methods.w4a8_moe import W4A8Int4MoEMethod
 from rtp_llm.models_py.quant_methods.weight_only import WeightOnlyLinearMethod
 
 __all__ = [
@@ -30,6 +31,7 @@ __all__ = [
     "AWQLinearMethod",
     "GPTQLinearMethod",
     "WeightOnlyLinearMethod",
+    "W4A8Int4MoEMethod",
     "UnquantizedLinearMethod",
     "UnquantizedFusedMoEMethod",
 ]

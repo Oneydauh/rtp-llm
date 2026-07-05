@@ -244,6 +244,23 @@ class _RuntimeWeightShell:
         return self.global_weights[name]
 
 
+def _attach_runtime_weight_buffers(
+    module: nn.Module, weights: Dict[str, torch.Tensor]
+) -> Dict[str, str]:
+    """Attach RTP internal-layout tensors to a module and return key -> buffer name."""
+    key_to_buffer_name: Dict[str, str] = {}
+    for idx, (key, tensor) in enumerate(weights.items()):
+        buffer_name = f"_runtime_weight_{idx}"
+        module.register_buffer(buffer_name, tensor, persistent=False)
+        key_to_buffer_name[key] = buffer_name
+    return key_to_buffer_name
+
+
+def _runtime_weight_view(module: nn.Module) -> Dict[str, torch.Tensor]:
+    key_to_buffer_name = getattr(module, "_runtime_weight_buffer_names", {})
+    return {key: getattr(module, name) for key, name in key_to_buffer_name.items()}
+
+
 class _KimiLinearRuntimeModel(GptModelBase):
     def __init__(
         self,
@@ -291,11 +308,13 @@ class _KimiLinearRuntimeModel(GptModelBase):
                 for idx in range(model_config.num_layers)
             ]
         )
+        for layer, weights in zip(self.layers, layer_weights):
+            layer._runtime_weight_buffer_names = _attach_runtime_weight_buffers(
+                layer, weights
+            )
         self.norm = RMSResNorm(
             _param(global_weights[W.final_ln_gamma]), eps=model_config.layernorm_eps
         )
-        self._global_weights = global_weights
-        self._layer_weights = layer_weights
 
     def initialize(self, init_resource):
         ok = super().initialize(init_resource)
@@ -303,9 +322,13 @@ class _KimiLinearRuntimeModel(GptModelBase):
         return ok
 
     def _ensure_weight_shell(self):
-        if self.weight is not None:
-            return
-        self.weight = _RuntimeWeightShell(self._global_weights, self._layer_weights)
+        global_weights = {
+            W.embedding: self.embed_tokens.weight,
+            W.final_ln_gamma: self.norm.weight,
+            W.lm_head: self.lm_head.weight,
+        }
+        layer_weights = [_runtime_weight_view(layer) for layer in self.layers]
+        self.weight = _RuntimeWeightShell(global_weights, layer_weights)
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
         input_ids: torch.Tensor = inputs.input_ids

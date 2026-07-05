@@ -3,7 +3,7 @@
 Provides common logic for:
   - EP parameter computation (num_local_experts, expert id remapping)
   - TP slicing of per-expert projections
-  - Buffer allocation for w13 (gate+up fused) and w2 (down)
+  - Buffer allocation for w13 (up+gate fused) and w2 (down)
   - Streaming weight dispatch from per-expert HF checkpoint tensors
   - FP8 quantization support (per-tensor, per-channel, per-block)
   - FusedMoe construction via FusedMoeFactory
@@ -38,7 +38,9 @@ class BaseMoEExperts(nn.Module):
     w2 layout:  [E, H, M_tp]
         down_proj
 
-    This matches ori_loader's stack_moe_w1: concat([gate, up], dim=1).
+    This matches Qwen3.5 old loader's stack_moe_w1 input order:
+    CkptWeightInfo lists up_proj first and gate_proj second, so the fused
+    tensor is concat([up, gate], dim=1).
 
     Built-in FP8 quantization support:
       - fp8_per_tensor: one scalar scale per expert per projection
@@ -117,13 +119,16 @@ class BaseMoEExperts(nn.Module):
                 ep_size,
             )
 
-        # EP selects the local expert subset; TP still shards each expert's
-        # intermediate dimension when tp_size > 1. This is required for
-        # topologies where ep_size == tp_size == world_size.
-        if moe_intermediate_size % tp_size != 0:
+        # Match old loader's moe_pure_tp_mode: only shard expert intermediate
+        # dimensions when there is no EP/DP split. In EP all-gather topologies
+        # each rank owns a local expert subset and must keep those experts full.
+        dp_size = getattr(parallelism_config, "dp_size", 1)
+        self.moe_expert_tp_size = tp_size if ep_size == 1 and dp_size == 1 else 1
+        self.moe_expert_tp_rank = tp_rank if self.moe_expert_tp_size > 1 else 0
+        if moe_intermediate_size % self.moe_expert_tp_size != 0:
             raise ValueError(
                 f"moe_intermediate_size {moe_intermediate_size} not divisible "
-                f"by tp_size {tp_size}"
+                f"by moe_expert_tp_size {self.moe_expert_tp_size}"
             )
 
         self.num_experts = num_experts
@@ -135,7 +140,7 @@ class BaseMoEExperts(nn.Module):
 
         self.tp_size = tp_size
         self.tp_rank = tp_rank
-        self.moe_inter_tp = moe_intermediate_size // self.tp_size
+        self.moe_inter_tp = moe_intermediate_size // self.moe_expert_tp_size
 
         # EP: compute local expert range
         if ep_size > 1:
@@ -352,6 +357,12 @@ class BaseMoEExperts(nn.Module):
             proj = parts[1]
             param_name = parts[2]
 
+            if self.quant_method is not None and self.quant_method.dispatch_weight(
+                self, local_expert_id, proj, param_name, tensor
+            ):
+                self._loaded_count += 1
+                continue
+
             if param_name == "weight":
                 # Log first weight tensor we see, for diagnostics.
                 if self.layer_idx == 0 and not getattr(
@@ -396,20 +407,32 @@ class BaseMoEExperts(nn.Module):
         Layouts (HF Qwen3-VL-MoE, [E, in, out]):
           * ``gate_up_proj``: [E, H, 2M]，最后一维 2M = [gate(M) | up(M)]。
             每个专家转置 + 切 gate/up，得到 per-expert [M, H]，复用 ``_copy_gate_or_up``
-            (它把 up 放 w13 前半、gate 放后半,与旧 loader ``transpose_stack_moe_w1`` 一致)。
+            (Qwen3.5 split expert 旧 loader 的 w13 顺序是 up 在前、gate 在后)。
           * ``down_proj``: [E, M, H]，转置成 [H, M] 复用 ``_copy_down``。
         ``_copy_*`` 内部负责 TP 切分；``_remap_expert_id`` 负责 EP 选本地专家。
         """
         E = tensor.shape[0]
         if base == "gate_up_proj":
-            M = tensor.shape[2] // 2
+            M = self.moe_inter
             for g in range(E):
                 local_id = self._remap_expert_id(g)
                 if local_id is None:
                     continue
                 e = tensor[g]  # [H, 2M]
-                gate_e = e[:, :M].t().contiguous()  # [M, H]
-                up_e = e[:, M:].t().contiguous()  # [M, H]
+                if e.shape == (self.hidden_size, 2 * M):
+                    # Qwen3-VL-MoE layout: [H, 2M] = [gate | up].
+                    gate_e = e[:, :M].t().contiguous()  # [M, H]
+                    up_e = e[:, M:].t().contiguous()  # [M, H]
+                elif e.shape == (2 * M, self.hidden_size):
+                    # Qwen3.5 BF16 layout: [2M, H] = [gate | up].
+                    gate_e = e[:M, :].contiguous()
+                    up_e = e[M:, :].contiguous()
+                else:
+                    raise ValueError(
+                        f"stacked gate_up_proj expert {g} shape {tuple(e.shape)} "
+                        f"does not match [H,2M]=({self.hidden_size},{2 * M}) "
+                        f"or [2M,H]=({2 * M},{self.hidden_size})"
+                    )
                 self._copy_gate_or_up(local_id, gate_e, gate=True)
                 self._copy_gate_or_up(local_id, up_e, gate=False)
                 self._loaded_count += 2
@@ -418,7 +441,17 @@ class BaseMoEExperts(nn.Module):
                 local_id = self._remap_expert_id(g)
                 if local_id is None:
                     continue
-                d = tensor[g].t().contiguous()  # [M, H] -> [H, M]
+                e = tensor[g]
+                if e.shape == (self.moe_inter, self.hidden_size):
+                    d = e.t().contiguous()  # [M, H] -> [H, M]
+                elif e.shape == (self.hidden_size, self.moe_inter):
+                    d = e.contiguous()
+                else:
+                    raise ValueError(
+                        f"stacked down_proj expert {g} shape {tuple(e.shape)} "
+                        f"does not match [M,H]=({self.moe_inter},{self.hidden_size}) "
+                        f"or [H,M]=({self.hidden_size},{self.moe_inter})"
+                    )
                 self._copy_down(local_id, d)
                 self._loaded_count += 1
 
@@ -521,12 +554,12 @@ class BaseMoEExperts(nn.Module):
         BS = self._FP8_BLOCK_SIZE
         nb = self._n_scale_blocks_per_proj
         if proj in ("gate_proj", "up_proj"):
-            start_block = (self.tp_rank * self.moe_inter_tp) // BS
+            start_block = (self.moe_expert_tp_rank * self.moe_inter_tp) // BS
             sliced = tensor.narrow(0, start_block, nb).contiguous()
             row_start = nb if proj == "gate_proj" else 0
             self.w13_scale.data[expert_id, row_start : row_start + nb].copy_(sliced)
         elif proj == "down_proj":
-            start_block = (self.tp_rank * self.moe_inter_tp) // BS
+            start_block = (self.moe_expert_tp_rank * self.moe_inter_tp) // BS
             sliced = tensor.narrow(1, start_block, nb).contiguous()
             self.w2_scale.data[expert_id].copy_(sliced)
 
@@ -541,13 +574,13 @@ class BaseMoEExperts(nn.Module):
         gate_proj → second half of w13 (rows [M_tp:2*M_tp])
         """
         tp_rows = self.w13.shape[1] // 2
-        full_rows = tp_rows * self.tp_size
+        full_rows = tp_rows * self.moe_expert_tp_size
         if tensor.shape[0] != full_rows:
             raise ValueError(
                 f"expert {expert_id} {'gate' if gate else 'up'}_proj.weight "
                 f"dim-0 {tensor.shape[0]} != expected {full_rows}"
             )
-        start = self.tp_rank * tp_rows
+        start = self.moe_expert_tp_rank * tp_rows
         sliced = tensor.narrow(0, start, tp_rows).contiguous()
         row_start = tp_rows if gate else 0
         self.w13.data[expert_id, row_start : row_start + tp_rows].copy_(sliced)
@@ -555,13 +588,13 @@ class BaseMoEExperts(nn.Module):
     def _copy_down(self, expert_id: int, tensor: torch.Tensor):
         """TP-slice a down projection and write into w2 buffer."""
         tp_cols = self.w2.shape[2]
-        full_cols = tp_cols * self.tp_size
+        full_cols = tp_cols * self.moe_expert_tp_size
         if tensor.shape[1] != full_cols:
             raise ValueError(
                 f"expert {expert_id} down_proj.weight dim-1 {tensor.shape[1]} "
                 f"!= expected {full_cols}"
             )
-        start = self.tp_rank * tp_cols
+        start = self.moe_expert_tp_rank * tp_cols
         sliced = tensor.narrow(1, start, tp_cols).contiguous()
         self.w2.data[expert_id].copy_(sliced)
 

@@ -380,7 +380,12 @@ class DeepSeekV32ForCausalLM(GptModelBase):
         def _track(it):
             nonlocal has_lm_head
             for name, tensor in it:
-                if name == "lm_head.weight" or name.startswith("lm_head."):
+                if (
+                    name == "lm_head.weight"
+                    or name.startswith("lm_head.")
+                    or name == "model.lm_head.weight"
+                    or name.startswith("model.lm_head.")
+                ):
                     has_lm_head = True
                 yield name, tensor
 

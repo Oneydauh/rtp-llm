@@ -226,12 +226,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def _copy_per_channel_scale(self, layer, expert_id, proj, tensor):
         scale = tensor.float().squeeze()
         if proj == "gate_proj":
-            start = layer.tp_rank * layer.moe_inter_tp
+            start = layer.moe_expert_tp_rank * layer.moe_inter_tp
             layer._gate_ch_scales.data[expert_id].copy_(
                 scale.narrow(0, start, layer.moe_inter_tp)
             )
         elif proj == "up_proj":
-            start = layer.tp_rank * layer.moe_inter_tp
+            start = layer.moe_expert_tp_rank * layer.moe_inter_tp
             layer._up_ch_scales.data[expert_id].copy_(
                 scale.narrow(0, start, layer.moe_inter_tp)
             )
@@ -244,12 +244,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
         nb = layer._n_scale_blocks_per_proj
         if proj in ("gate_proj", "up_proj"):
-            start_block = (layer.tp_rank * layer.moe_inter_tp) // block_n
+            start_block = (layer.moe_expert_tp_rank * layer.moe_inter_tp) // block_n
             sliced = tensor.narrow(0, start_block, nb).contiguous()
             row_start = nb if proj == "gate_proj" else 0
             layer.w13_scale.data[expert_id, row_start : row_start + nb].copy_(sliced)
         elif proj == "down_proj":
-            start_block = (layer.tp_rank * layer.moe_inter_tp) // block_k
+            start_block = (layer.moe_expert_tp_rank * layer.moe_inter_tp) // block_k
             k_nb = getattr(layer, "_k_scale_blocks_per_proj", nb)
             sliced = tensor.narrow(1, start_block, k_nb).contiguous()
             layer.w2_scale.data[expert_id].copy_(sliced)
@@ -360,40 +360,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.w2 = nn.Parameter(new_w2.to(device), requires_grad=False)
 
     def _online_per_block(self, layer):
-        E = layer.num_local_experts
         BS = layer._FP8_BLOCK_SIZE
-        device = layer.w13.data.device
-        new_w13 = torch.empty_like(layer.w13.data, dtype=torch.float8_e4m3fn)
-        new_w2 = torch.empty_like(layer.w2.data, dtype=torch.float8_e4m3fn)
-        fp8_max = _FP8_E4M3_MAX
+        from rtp_llm.model_loader.per_block_fp8_quant_weight import (
+            per_block_cast_to_fp8 as legacy_per_block_cast_to_fp8,
+        )
 
-        rows13, cols13 = layer.w13.data.shape[1], layer.w13.data.shape[2]
-        rows2, cols2 = layer.w2.data.shape[1], layer.w2.data.shape[2]
-        nb_r13 = (rows13 + BS - 1) // BS
-        nb_c13 = (cols13 + BS - 1) // BS
-        nb_r2 = (rows2 + BS - 1) // BS
-        nb_c2 = (cols2 + BS - 1) // BS
+        # Use the same vectorized loader-side quantizer as linear online
+        # fp8_block. The old Python block loop synchronized once per 128x128
+        # block via .item(), making large MoE checkpoints exceed smoke timeout.
+        new_w13, w13_scale = legacy_per_block_cast_to_fp8(
+            layer.w13.data.contiguous(), BS
+        )
+        new_w2, w2_scale = legacy_per_block_cast_to_fp8(layer.w2.data.contiguous(), BS)
 
-        for e in range(E):
-            for bi in range(nb_r13):
-                r0, r1 = bi * BS, min((bi + 1) * BS, rows13)
-                for bj in range(nb_c13):
-                    c0, c1 = bj * BS, min((bj + 1) * BS, cols13)
-                    block = layer.w13.data[e, r0:r1, c0:c1].float()
-                    scale = max(_FP8_MIN_SCALE, block.abs().max().item() / fp8_max)
-                    new_w13[e, r0:r1, c0:c1] = (block / scale).to(torch.float8_e4m3fn)
-                    layer.w13_scale.data[e, bi, bj] = scale
-            for bi in range(nb_r2):
-                r0, r1 = bi * BS, min((bi + 1) * BS, rows2)
-                for bj in range(nb_c2):
-                    c0, c1 = bj * BS, min((bj + 1) * BS, cols2)
-                    block = layer.w2.data[e, r0:r1, c0:c1].float()
-                    scale = max(_FP8_MIN_SCALE, block.abs().max().item() / fp8_max)
-                    new_w2[e, r0:r1, c0:c1] = (block / scale).to(torch.float8_e4m3fn)
-                    layer.w2_scale.data[e, bi, bj] = scale
-
-        layer.w13 = nn.Parameter(new_w13.to(device), requires_grad=False)
-        layer.w2 = nn.Parameter(new_w2.to(device), requires_grad=False)
+        layer.w13 = nn.Parameter(new_w13.contiguous(), requires_grad=False)
+        layer.w2 = nn.Parameter(new_w2.contiguous(), requires_grad=False)
+        layer.w13_scale.data.copy_(w13_scale.contiguous())
+        layer.w2_scale.data.copy_(w2_scale.contiguous())
 
     def _requant_per_block_if_needed(self, layer):
         block_size = getattr(

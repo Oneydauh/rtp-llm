@@ -114,18 +114,20 @@ class DeepSeekV32MlaAttention(RtpModule):
         self.softmax_scale = self.q_head_dim ** (-0.5)
 
         # --- Independent submodules matching HF ckpt names ---
-        # q_a_proj: hidden → q_lora_rank.
-        # MLA down-projection to the q latent — REPLICATED across TP ranks
-        # (q_lora is shared by all heads before q_b_proj expands per-head), so
-        # tp_size=1 here regardless of the model's tp_size. Matches the legacy
-        # loader, which keeps the fused qk-rope down-proj un-sharded.
+        # q_a_proj is either the LoRA down-projection (hidden -> q_lora_rank)
+        # or, when q_lora_rank == 0, the direct query projection
+        # (hidden -> num_heads * q_head_dim). Both are replicated across TP here;
+        # no-LoRA fused q/k-rope splitting is handled by the MLA kernels.
+        q_a_output_size = (
+            q_lora_rank if q_lora_rank > 0 else num_heads * self.q_head_dim
+        )
         self.q_a_proj = ColumnParallelLinear(
             input_size=hidden_size,
-            output_size=q_lora_rank,
+            output_size=q_a_output_size,
             tp_size=1,
             tp_rank=0,
             quant_config=quant_config,
-            prefix="q_a_proj",
+            prefix="q_a_proj" if q_lora_rank > 0 else "q_proj",
             bias=False,
             params_dtype=params_dtype,
         )
@@ -193,6 +195,19 @@ class DeepSeekV32MlaAttention(RtpModule):
         self._kc_w: Optional[nn.Parameter] = None
         self._vc_w: Optional[nn.Parameter] = None
 
+    def load_weights(self, weights):
+        if self.q_lora_rank == 0:
+            items = weights.items() if isinstance(weights, dict) else weights
+            weights = {
+                (
+                    "q_a_proj." + name[len("q_proj.") :]
+                    if name.startswith("q_proj.")
+                    else name
+                ): tensor
+                for name, tensor in items
+            }
+        return super().load_weights(weights)
+
     def process_weights_after_loading(self):
         """Fuse q_a_proj + kv_a_proj_with_mqa into a single _fused_qkv_a_w.
 
@@ -211,10 +226,11 @@ class DeepSeekV32MlaAttention(RtpModule):
         self._fused_qkv_a_w = nn.Parameter(
             torch.cat([q_a_w, kv_a_w], dim=0).contiguous(), requires_grad=False
         )
-        # q_b_proj weight: [num_heads * q_head_dim, q_lora_rank]
-        self._fused_qkv_b_w = nn.Parameter(
-            _linear_weight_bf16(self.q_b_proj).clone(), requires_grad=False
-        )
+        if self.q_lora_rank > 0:
+            # q_b_proj weight: [num_heads * q_head_dim, q_lora_rank]
+            self._fused_qkv_b_w = nn.Parameter(
+                _linear_weight_bf16(self.q_b_proj).clone(), requires_grad=False
+            )
 
         # kv_b_proj weight: [num_heads * (nope + v_head), kv_lora_rank].
         # Reshape to [kv_lora_rank, num_heads, nope+v_head] then slice.
@@ -317,9 +333,16 @@ class DeepSeekV32MlaAttention(RtpModule):
             # q_b projection
             q = self.q_b_proj(q_c)
         else:
-            # No LoRA: direct qkv projection
-            q_output = self.q_a_proj(hidden_states)
-            kv_output = self.kv_a_proj_with_mqa(hidden_states)
+            # No LoRA: match the legacy loader's fused q/k-rope projection.
+            if self._fused_qkv_a_w is None:
+                raise RuntimeError("process_weights_after_loading() must run first")
+            fused_qkv = torch.nn.functional.linear(hidden_states, self._fused_qkv_a_w)
+            q_offset = self.num_heads * self.q_head_dim
+            q_output, kv_output = torch.split(
+                fused_qkv,
+                [q_offset, self.kv_lora_rank + self.rope_head_dim],
+                dim=-1,
+            )
             compressed_kv = kv_output[..., : self.kv_lora_rank]
             k_pe = kv_output[..., self.kv_lora_rank :]
             q = q_output
@@ -339,7 +362,7 @@ class DeepSeekV32MlaAttention(RtpModule):
             q_view, compressed_kv, k_pe, kv_cache, self.layer_idx, topk_indices
         )
 
-        if attn_output is not None:
+        if attn_output is not None and attn_output.numel() != 0:
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         else:
             attn_output = torch.zeros(

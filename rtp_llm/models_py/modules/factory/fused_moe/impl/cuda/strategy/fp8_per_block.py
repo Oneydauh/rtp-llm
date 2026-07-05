@@ -31,14 +31,12 @@ class CudaFp8PerBlockNoDPStrategy(MoeStrategy):
             config.moe_strategy == "fp8_per_block_no_dp"
             or config.moe_strategy == "auto"
         )
-        # Pure-TP router: all experts live on every rank (only moe_inter is
-        # TP-sharded). It must NOT be selected when ep_size > 1 — the experts
-        # are then EP-sharded and this router neither dispatches tokens to the
-        # owning rank nor combines across ranks, which silently corrupts output
-        # (and SIGSEGVs the deepgemm path). Mixed TP+EP requires a DeepEP
-        # strategy; leaving this unmatched makes that config fail with a clear
-        # "No suitable MOE strategy" error instead.
-        checker.check(config.ep_size <= 1)
+        # PureTpRouterBase handles both single-rank MoE and the all-gather
+        # topology where attention TP equals EP. Keep the strategy gate aligned
+        # with the router gate so USE_ALL_GATHER smoke tests do not fall through
+        # to DeepEP.
+        checker.check(resolver.is_single_gpu(config) or resolver.is_tp_equal_ep(config))
+        checker.check(resolver.use_all_gather(config))
 
     def get_attributes(self) -> StrategyAttributes:
         from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.deepgemm_hybrid_executor import (

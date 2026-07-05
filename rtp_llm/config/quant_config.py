@@ -778,6 +778,9 @@ class W4a8Int4PerChannelQuantConfig(QuantizationConfig):
     def get_algo(cls) -> str:
         return "w4a8_int4_per_channel"
 
+    def get_runtime_method_key(self) -> str:
+        return "W4A8_INT4_PER_CHANNEL"
+
     def get_supported_compute_dtypes(self) -> List[torch.dtype]:
         return [torch.float16, torch.bfloat16]
 
@@ -826,6 +829,9 @@ class CompressedW4A8Int4PerChannelQuantConfig(QuantizationConfig):
     def get_algo(cls) -> str:
         # C++ reuses the existing W4A8 INT4 algo enum; group_size discriminates.
         return "w4a8_int4_per_channel"
+
+    def get_runtime_method_key(self) -> str:
+        return "W4A8_INT4_PER_CHANNEL_COMPRESSED"
 
     @property
     def weight_pack_suffix(self) -> str:
