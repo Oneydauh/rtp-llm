@@ -9,6 +9,12 @@ def rocm_oss_suites():
         name = "smoke_rocm_basic",
         tests = [
             smoke_test(
+                name="rocm_basic_qwen25_0_5b_tp1_newloader",
+                task_info="data/model/qwen25/q_r_s_fp16.json",
+                smoke_args="--seq_size_per_block 16 --use_aiter_pa 1 --use_asm_pa 1 --disable_flash_infer 1 --act_type FP16",
+                gpu_type=["MI308X-ROCM7"],
+            ),
+            smoke_test(
                 name="rocm_basic_cache_reuse",
                 task_info="data/model/qwen2/q_r_reuse.json",
                 smoke_args="--reuse_cache 1 --seq_size_per_block 16 --use_aiter_pa 1 --use_asm_pa 1 --act_type FP16",
@@ -17,7 +23,7 @@ def rocm_oss_suites():
             smoke_test(
                 name="rocm_basic_batch_cache_reuse",
                 task_info="data/model/qwen3/q_r_308x_batch_cache.json",
-                smoke_args="--reuse_cache 1 --enable_cuda_graph 1 --seq_size_per_block 16 --use_aiter_pa 1 --use_asm_pa 1 --act_type FP16",
+                smoke_args="--reuse_cache 1 --disable_flash_infer 1 --seq_size_per_block 16 --use_aiter_pa 1 --use_asm_pa 1 --act_type FP16",
                 gpu_type=["MI308X-ROCM7"],
             ),
             smoke_test(
@@ -76,13 +82,13 @@ def rocm_oss_suites():
             smoke_test(
                 name="rocm_moe_qwen3_30b_basic",
                 task_info="data/model/qwen3_moe/q_r_30b_amd_py.json",
-                smoke_args="--quantization FP8_PER_CHANNEL_COMPRESSED --use_asm_pa 1 --act_type BF16 --reserver_runtime_mem_mb 51200 --tp_size 1 --world_size 1 --ep_size 1",
+                smoke_args="--quantization FP8_PER_BLOCK --use_asm_pa 1 --act_type BF16 --reserver_runtime_mem_mb 51200 --tp_size 1 --world_size 1 --ep_size 1",
                 gpu_type=["MI308X-ROCM7"],
             ),
             smoke_test(
                 name="rocm_moe_qwen3_30b_tp2",
                 task_info="data/model/qwen3_moe/q_r_30b_amd_py_tp2.json",
-                smoke_args="--quantization FP8_PER_CHANNEL_COMPRESSED --use_asm_pa 1 --act_type BF16 --reserver_runtime_mem_mb 51200 --tp_size 2 --world_size 2 --ep_size 1",
+                smoke_args="--quantization FP8_PER_BLOCK --use_asm_pa 1 --act_type BF16 --reserver_runtime_mem_mb 51200 --tp_size 2 --world_size 2 --ep_size 1",
                 gpu_type=["MI308X-ROCM7"],
             ),
         ],

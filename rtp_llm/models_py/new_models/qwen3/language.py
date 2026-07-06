@@ -125,28 +125,31 @@ class Qwen3Attention(RtpModule):
 
     def _apply_qk_norm(self, qkv: torch.Tensor) -> torch.Tensor:
         if qkv.is_cuda and qkv.dim() == 2:
-            import flashinfer
+            try:
+                import flashinfer
 
-            m, n = qkv.shape
-            qkv_view = qkv.reshape(
-                m,
-                self.num_heads_per_partition + self.num_kv_heads_per_partition * 2,
-                self.head_dim,
-            )
-            q = qkv_view[:, : self.num_heads_per_partition, :]
-            k = qkv_view[
-                :,
-                self.num_heads_per_partition : self.num_heads_per_partition
-                + self.num_kv_heads_per_partition,
-                :,
-            ]
-            flashinfer.norm.rmsnorm(
-                q, self.q_norm.weight.data, eps=self.q_norm.eps, out=q
-            )
-            flashinfer.norm.rmsnorm(
-                k, self.k_norm.weight.data, eps=self.k_norm.eps, out=k
-            )
-            return qkv_view.reshape(m, n)
+                m, n = qkv.shape
+                qkv_view = qkv.reshape(
+                    m,
+                    self.num_heads_per_partition + self.num_kv_heads_per_partition * 2,
+                    self.head_dim,
+                )
+                q = qkv_view[:, : self.num_heads_per_partition, :]
+                k = qkv_view[
+                    :,
+                    self.num_heads_per_partition : self.num_heads_per_partition
+                    + self.num_kv_heads_per_partition,
+                    :,
+                ]
+                flashinfer.norm.rmsnorm(
+                    q, self.q_norm.weight.data, eps=self.q_norm.eps, out=q
+                )
+                flashinfer.norm.rmsnorm(
+                    k, self.k_norm.weight.data, eps=self.k_norm.eps, out=k
+                )
+                return qkv_view.reshape(m, n)
+            except ModuleNotFoundError:
+                pass
 
         prefix_shape = qkv.shape[:-1]
         q = qkv[..., : self.q_size].reshape(

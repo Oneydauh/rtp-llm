@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from rtp_llm.device import get_current_device
 from rtp_llm.models_py.modules import FusedMoeFactory
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
     MoEConfigAdapter,
@@ -872,18 +873,28 @@ class BaseMoEExperts(nn.Module):
         ):
             weights_dict[W.moe_s1] = self.w13_scale
             weights_dict[W.moe_s2] = self.w2_scale
-        exported_device = getattr(self._model_config, "exported_device", None)
-        if exported_device is not None:
+        runtime_device = getattr(self._model_config, "exported_device", None)
+        if runtime_device is None:
+            runtime_device = get_current_device()
+        if self.layer_idx == 0 and not getattr(self, "_logged_moe_runtime_device", False):
+            logger.info(
+                "[BaseMoEExperts] layer_idx=0 using runtime_device=%s for newloader MoE postprocess",
+                type(runtime_device).__name__ if runtime_device is not None else None,
+            )
+            self._logged_moe_runtime_device = True
+        if runtime_device is not None:
             for name in (W.moe_w1, W.moe_w2, W.moe_s1, W.moe_s2):
                 tensor = weights_dict.get(name)
                 if tensor is None:
                     continue
-                # Old MoeAtomicWeight postprocess routes MoE weights/scales
-                # through exported_device before constructing the executor.
-                # Per-tensor FP8 scales are 1D and do not encode gate/up rows.
+                # Newloader builds executor weights directly from PyModel tensors.
+                # Apply the runtime MoE layout transform here so ROCm AITER gets
+                # gate/up order and preshuffled weights without using the legacy
+                # loader's AtomicWeight path. Per-tensor FP8 scales are 1D and
+                # do not encode gate/up rows.
                 if tensor.dim() == 1:
                     continue
-                weights_dict[name] = exported_device.shuffle_moe_weight(
+                weights_dict[name] = runtime_device.shuffle_moe_weight(
                     tensor, self._model_config.data_type, name
                 )
         return weights_dict

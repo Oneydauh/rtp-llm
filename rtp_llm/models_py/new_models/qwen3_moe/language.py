@@ -18,7 +18,6 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 
-from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
 from rtp_llm.models_py.layers.embedding import ParallelLMHead, VocabParallelEmbedding
 from rtp_llm.models_py.layers.linear import ColumnParallelLinear
 from rtp_llm.models_py.layers.moe_experts import BaseMoEExperts
@@ -449,11 +448,8 @@ class Qwen3MoeDecoderLayer(RtpModule):
         hidden_states = self.self_attn(hidden_states, fmha_impl, kv_cache)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        if self.mlp.ep_size <= 1 and self.mlp.tp_size > 1:
-            # TP-only mode: MoE FFN inner-dim is TP-sharded; reduce across TP ranks.
-            # EP mode: FusedMoe executor handles EP combine (all_to_all / all_gather)
-            # internally, so no extra all_reduce is needed here.
-            hidden_states = all_reduce(hidden_states, group=Group.TP)
+        # FusedMoe PureTP routers reduce TP-sharded expert outputs in finalize().
+        # Do not all_reduce here, otherwise TP>1 applies the MoE contribution twice.
         return hidden_states, residual
 
 

@@ -18,6 +18,7 @@ from rtp_llm.model_loader.load_config import LoadMethod
 from rtp_llm.model_loader.loader import ModelLoader, get_model_loader
 from rtp_llm.model_loader.model_weight_info import ModelDeployWeightInfo, ModelWeights
 from rtp_llm.model_loader.weight_manager import WeightManager
+from rtp_llm.model_loader.weight_module import CustomAtomicWeight
 from rtp_llm.models.downstream_modules.custom_module import CustomModule
 from rtp_llm.models.downstream_modules.utils import create_custom_module
 from rtp_llm.ops import (
@@ -309,6 +310,7 @@ class BaseModel(object):
 
         device_str = self._get_device_str()
         logging.info(f"Using NewModelLoader (two-phase) to load model on {device_str}")
+        self.custom_module = self._init_custom_module()
 
         load_config = LoadConfig(
             tp_size=self.parallelism_config.tp_size,
@@ -351,6 +353,7 @@ class BaseModel(object):
         self.device = device_str
         self.py_model = loader.load()
         self.weight = self._build_weights_from_module(self.py_model)
+        self._load_custom_module()
         self.weight_manager = None
         self.model_weights_loader = loader
         # 动态 EPLB：构造一个能从 ckpt 重载并把重排权重写回 py_model.w13/w2 的 py_eplb。
@@ -388,6 +391,11 @@ class BaseModel(object):
         weights = ModelWeights(num_layers, self.device, dtype)
 
         global_weights = self._extract_global_weights(module)
+        source_weights = getattr(module, "weights", None)
+        if source_weights is not None:
+            for key, tensor in getattr(source_weights, "global_weights", {}).items():
+                if key.startswith(CustomAtomicWeight.prefix):
+                    global_weights[key] = tensor
         for key, tensor in global_weights.items():
             weights.set_global_weight(key, tensor)
 

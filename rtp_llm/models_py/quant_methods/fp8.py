@@ -11,6 +11,56 @@ from rtp_llm.models_py.quant_methods.base import (
 
 logger = logging.getLogger(__name__)
 
+_FP8_MIN_SCALE = 1e-12
+
+
+def _runtime_fp8_dtype() -> torch.dtype:
+    try:
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.rocm._utils import (
+            get_rocm_fp8_dtype,
+        )
+
+        return get_rocm_fp8_dtype()
+    except Exception:
+        return torch.float8_e4m3fn
+
+
+def _requant_per_tensor_to_runtime_fp8(
+    weight: torch.Tensor, scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    runtime_dtype = _runtime_fp8_dtype()
+    if weight.dtype == runtime_dtype:
+        return weight.contiguous(), scale.view(1).contiguous()
+
+    scale_scalar = scale.float().view(-1)[0]
+    deq = weight.float() * scale_scalar
+    fp8_max = float(torch.finfo(runtime_dtype).max)
+    new_scale = deq.abs().amax().clamp_min(_FP8_MIN_SCALE) / fp8_max
+    requant = (deq / new_scale).to(runtime_dtype)
+    return requant.contiguous(), new_scale.reshape(1).to(torch.float32).contiguous()
+
+
+def _requant_per_channel_to_runtime_fp8(
+    weight: torch.Tensor, scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    runtime_dtype = _runtime_fp8_dtype()
+    scale_rows = scale.float().view(-1, 1)
+    if weight.dtype == runtime_dtype:
+        return weight.contiguous(), scale_rows.view(1, -1).contiguous()
+
+    if scale_rows.shape[0] != weight.shape[0]:
+        raise ValueError(
+            f"FP8 per-channel scale/weight mismatch: "
+            f"weight={tuple(weight.shape)} scale={tuple(scale.shape)}"
+        )
+    deq = weight.float() * scale_rows
+    fp8_max = float(torch.finfo(runtime_dtype).max)
+    new_scale = (
+        deq.abs().amax(dim=1, keepdim=True).clamp_min(_FP8_MIN_SCALE) / fp8_max
+    )
+    requant = (deq / new_scale).to(runtime_dtype)
+    return requant.contiguous(), new_scale.view(1, -1).to(torch.float32).contiguous()
+
 # Hoist kernel imports to module scope. apply() is on the per-token decode hot
 # path: doing the import inside apply() (even though sys.modules caches it)
 # still costs a sys.modules lookup + LOAD_ATTR on every call. Importing once at
@@ -227,10 +277,17 @@ class Fp8LinearMethod(QuantizeMethodBase):
         return output.view(*output_shape)
 
     def process_weights_after_loading(self, layer):
-        if layer.weight_scale.dim() == 0:
-            layer.weight_scale = nn.Parameter(
-                layer.weight_scale.reshape(1), requires_grad=False
-            )
+        fp8_weight, scale = _requant_per_tensor_to_runtime_fp8(
+            layer.weight.data, layer.weight_scale.data
+        )
+        del layer.weight
+        layer.register_parameter(
+            "weight", nn.Parameter(fp8_weight, requires_grad=False)
+        )
+        del layer.weight_scale
+        layer.register_parameter(
+            "weight_scale", nn.Parameter(scale, requires_grad=False)
+        )
         if hasattr(layer, "input_scale") and layer.input_scale.dim() == 0:
             layer.input_scale = nn.Parameter(
                 layer.input_scale.reshape(1), requires_grad=False
@@ -535,11 +592,16 @@ class Fp8PerChannelLinearMethod(QuantizeMethodBase):
         )
 
     def process_weights_after_loading(self, layer):
-        # ckpt scale may arrive as [N] or [N, 1]; normalize to [1, N] contig
-        # once here so apply() can pass layer.weight_scale directly to
-        # _scaled_mm without per-call reshape+contiguous.
-        scale = layer.weight_scale.data
-        scale = scale.view(1, -1).contiguous()
+        # ckpt scale may arrive as [N] or [N, 1]. ROCm fp8 kernels expect the
+        # platform runtime dtype (e4m3fnuz on MI308X), so convert already-FP8
+        # checkpoint weights once after loading and store scale as [1, N].
+        fp8_weight, scale = _requant_per_channel_to_runtime_fp8(
+            layer.weight.data, layer.weight_scale.data
+        )
+        del layer.weight
+        layer.register_parameter(
+            "weight", nn.Parameter(fp8_weight, requires_grad=False)
+        )
         del layer.weight_scale
         layer.register_parameter(
             "weight_scale",
@@ -677,10 +739,12 @@ class Fp8BlockOnlineLinearMethod(QuantizeMethodBase):
         self, layer, x: torch.Tensor, bias: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         if not has_deep_gemm():
+            if not hasattr(layer, "weight_scale"):
+                return torch.nn.functional.linear(x, layer.weight, bias)
             raise RuntimeError(
                 "Fp8BlockOnlineLinearMethod requires DeepGEMM at forward time; "
-                "install the `deep_gemm` package or fall back to "
-                "QUANTIZATION=FP8_DYNAMIC_PER_TENSOR."
+                "install the `deep_gemm` package or load fp8_block weights "
+                "through the no-DeepGEMM dequant fallback."
             )
 
         out_dtype = x.dtype
@@ -800,12 +864,40 @@ class Fp8BlockLinearMethod(Fp8BlockOnlineLinearMethod):
         )
 
     def process_weights_after_loading(self, layer):
-        # The weight is already fp8; just expose the block scale under the name
-        # the inherited apply() expects (`weight_scale`), mirroring the online
-        # sibling's post-load contract.
+        # The weight is already fp8. With DeepGEMM available, expose the block
+        # scale under the name the inherited apply() expects (`weight_scale`).
+        # ROCm/test containers do not provide CUDA DeepGEMM, so dequantize once
+        # at load time and use a plain bf16 linear fallback for smoke coverage.
         block_size = getattr(
             layer.quant_config, "weight_block_size", [self.BLOCK, self.BLOCK]
         )
+        if not has_deep_gemm():
+            if list(block_size) == [self.BLOCK, self.BLOCK]:
+                weight_dequant = _dequant_block_to_bf16(
+                    layer.weight.data, layer.weight_scale_inv.data, self.BLOCK
+                )
+            else:
+                from rtp_llm.models_py.kernels.cuda.fp8_kernel.fp8_kernel import (
+                    block_quant_dequant,
+                )
+
+                weight_dequant = block_quant_dequant(
+                    layer.weight.data,
+                    layer.weight_scale_inv.data,
+                    list(block_size),
+                    torch.bfloat16,
+                )
+            del layer.weight
+            layer.register_parameter(
+                "weight", nn.Parameter(weight_dequant.contiguous(), requires_grad=False)
+            )
+            del layer.weight_scale_inv
+            logger.info(
+                "[Fp8BlockLinearMethod] DeepGEMM unavailable; dequantized %r to bf16 for fallback linear",
+                getattr(layer, "prefix", "?"),
+            )
+            return
+
         if list(block_size) != [self.BLOCK, self.BLOCK]:
             from rtp_llm.models_py.kernels.cuda.fp8_kernel.fp8_kernel import (
                 block_quant_dequant,

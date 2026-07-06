@@ -13,6 +13,7 @@ from rtp_llm.models_py.layers.linear import (
     RowParallelLinear,
 )
 from rtp_llm.models_py.layers.norm import RMSNorm
+from rtp_llm.models_py.model_desc.block_map import select_block_map_for_layer
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
 from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
@@ -214,6 +215,7 @@ def _extract_config_values(model_config: Any, load_config: Any):
     tp_rank = getattr(load_config, "tp_rank", 0)
     quant_config = getattr(load_config, "quant_config", None)
     params_dtype = getattr(load_config, "compute_dtype", torch.float16)
+    enable_fp32_lm_head = getattr(model_config, "enable_fp32_lm_head", True)
 
     return dict(
         hidden_size=hidden_size,
@@ -227,6 +229,7 @@ def _extract_config_values(model_config: Any, load_config: Any):
         tp_rank=tp_rank,
         quant_config=quant_config,
         params_dtype=params_dtype,
+        lm_head_params_dtype=torch.float32 if enable_fp32_lm_head else params_dtype,
     )
 
 
@@ -244,12 +247,16 @@ class Qwen2ForCausalLM(GptModelBase):
         else:
             weights_iter = weights
         has_lm_head = False
+        embed_weight = None
 
         def _track(it):
-            nonlocal has_lm_head
+            nonlocal has_lm_head, embed_weight
             for name, tensor in it:
-                if name == "lm_head.weight" or name.startswith("lm_head."):
+                mapped_name = self.WEIGHTS_MAPPER.map_name(name)
+                if mapped_name == "lm_head.weight" or mapped_name.startswith("lm_head."):
                     has_lm_head = True
+                if mapped_name == "embed_tokens.weight":
+                    embed_weight = tensor
                 yield name, tensor
 
         mapped_iter = self.WEIGHTS_MAPPER.apply(_track(weights_iter))
@@ -259,11 +266,19 @@ class Qwen2ForCausalLM(GptModelBase):
         # with tie_word_embeddings=true), HF transformers reuses embed_tokens.weight
         # at runtime. Mirror that here so lm_head doesn't stay uninitialized.
         if not has_lm_head:
+            if embed_weight is None:
+                raise ValueError("Cannot tie lm_head: embed_tokens.weight not found")
             logging.info(
                 "[Qwen2ForCausalLM] lm_head.weight not found in ckpt; "
                 "tying lm_head to embed_tokens (tie_word_embeddings)"
             )
-            self.lm_head.weight.data.copy_(self.embed_tokens.weight.data)
+            if self.lm_head.tp_size > 1:
+                start = self.lm_head.tp_rank * self.lm_head.vocab_size_per_partition
+                end = start + self.lm_head.vocab_size_per_partition
+                embed_weight = embed_weight[start:end, :]
+            self.lm_head.weight.data.copy_(
+                embed_weight.to(dtype=self.lm_head.weight.dtype)
+            )
 
     def __init__(self, model_config: Any, load_config: Any):
         parallelism_config = getattr(load_config, "parallelism_config", None)
@@ -311,7 +326,7 @@ class Qwen2ForCausalLM(GptModelBase):
             hidden_size=cfg["hidden_size"],
             tp_size=cfg["tp_size"],
             tp_rank=cfg["tp_rank"],
-            params_dtype=cfg["params_dtype"],
+            params_dtype=cfg["lm_head_params_dtype"],
         )
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
@@ -320,6 +335,7 @@ class Qwen2ForCausalLM(GptModelBase):
         if fmha_impl is None:
             fmha_impl = self.prepare_fmha_impl(inputs)
         for i, layer in enumerate(self.layers):
+            select_block_map_for_layer(inputs.attention_inputs, i)
             hidden_states = layer(
                 hidden_states,
                 fmha_impl,

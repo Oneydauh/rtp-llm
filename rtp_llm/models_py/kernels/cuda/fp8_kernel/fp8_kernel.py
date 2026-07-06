@@ -185,6 +185,15 @@ def scaled_fp8_per_token_quant(
     input: torch.Tensor,
     output: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if "per_token_quant_fp8" not in globals():
+        from rtp_llm.models_py.kernels.rocm.fp8_kernel import rocm_per_token_quant_fp8
+
+        rocm_output, rocm_scale = rocm_per_token_quant_fp8(input.contiguous())
+        if output is not None:
+            output.copy_(rocm_output)
+            rocm_output = output
+        return rocm_output, rocm_scale
+
     scale = torch.zeros(input.size(0), device=input.device, dtype=torch.float32)
     if output is not None:
         assert output.dtype == torch.float8_e4m3fn

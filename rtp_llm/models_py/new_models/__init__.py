@@ -1,3 +1,6 @@
-from rtp_llm.models_py.new_models.qwen2_vl import Qwen2VLForConditionalGeneration
+"""Lazy new-loader model package.
 
-__all__ = ["Qwen2VLForConditionalGeneration"]
+Model classes are imported by rtp_llm.models_py.registry on demand.
+"""
+
+__all__ = []

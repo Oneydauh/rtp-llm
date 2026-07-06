@@ -32,6 +32,17 @@ _FP8_E4M3_MAX: float = 448.0
 _FP8_MIN_SCALE: float = 1.0 / (448.0 * 512.0)
 
 
+def _runtime_fp8_dtype() -> torch.dtype:
+    try:
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.rocm._utils import (
+            get_rocm_fp8_dtype,
+        )
+
+        return get_rocm_fp8_dtype()
+    except Exception:
+        return torch.float8_e4m3fn
+
+
 @register_moe_quant_method(
     # per_tensor 子族
     "fp8",
@@ -65,6 +76,34 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 getattr(self.quant_config, "weight_block_size", [128, 128]),
             )
         )
+
+    def _requant_block_to_runtime_fp8(
+        self, weight: torch.Tensor, scale: torch.Tensor, block_size: List[int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        runtime_dtype = _runtime_fp8_dtype()
+        if weight.dtype == runtime_dtype:
+            return weight.contiguous(), scale.contiguous()
+
+        block_n, block_k = block_size
+        e, out_dim, in_dim = weight.shape
+        if out_dim % block_n != 0 or in_dim % block_k != 0:
+            raise ValueError(
+                f"MoE FP8 block requant requires divisible dims, got "
+                f"weight={tuple(weight.shape)} block={block_size}"
+            )
+
+        out_blocks = out_dim // block_n
+        in_blocks = in_dim // block_k
+        deq = weight.float().reshape(e, out_blocks, block_n, in_blocks, block_k)
+        deq = deq * scale.float().reshape(e, out_blocks, 1, in_blocks, 1)
+        fp8_max = float(torch.finfo(runtime_dtype).max)
+        new_scale = (
+            deq.abs().amax(dim=(2, 4), keepdim=True).clamp_min(_FP8_MIN_SCALE)
+            / fp8_max
+        )
+        requant = (deq / new_scale).to(runtime_dtype).reshape(e, out_dim, in_dim)
+        new_scale = new_scale.squeeze(2).squeeze(-1).to(torch.float32)
+        return requant.contiguous(), new_scale.contiguous()
 
     # ------------------------------------------------------------------ #
     #  create_weights ← _init_buffers 的 fp8/online 分支
@@ -287,7 +326,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             for shard_s in (up_s, gate_s):
                 if shard_s != max_s:
                     half = layer.w13.data[e, :M_tp].to(torch.float16) * shard_s
-                    layer.w13.data[e, :M_tp] = (half / max_s).to(torch.float8_e4m3fn)
+                    layer.w13.data[e, :M_tp] = (half / max_s).to(_runtime_fp8_dtype())
             layer.w13_scale[e] = max_s
             layer.w2_scale[e] = down_s
 
@@ -313,8 +352,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         per_tensor_quant = _resolve_per_tensor_quant()
         E = layer.num_local_experts
         device = layer.w13.data.device
-        new_w13 = torch.empty_like(layer.w13.data, dtype=torch.float8_e4m3fn)
-        new_w2 = torch.empty_like(layer.w2.data, dtype=torch.float8_e4m3fn)
+        new_w13 = torch.empty_like(layer.w13.data, dtype=_runtime_fp8_dtype())
+        new_w2 = torch.empty_like(layer.w2.data, dtype=_runtime_fp8_dtype())
         force_cpu_quant = bool(
             getattr(layer, "_new_loader_force_cpu_load_weights", False)
         )
@@ -339,21 +378,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def _online_per_channel(self, layer):
         E = layer.num_local_experts
         device = layer.w13.data.device
-        new_w13 = torch.empty_like(layer.w13.data, dtype=torch.float8_e4m3fn)
-        new_w2 = torch.empty_like(layer.w2.data, dtype=torch.float8_e4m3fn)
+        new_w13 = torch.empty_like(layer.w13.data, dtype=_runtime_fp8_dtype())
+        new_w2 = torch.empty_like(layer.w2.data, dtype=_runtime_fp8_dtype())
         fp8_max = _FP8_E4M3_MAX
 
         for e in range(E):
             w13_e = layer.w13.data[e].float()
             row_max = w13_e.abs().amax(dim=1)
             row_scale = (row_max / fp8_max).clamp_min(_FP8_MIN_SCALE)
-            new_w13[e] = (w13_e / row_scale.unsqueeze(1)).to(torch.float8_e4m3fn)
+            new_w13[e] = (w13_e / row_scale.unsqueeze(1)).to(_runtime_fp8_dtype())
             layer.w13_scale.data[e] = row_scale
 
             w2_e = layer.w2.data[e].float()
             row_max = w2_e.abs().amax(dim=1)
             row_scale = (row_max / fp8_max).clamp_min(_FP8_MIN_SCALE)
-            new_w2[e] = (w2_e / row_scale.unsqueeze(1)).to(torch.float8_e4m3fn)
+            new_w2[e] = (w2_e / row_scale.unsqueeze(1)).to(_runtime_fp8_dtype())
             layer.w2_scale.data[e] = row_scale
 
         layer.w13 = nn.Parameter(new_w13.to(device), requires_grad=False)
@@ -387,6 +426,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
 
         if list(block_size) == [layer._FP8_BLOCK_SIZE, layer._FP8_BLOCK_SIZE]:
+            runtime_dtype = _runtime_fp8_dtype()
+            if layer.w13.dtype != runtime_dtype or layer.w2.dtype != runtime_dtype:
+                layer.w13.data, layer.w13_scale = self._requant_block_to_runtime_fp8(
+                    layer.w13.data.contiguous(),
+                    layer.w13_scale.to(layer.w13.device, non_blocking=True).contiguous(),
+                    list(block_size),
+                )
+                layer.w2.data, layer.w2_scale = self._requant_block_to_runtime_fp8(
+                    layer.w2.data.contiguous(),
+                    layer.w2_scale.to(layer.w2.device, non_blocking=True).contiguous(),
+                    list(block_size),
+                )
+                logger.info(
+                    "[Fp8MoEMethod] requantized MoE fp8 block weights to runtime dtype: "
+                    "dtype=%s w13=%s w13_scale=%s w2=%s w2_scale=%s",
+                    runtime_dtype,
+                    tuple(layer.w13.shape),
+                    tuple(layer.w13_scale.shape),
+                    tuple(layer.w2.shape),
+                    tuple(layer.w2_scale.shape),
+                )
+
             if not is_deep_gemm_e8m0_used():
                 return
 

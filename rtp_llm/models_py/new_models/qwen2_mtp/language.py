@@ -9,7 +9,7 @@ HF ckpt structure (after WEIGHTS_MAPPER strips "model."):
   lm_head.weight                       -> lm_head.weight
   layers.0.e_norm.weight               -> mtp_block.e_norm.weight
   layers.0.h_norm.weight               -> mtp_block.h_norm.weight
-  layers.0.eh_proj.weight              -> mtp_block.fc.weight  (NO transpose)
+  layers.0.eh_proj.weight              -> mtp_block.fc.weight  (transposed)
   layers.0.final_head.norm.weight      -> norm.weight
   layers.0.self_attn.*                 -> layers.0.self_attn.*
   layers.0.mlp.*                       -> layers.0.mlp.*
@@ -23,6 +23,7 @@ import torch.nn as nn
 
 from rtp_llm.models_py.layers.embedding import ParallelLMHead, VocabParallelEmbedding
 from rtp_llm.models_py.layers.norm import RMSNorm
+from rtp_llm.models_py.model_desc.block_map import select_block_map_for_layer
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
 from rtp_llm.models_py.new_models.mtp import MTPBlock
 from rtp_llm.models_py.new_models.qwen2_vl.language import (
@@ -67,7 +68,10 @@ class Qwen2MTPForCausalLM(GptModelBase):
                     yield "mtp_block.h_norm." + name.split(".h_norm.", 1)[1], tensor
                     continue
                 if ".eh_proj." in name:
-                    yield "mtp_block.fc." + name.split(".eh_proj.", 1)[1], tensor
+                    mapped_name = "mtp_block.fc." + name.split(".eh_proj.", 1)[1]
+                    if mapped_name == "mtp_block.fc.weight":
+                        tensor = tensor.t().contiguous()
+                    yield mapped_name, tensor
                     continue
                 if ".final_head.norm." in name:
                     yield "norm." + name.split(".final_head.norm.", 1)[1], tensor
@@ -162,6 +166,7 @@ class Qwen2MTPForCausalLM(GptModelBase):
         if fmha_impl is None:
             fmha_impl = self.prepare_fmha_impl(inputs)
         for i, layer in enumerate(self.layers):
+            select_block_map_for_layer(inputs.attention_inputs, i)
             hidden_states = layer(
                 hidden_states,
                 fmha_impl,

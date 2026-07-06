@@ -102,6 +102,14 @@ _LAZY_MODEL_REGISTRY: Dict[str, Tuple[str, str]] = {
         "rtp_llm.models_py.new_models.llama",
         "LlamaForCausalLM",
     ),
+    "bert": (
+        "rtp_llm.models_py.new_models.bert",
+        "BertForEmbedding",
+    ),
+    "roberta": (
+        "rtp_llm.models_py.new_models.bert",
+        "RobertaForEmbedding",
+    ),
 }
 
 
