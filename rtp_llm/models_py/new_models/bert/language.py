@@ -33,12 +33,99 @@ def _float_to_dtype(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return tensor
 
 
+def _set_param(module: nn.Module, attr: str, tensor: torch.Tensor, dtype: torch.dtype):
+    value = _float_to_dtype(tensor.detach().contiguous(), dtype)
+    current = getattr(module, attr, None)
+    if isinstance(current, nn.Parameter):
+        if current.shape != value.shape:
+            raise ValueError(f"Shape mismatch for {attr}: {value.shape} vs {current.shape}")
+        current.data.copy_(value)
+    else:
+        module.register_parameter(attr, nn.Parameter(value, requires_grad=False))
+
+
+def _required_param(module: nn.Module, attr: str) -> nn.Parameter:
+    value = getattr(module, attr, None)
+    if not isinstance(value, nn.Parameter):
+        raise KeyError(attr)
+    return value
+
+
+def _optional_param(module: nn.Module, attr: str):
+    value = getattr(module, attr, None)
+    return value if isinstance(value, nn.Parameter) else None
+
+
+def _weight_data(param: nn.Parameter, dtype: torch.dtype) -> torch.Tensor:
+    return _float_to_dtype(param.data, dtype)
+
+
+class _BertEmbeddingParams(nn.Module):
+    def load_weight(self, name: str, tensor: torch.Tensor, dtype: torch.dtype) -> bool:
+        mapping = {
+            "word_embeddings.weight": "word_embeddings_weight",
+            "position_embeddings.weight": "position_embeddings_weight",
+            "token_type_embeddings.weight": "token_type_embeddings_weight",
+            "LayerNorm.weight": "layernorm_weight",
+            "LayerNorm.bias": "layernorm_bias",
+        }
+        attr = mapping.get(name)
+        if attr is None:
+            return False
+        _set_param(self, attr, tensor, dtype)
+        return True
+
+
+class _BertLayerParams(nn.Module):
+    _MAPPING = {
+        "attention.self.query.weight": "attention_query_weight",
+        "attention.self.query.bias": "attention_query_bias",
+        "attention.self.key.weight": "attention_key_weight",
+        "attention.self.key.bias": "attention_key_bias",
+        "attention.self.value.weight": "attention_value_weight",
+        "attention.self.value.bias": "attention_value_bias",
+        "attention.output.dense.weight": "attention_output_dense_weight",
+        "attention.output.dense.bias": "attention_output_dense_bias",
+        "attention.output.LayerNorm.weight": "attention_output_layernorm_weight",
+        "attention.output.LayerNorm.bias": "attention_output_layernorm_bias",
+        "intermediate.dense.weight": "intermediate_dense_weight",
+        "intermediate.dense.bias": "intermediate_dense_bias",
+        "output.dense.weight": "output_dense_weight",
+        "output.dense.bias": "output_dense_bias",
+        "output.LayerNorm.weight": "output_layernorm_weight",
+        "output.LayerNorm.bias": "output_layernorm_bias",
+    }
+
+    def load_weight(self, name: str, tensor: torch.Tensor, dtype: torch.dtype) -> bool:
+        attr = self._MAPPING.get(name)
+        if attr is None:
+            return False
+        _set_param(self, attr, tensor, dtype)
+        return True
+
+
+class _BertCustomParams(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.names: Dict[str, str] = {}
+
+    @staticmethod
+    def _attr(name: str) -> str:
+        return "custom_" + str(abs(hash(name)))
+
+    def load_weight(self, name: str, tensor: torch.Tensor, dtype: torch.dtype):
+        attr = self._attr(name)
+        self.names[attr] = name
+        _set_param(self, attr, tensor, dtype)
+
+
 class _BertNewLoaderBase(nn.Module):
     """New-loader wrapper for legacy BERT/Roberta PyModel.
 
     The new loader creates this object first, then calls load_weights(weights_iter).
-    load_weights builds the ModelWeights object from the incoming checkpoint stream
-    and creates the internal BertModel only after all required tensors are mapped.
+    load_weights stores checkpoint tensors as parameters on this PyModel.  The
+    legacy BertModel still needs W.* layout for kernels, so we rebuild a small
+    ModelWeights view from the PyModel parameters after loading.
     """
 
     model_prefix = "bert"
@@ -59,37 +146,33 @@ class _BertNewLoaderBase(nn.Module):
             self.parallelism_config.local_world_size = self.parallelism_config.world_size
         self.model = None
         self.weights = None
+        self.embeddings = _BertEmbeddingParams()
+        self.layers = nn.ModuleList(
+            [_BertLayerParams() for _ in range(int(getattr(self.config, "num_layers")))]
+        )
+        self.custom_params = _BertCustomParams()
 
-    def _lookup(self, state: Dict[str, torch.Tensor], name: str) -> torch.Tensor:
-        if name in state:
-            return state[name]
-        prefixed = self.model_prefix + "." + name
-        if prefixed in state:
-            return state[prefixed]
-        for prefix in ("bert.", "roberta."):
-            alt = prefix + name
-            if alt in state:
-                return state[alt]
-        raise KeyError(name)
+    def _embedding_param(self, attr: str) -> nn.Parameter:
+        return _required_param(self.embeddings, attr)
 
-    def _optional_lookup(self, state: Dict[str, torch.Tensor], name: str):
-        try:
-            return self._lookup(state, name)
-        except KeyError:
-            return None
+    def _optional_embedding_param(self, attr: str):
+        return _optional_param(self.embeddings, attr)
 
-    def _create_model_weights(self, state: Dict[str, torch.Tensor]) -> ModelWeights:
+    def _layer_param(self, layer_idx: int, attr: str) -> nn.Parameter:
+        return _required_param(self.layers[layer_idx], attr)
+
+    def _create_model_weights(self) -> ModelWeights:
         num_layers = int(getattr(self.config, "num_layers"))
         weights = ModelWeights(num_layers, "cpu", self.compute_dtype)
 
-        def put_global(w_name: str, ckpt_name: str, *, optional: bool = False):
-            tensor = self._optional_lookup(state, ckpt_name) if optional else self._lookup(state, ckpt_name)
-            if tensor is not None:
-                weights.set_global_weight(w_name, _float_to_dtype(tensor.contiguous(), self.compute_dtype))
+        def put_global(w_name: str, attr: str, *, optional: bool = False):
+            param = self._optional_embedding_param(attr) if optional else self._embedding_param(attr)
+            if param is not None:
+                weights.set_global_weight(w_name, _weight_data(param, self.compute_dtype).contiguous())
 
-        put_global(W.embedding, "embeddings.word_embeddings.weight")
-        put_global(W.positional_embedding, "embeddings.position_embeddings.weight")
-        put_global(W.token_type_embedding, "embeddings.token_type_embeddings.weight", optional=True)
+        put_global(W.embedding, "word_embeddings_weight")
+        put_global(W.positional_embedding, "position_embeddings_weight")
+        put_global(W.token_type_embedding, "token_type_embeddings_weight", optional=True)
         if W.token_type_embedding not in weights.global_weights:
             type_vocab_size = int(getattr(self.config, "type_vocab_size", 0) or 0)
             if type_vocab_size > 0:
@@ -98,17 +181,16 @@ class _BertNewLoaderBase(nn.Module):
                     W.token_type_embedding,
                     torch.zeros(type_vocab_size, hidden_size, dtype=self.compute_dtype),
                 )
-        put_global(W.pre_decoder_ln_gamma, "embeddings.LayerNorm.weight")
-        put_global(W.pre_decoder_ln_beta, "embeddings.LayerNorm.bias")
+        put_global(W.pre_decoder_ln_gamma, "layernorm_weight")
+        put_global(W.pre_decoder_ln_beta, "layernorm_bias")
 
         for i in range(num_layers):
-            base = f"encoder.layer.{i}"
-            q_w = self._lookup(state, f"{base}.attention.self.query.weight")
-            k_w = self._lookup(state, f"{base}.attention.self.key.weight")
-            v_w = self._lookup(state, f"{base}.attention.self.value.weight")
-            q_b = self._lookup(state, f"{base}.attention.self.query.bias")
-            k_b = self._lookup(state, f"{base}.attention.self.key.bias")
-            v_b = self._lookup(state, f"{base}.attention.self.value.bias")
+            q_w = _weight_data(self._layer_param(i, "attention_query_weight"), self.compute_dtype)
+            k_w = _weight_data(self._layer_param(i, "attention_key_weight"), self.compute_dtype)
+            v_w = _weight_data(self._layer_param(i, "attention_value_weight"), self.compute_dtype)
+            q_b = _weight_data(self._layer_param(i, "attention_query_bias"), self.compute_dtype)
+            k_b = _weight_data(self._layer_param(i, "attention_key_bias"), self.compute_dtype)
+            v_b = _weight_data(self._layer_param(i, "attention_value_bias"), self.compute_dtype)
 
             weights.set_layer_weight(
                 i,
@@ -125,7 +207,7 @@ class _BertNewLoaderBase(nn.Module):
             weights.set_layer_weight(
                 i,
                 W.attn_o_w,
-                self._lookup(state, f"{base}.attention.output.dense.weight")
+                _weight_data(self._layer_param(i, "attention_output_dense_weight"), self.compute_dtype)
                 .t()
                 .contiguous()
                 .to(self.compute_dtype),
@@ -133,28 +215,28 @@ class _BertNewLoaderBase(nn.Module):
             weights.set_layer_weight(
                 i,
                 W.attn_o_b,
-                self._lookup(state, f"{base}.attention.output.dense.bias")
+                _weight_data(self._layer_param(i, "attention_output_dense_bias"), self.compute_dtype)
                 .contiguous()
                 .to(self.compute_dtype),
             )
             weights.set_layer_weight(
                 i,
                 W.post_ln_gamma,
-                self._lookup(state, f"{base}.attention.output.LayerNorm.weight")
+                _weight_data(self._layer_param(i, "attention_output_layernorm_weight"), self.compute_dtype)
                 .contiguous()
                 .to(self.compute_dtype),
             )
             weights.set_layer_weight(
                 i,
                 W.post_ln_beta,
-                self._lookup(state, f"{base}.attention.output.LayerNorm.bias")
+                _weight_data(self._layer_param(i, "attention_output_layernorm_bias"), self.compute_dtype)
                 .contiguous()
                 .to(self.compute_dtype),
             )
             weights.set_layer_weight(
                 i,
                 W.ffn_w3,
-                self._lookup(state, f"{base}.intermediate.dense.weight")
+                _weight_data(self._layer_param(i, "intermediate_dense_weight"), self.compute_dtype)
                 .t()
                 .contiguous()
                 .to(self.compute_dtype),
@@ -162,14 +244,14 @@ class _BertNewLoaderBase(nn.Module):
             weights.set_layer_weight(
                 i,
                 W.ffn_b3,
-                self._lookup(state, f"{base}.intermediate.dense.bias")
+                _weight_data(self._layer_param(i, "intermediate_dense_bias"), self.compute_dtype)
                 .contiguous()
                 .to(self.compute_dtype),
             )
             weights.set_layer_weight(
                 i,
                 W.ffn_w2,
-                self._lookup(state, f"{base}.output.dense.weight")
+                _weight_data(self._layer_param(i, "output_dense_weight"), self.compute_dtype)
                 .t()
                 .contiguous()
                 .to(self.compute_dtype),
@@ -177,34 +259,33 @@ class _BertNewLoaderBase(nn.Module):
             weights.set_layer_weight(
                 i,
                 W.ffn_b2,
-                self._lookup(state, f"{base}.output.dense.bias")
+                _weight_data(self._layer_param(i, "output_dense_bias"), self.compute_dtype)
                 .contiguous()
                 .to(self.compute_dtype),
             )
             weights.set_layer_weight(
                 i,
                 W.post_ffn_ln_gamma,
-                self._lookup(state, f"{base}.output.LayerNorm.weight")
+                _weight_data(self._layer_param(i, "output_layernorm_weight"), self.compute_dtype)
                 .contiguous()
                 .to(self.compute_dtype),
             )
             weights.set_layer_weight(
                 i,
                 W.post_ffn_ln_beta,
-                self._lookup(state, f"{base}.output.LayerNorm.bias")
+                _weight_data(self._layer_param(i, "output_layernorm_bias"), self.compute_dtype)
                 .contiguous()
                 .to(self.compute_dtype),
             )
 
         return weights
 
-    def _add_custom_weights(self, model_weights: ModelWeights, custom_state: Dict[str, torch.Tensor]):
-        for name, tensor in custom_state.items():
-            if not isinstance(tensor, torch.Tensor):
-                continue
+    def _add_custom_weights(self, model_weights: ModelWeights):
+        for attr, name in self.custom_params.names.items():
+            param = _required_param(self.custom_params, attr)
             model_weights.set_global_weight(
                 CustomAtomicWeight.prefix + name,
-                _float_to_dtype(tensor.contiguous(), self.compute_dtype),
+                _weight_data(param, self.compute_dtype).contiguous(),
             )
 
     def _build_inner_model(self):
@@ -220,46 +301,55 @@ class _BertNewLoaderBase(nn.Module):
         )
 
     def load_weights(self, weights):
-        state: Dict[str, torch.Tensor] = {}
-        custom_state: Dict[str, torch.Tensor] = {}
+        loaded = 0
+        custom_loaded = 0
         dropped = 0
+        self.custom_params.names.clear()
         for name, tensor in _as_iter(weights):
             stripped = _strip_known_prefix(name, self.model_prefix)
-            if (
-                stripped.startswith("embeddings.")
-                or stripped.startswith("encoder.layer.")
-            ):
-                state[stripped] = tensor
-            elif isinstance(tensor, torch.Tensor) and tensor.is_floating_point():
+            if stripped.startswith("embeddings."):
+                if self.embeddings.load_weight(stripped[len("embeddings.") :], tensor, self.compute_dtype):
+                    loaded += 1
+                else:
+                    dropped += 1
+                continue
+            if stripped.startswith("encoder.layer."):
+                parts = stripped.split(".", 3)
+                if len(parts) == 4 and parts[2].isdigit():
+                    layer_idx = int(parts[2])
+                    if 0 <= layer_idx < len(self.layers) and self.layers[layer_idx].load_weight(
+                        parts[3], tensor, self.compute_dtype
+                    ):
+                        loaded += 1
+                    else:
+                        dropped += 1
+                else:
+                    dropped += 1
+                continue
+            if isinstance(tensor, torch.Tensor) and tensor.is_floating_point():
                 custom_name = name if name.startswith("bert.pooler.") else stripped
-                custom_state[custom_name] = tensor
+                self.custom_params.load_weight(custom_name, tensor, self.compute_dtype)
+                custom_loaded += 1
             else:
                 dropped += 1
-        self.weights = self._create_model_weights(state)
-        self._add_custom_weights(self.weights, custom_state)
+        self.weights = self._create_model_weights()
+        self._add_custom_weights(self.weights)
         self._build_inner_model()
         logger.info(
-            "%s newloader loaded BERT-style weights: tensors=%d custom_tensors=%d dropped=%d",
+            "%s newloader streamed BERT-style weights into PyModel params: tensors=%d custom_tensors=%d dropped=%d",
             self.__class__.__name__,
-            len(state),
-            len(custom_state),
+            loaded,
+            custom_loaded,
             dropped,
         )
 
-    def _move_model_weights(self, fn):
-        if self.weights is None:
-            return
-        for k, v in list(self.weights.global_weights.items()):
-            self.weights.global_weights[k] = fn(v)
-        for layer in self.weights.weights:
-            for k, v in list(layer.items()):
-                layer[k] = fn(v)
-
     def _apply(self, fn):
         super()._apply(fn)
-        if self.model is not None:
-            self._move_model_weights(fn)
-            self._build_inner_model()
+        if self.weights is not None:
+            self.weights = self._create_model_weights()
+            self._add_custom_weights(self.weights)
+            if self.model is not None:
+                self._build_inner_model()
         return self
 
     def initialize(self, init_resource):

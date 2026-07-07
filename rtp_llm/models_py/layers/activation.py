@@ -40,14 +40,20 @@ def silu_and_mul(gate_up: torch.Tensor) -> torch.Tensor:
     """
     if gate_up.is_cuda:
         try:
-            from rtp_llm.ops.compute_ops import rtp_llm_ops
-
             d = gate_up.shape[-1] // 2
             out = torch.empty(
                 gate_up.shape[:-1] + (d,),
                 dtype=gate_up.dtype,
                 device=gate_up.device,
             )
+            if getattr(torch.version, "hip", None) is not None:
+                import aiter
+
+                aiter.silu_and_mul(out, gate_up)
+                return out
+
+            from rtp_llm.ops.compute_ops import rtp_llm_ops
+
             stream_id = torch.cuda.current_stream().cuda_stream
             rtp_llm_ops.silu_and_mul(out, gate_up, stream_id)
             return out

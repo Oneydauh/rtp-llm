@@ -32,6 +32,11 @@ class RMSNorm(nn.Module):
         # 非 CUDA / kernel 不可用时回退 eager fp32（可移植）。
         if x.is_cuda:
             try:
+                if getattr(torch.version, "hip", None) is not None:
+                    from aiter import rms_norm
+
+                    return rms_norm(x, self.weight.data, self.eps)
+
                 from rtp_llm.ops.compute_ops import rtp_llm_ops
 
                 orig_shape = x.shape
@@ -83,6 +88,22 @@ class RMSResNorm(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if hidden_states.is_cuda:
             try:
+                if getattr(torch.version, "hip", None) is not None:
+                    from aiter import rmsnorm2d_fwd_with_add as fused_add_rmsnorm
+
+                    output = torch.empty_like(hidden_states)
+                    residual_out = torch.empty_like(hidden_states)
+                    fused_add_rmsnorm(
+                        output,
+                        hidden_states,
+                        residual,
+                        residual_out,
+                        self.weight.data,
+                        self.eps,
+                        0,
+                    )
+                    return output, residual_out
+
                 from rtp_llm.ops.compute_ops import rtp_llm_ops
 
                 orig_shape = hidden_states.shape

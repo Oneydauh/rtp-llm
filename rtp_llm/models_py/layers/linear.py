@@ -154,10 +154,17 @@ class ColumnParallelLinear(LinearBase):
                     tensor = self._split_weight(tensor, dim=1)
 
             if tensor.shape != param.shape:
-                raise ValueError(
-                    f"Shape mismatch for {self.prefix}.{param_name}: "
-                    f"weight {tensor.shape} vs param {param.shape}"
-                )
+                if (
+                    param_name == "weight"
+                    and tensor.dim() == 2
+                    and tensor.t().shape == param.shape
+                ):
+                    tensor = tensor.t().contiguous()
+                else:
+                    raise ValueError(
+                        f"Shape mismatch for {self.prefix}.{param_name}: "
+                        f"weight {tensor.shape} vs param {param.shape}"
+                    )
             param.data.copy_(tensor)
 
         # process_weights_after_loading is invoked by NewModelLoader's
@@ -250,10 +257,17 @@ class RowParallelLinear(LinearBase):
                     tensor = self._split_weight(tensor, dim=0)
 
             if tensor.shape != param.shape:
-                raise ValueError(
-                    f"Shape mismatch for {self.prefix}.{param_name}: "
-                    f"weight {tensor.shape} vs param {param.shape}"
-                )
+                if (
+                    param_name == "weight"
+                    and tensor.dim() == 2
+                    and tensor.t().shape == param.shape
+                ):
+                    tensor = tensor.t().contiguous()
+                else:
+                    raise ValueError(
+                        f"Shape mismatch for {self.prefix}.{param_name}: "
+                        f"weight {tensor.shape} vs param {param.shape}"
+                    )
             param.data.copy_(tensor)
 
         # process_weights_after_loading is invoked by NewModelLoader's
@@ -392,6 +406,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             if shard_id < 0:
                 if param_name == "weight":
                     split_tensor = self._split_weight(tensor, dim=0)
+                    if split_tensor.shape != self.weight.shape and split_tensor.t().shape == self.weight.shape:
+                        split_tensor = split_tensor.t().contiguous()
                     self.weight.data.copy_(split_tensor)
                 continue
 
@@ -402,7 +418,16 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
             if param_name == "weight":
                 offset = shard_id * shard_size
-                self.weight.data[offset : offset + shard_size, :].copy_(tensor)
+                if (
+                    tensor.dim() == 2
+                    and self.weight.shape[0] == tensor.shape[1]
+                    and self.weight.shape[1] >= offset + shard_size
+                ):
+                    self.weight.data[:, offset : offset + shard_size].copy_(
+                        tensor.t().contiguous()
+                    )
+                else:
+                    self.weight.data[offset : offset + shard_size, :].copy_(tensor)
             elif param_name == "bias" and self.bias is not None:
                 offset = shard_id * shard_size
                 self.bias.data[offset : offset + shard_size].copy_(tensor)
@@ -563,7 +588,16 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         if param_name == "weight":
             split = self._split_qkv(tensor, num_heads, self.head_dim)
-            self.weight.data[offset : offset + size].copy_(split)
+            if (
+                split.dim() == 2
+                and self.weight.shape[0] == split.shape[1]
+                and self.weight.shape[1] >= offset + size
+            ):
+                self.weight.data[:, offset : offset + size].copy_(
+                    split.t().contiguous()
+                )
+            else:
+                self.weight.data[offset : offset + size].copy_(split)
             return
 
         if param_name == "bias":
