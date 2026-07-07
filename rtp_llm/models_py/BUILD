@@ -113,6 +113,20 @@ py_library(
 )
 
 py_library(
+    name = "new_weight_loader",
+    srcs = glob([
+        "__init__.py",
+        "module_base.py",
+        "weight_mapper.py",
+        "registry.py",
+        "model_loader.py",
+        "quant_methods/*.py",
+        "layers/*.py",
+    ]),
+    visibility = ["//visibility:public"],
+)
+
+py_library(
     name = "models",
     srcs = glob([
         "model_desc/*.py",
@@ -123,6 +137,7 @@ py_library(
         ":modules",
         ":kernels",
         ":configs",
+        ":new_weight_loader",
         "//rtp_llm/model_loader:loader",
     ] + select({
         "@//:using_cuda12": [
