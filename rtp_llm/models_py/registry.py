@@ -8,7 +8,22 @@ import torch.nn as nn
 logger = logging.getLogger(__name__)
 
 # 仅声明模型名称到其对应的导入路径和类名
-_LAZY_MODEL_REGISTRY: Dict[str, Tuple[str, str]] = {}
+_LAZY_MODEL_REGISTRY: Dict[str, Tuple[str, str]] = {
+    "qwen_2": ("rtp_llm.models_py.new_models.qwen2_vl.language", "Qwen2ForCausalLM"),
+    "qwen_2_embedding": ("rtp_llm.models_py.new_models.qwen2_vl.language", "Qwen2ForCausalLM"),
+    "qwen_tool": ("rtp_llm.models_py.new_models.qwen2_vl.language", "Qwen2ForCausalLM"),
+    "qwen_3": ("rtp_llm.models_py.new_models.qwen3", "Qwen3ForCausalLM"),
+    "qwen_3_tool": ("rtp_llm.models_py.new_models.qwen3", "Qwen3ForCausalLM"),
+    "qwen_3_moe": ("rtp_llm.models_py.new_models.qwen3_moe", "Qwen3MoeForCausalLM"),
+    "qwen3_coder_moe": ("rtp_llm.models_py.new_models.qwen3_moe", "Qwen3MoeForCausalLM"),
+    "qwen35_moe": ("rtp_llm.models_py.new_models.qwen3_next", "Qwen35MoeForCausalLM"),
+    "qwen35_dense": ("rtp_llm.models_py.new_models.qwen3_next", "Qwen35DenseForCausalLM"),
+    "qwen3_next": ("rtp_llm.models_py.new_models.qwen3_next", "Qwen3NextForCausalLM"),
+    "qwen_3_moe_eagle3": ("rtp_llm.models_py.new_models.qwen3_next", "Qwen3MoeEagle3ForCausalLM"),
+    "qwen_2-mtp": ("rtp_llm.models_py.new_models.qwen2_mtp", "Qwen2MTPForCausalLM"),
+    "qwen35_moe_mtp": ("rtp_llm.models_py.new_models.qwen3_next", "Qwen35MoeMTPForCausalLM"),
+    "qwen3_next_mtp": ("rtp_llm.models_py.new_models.qwen3_next", "Qwen3NextMTPForCausalLM"),
+}
 
 
 

@@ -122,6 +122,8 @@ py_library(
         "model_loader.py",
         "quant_methods/*.py",
         "layers/*.py",
+        "new_models/*.py",
+        "new_models/**/*.py",
     ]),
     visibility = ["//visibility:public"],
 )
