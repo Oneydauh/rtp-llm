@@ -33,9 +33,12 @@ class RMSNorm(nn.Module):
         if x.is_cuda:
             try:
                 if getattr(torch.version, "hip", None) is not None:
+                    orig_shape = x.shape
+                    x2d = x.reshape(-1, orig_shape[-1]).contiguous()
                     from aiter import rms_norm
 
-                    return rms_norm(x, self.weight.data, self.eps)
+                    out = rms_norm(x2d, self.weight.data, self.eps)
+                    return out.reshape(orig_shape)
 
                 from rtp_llm.ops.compute_ops import rtp_llm_ops
 
