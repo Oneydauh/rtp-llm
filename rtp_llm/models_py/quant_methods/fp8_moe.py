@@ -33,6 +33,8 @@ _FP8_MIN_SCALE: float = 1.0 / (448.0 * 512.0)
 
 
 def _runtime_fp8_dtype() -> torch.dtype:
+    if torch.version.hip is None:
+        return torch.float8_e4m3fn
     try:
         from rtp_llm.models_py.modules.factory.fused_moe.impl.rocm._utils import (
             get_rocm_fp8_dtype,
@@ -98,8 +100,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         deq = deq * scale.float().reshape(e, out_blocks, 1, in_blocks, 1)
         fp8_max = float(torch.finfo(runtime_dtype).max)
         new_scale = (
-            deq.abs().amax(dim=(2, 4), keepdim=True).clamp_min(_FP8_MIN_SCALE)
-            / fp8_max
+            deq.abs().amax(dim=(2, 4), keepdim=True).clamp_min(_FP8_MIN_SCALE) / fp8_max
         )
         requant = (deq / new_scale).to(runtime_dtype).reshape(e, out_dim, in_dim)
         new_scale = new_scale.squeeze(2).squeeze(-1).to(torch.float32)
@@ -430,7 +431,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if layer.w13.dtype != runtime_dtype or layer.w2.dtype != runtime_dtype:
                 layer.w13.data, layer.w13_scale = self._requant_block_to_runtime_fp8(
                     layer.w13.data.contiguous(),
-                    layer.w13_scale.to(layer.w13.device, non_blocking=True).contiguous(),
+                    layer.w13_scale.to(
+                        layer.w13.device, non_blocking=True
+                    ).contiguous(),
                     list(block_size),
                 )
                 layer.w2.data, layer.w2_scale = self._requant_block_to_runtime_fp8(

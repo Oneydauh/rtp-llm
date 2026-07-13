@@ -113,20 +113,27 @@ class DeepSeekV32MlaAttention(RtpModule):
         self.tp_size = tp_size
         self.softmax_scale = self.q_head_dim ** (-0.5)
 
+        # Legacy FP8_PER_BLOCK keeps the fused Q/KV A projection in BF16;
+        # only the B projections and output projection are block-quantized.
+        # Keep the new-loader effective quantization policy identical.
+        a_proj_quant_config = QuantizationConfig(quant_type="none")
+
         # --- Independent submodules matching HF ckpt names ---
         # q_a_proj is either the LoRA down-projection (hidden -> q_lora_rank)
         # or, when q_lora_rank == 0, the direct query projection
-        # (hidden -> num_heads * q_head_dim). Both are replicated across TP here;
-        # no-LoRA fused q/k-rope splitting is handled by the MLA kernels.
+        # (hidden -> num_heads * q_head_dim). The LoRA down-projection is
+        # replicated, while direct Q is sharded by head across TP ranks.
         q_a_output_size = (
             q_lora_rank if q_lora_rank > 0 else num_heads * self.q_head_dim
         )
+        q_a_tp_size = 1 if q_lora_rank > 0 else tp_size
+        q_a_tp_rank = 0 if q_lora_rank > 0 else tp_rank
         self.q_a_proj = ColumnParallelLinear(
             input_size=hidden_size,
             output_size=q_a_output_size,
-            tp_size=1,
-            tp_rank=0,
-            quant_config=quant_config,
+            tp_size=q_a_tp_size,
+            tp_rank=q_a_tp_rank,
+            quant_config=a_proj_quant_config,
             prefix="q_a_proj" if q_lora_rank > 0 else "q_proj",
             bias=False,
             params_dtype=params_dtype,
@@ -138,7 +145,7 @@ class DeepSeekV32MlaAttention(RtpModule):
             output_size=kv_lora_rank + rope_head_dim,
             tp_size=1,
             tp_rank=0,
-            quant_config=quant_config,
+            quant_config=a_proj_quant_config,
             prefix="kv_a_proj_with_mqa",
             bias=False,
             params_dtype=params_dtype,
@@ -150,12 +157,16 @@ class DeepSeekV32MlaAttention(RtpModule):
             kv_lora_rank, eps=layernorm_eps, params_dtype=params_dtype
         )
         # q_b_proj: q_lora_rank → num_heads * q_head_dim
+        # It is unused when q_lora_rank == 0. Keep the empty [N, 0] placeholder
+        # unquantized so online FP8 methods do not launch a CUDA kernel with a
+        # zero-sized input dimension.
+        q_b_quant_config = quant_config if q_lora_rank > 0 else a_proj_quant_config
         self.q_b_proj = ColumnParallelLinear(
             input_size=q_lora_rank,
             output_size=num_heads * self.q_head_dim,
             tp_size=tp_size,
             tp_rank=tp_rank,
-            quant_config=quant_config,
+            quant_config=q_b_quant_config,
             prefix="q_b_proj",
             bias=False,
             params_dtype=params_dtype,
@@ -276,8 +287,41 @@ class DeepSeekV32MlaAttention(RtpModule):
         else:
             weights[W.mla_fusedqkrope_no_lora_w] = self._fused_qkv_a_w
         weights[W.mla_kv_a_ln_gamma] = self.kv_a_layernorm.weight.data
-        weights[W.attn_o_w] = self.o_proj.weight.data
-        weights[W.mla_kv_b_w] = self._kv_b_w
+        o_weight = self.o_proj.weight.data
+        if hasattr(self.o_proj, "weight_scale"):
+            o_scale = self.o_proj.weight_scale.data
+            weights[W.attn_o_w] = (
+                o_weight.reshape(o_weight.shape[1], o_weight.shape[0])
+                if o_scale.dim() == 2
+                else o_weight
+            )
+            weights[W.attn_o_s] = (
+                o_scale.reshape(o_scale.shape[1], o_scale.shape[0])
+                if o_scale.dim() == 2
+                else o_scale
+            )
+        else:
+            weights[W.attn_o_w] = o_weight.reshape(o_weight.shape[1], o_weight.shape[0])
+
+        # Prefill consumes kv_b through the attention factory. Preserve the
+        # FP8 weight/scale pair so it selects the same block-quantized linear
+        # as the legacy loader; kc/vc remain dequantized derived views for the
+        # absorb/decode paths.
+        kv_b_weight = self.kv_b_proj.weight.data
+        if hasattr(self.kv_b_proj, "weight_scale"):
+            kv_b_scale = self.kv_b_proj.weight_scale.data
+            weights[W.mla_kv_b_w] = (
+                kv_b_weight.reshape(kv_b_weight.shape[1], kv_b_weight.shape[0])
+                if kv_b_scale.dim() == 2
+                else kv_b_weight
+            )
+            weights[W.mla_kv_b_s] = (
+                kv_b_scale.reshape(kv_b_scale.shape[1], kv_b_scale.shape[0])
+                if kv_b_scale.dim() == 2
+                else kv_b_scale
+            )
+        else:
+            weights[W.mla_kv_b_w] = self._kv_b_w
         weights[W.mla_kc] = self._kc_w
         weights[W.mla_vc] = self._vc_w
         return weights
@@ -333,7 +377,7 @@ class DeepSeekV32MlaAttention(RtpModule):
             # q_b projection
             q = self.q_b_proj(q_c)
         else:
-            # No LoRA: match the legacy loader's fused q/k-rope projection.
+            # Match the legacy no-LoRA path's single fused BF16 projection.
             if self._fused_qkv_a_w is None:
                 raise RuntimeError("process_weights_after_loading() must run first")
             fused_qkv = torch.nn.functional.linear(hidden_states, self._fused_qkv_a_w)

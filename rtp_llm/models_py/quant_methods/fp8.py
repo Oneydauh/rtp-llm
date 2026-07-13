@@ -29,6 +29,8 @@ def _convert_e4m3fn_to_fnuz(
 
 
 def _runtime_fp8_dtype() -> torch.dtype:
+    if torch.version.hip is None:
+        return torch.float8_e4m3fn
     try:
         from rtp_llm.models_py.modules.factory.fused_moe.impl.rocm._utils import (
             get_rocm_fp8_dtype,
@@ -82,9 +84,7 @@ def _requant_per_channel_to_runtime_fp8(
         )
     deq = weight.float() * scale_rows
     fp8_max = float(torch.finfo(runtime_dtype).max)
-    new_scale = (
-        deq.abs().amax(dim=1, keepdim=True).clamp_min(_FP8_MIN_SCALE) / fp8_max
-    )
+    new_scale = deq.abs().amax(dim=1, keepdim=True).clamp_min(_FP8_MIN_SCALE) / fp8_max
     requant = (deq / new_scale).to(runtime_dtype)
     return requant.contiguous(), new_scale.to(torch.float32).contiguous()
 
@@ -118,6 +118,7 @@ def _apply_rocm_fp8_per_channel(
         None,
         out_dtype,
     )
+
 
 # Hoist kernel imports to module scope. apply() is on the per-token decode hot
 # path: doing the import inside apply() (even though sys.modules caches it)
@@ -776,12 +777,60 @@ class Fp8BlockOnlineLinearMethod(QuantizeMethodBase):
             per_block_cast_to_fp8 as legacy_per_block_cast_to_fp8,
         )
 
-        fp8_weight, scale = legacy_per_block_cast_to_fp8(weight, self.BLOCK)
+        logical_n, logical_k = weight.shape
+        padded_k = (logical_k + self.BLOCK - 1) // self.BLOCK * self.BLOCK
+        shard_names = getattr(layer, "shard_names", None)
+        num_shards = len(shard_names) if shard_names else 1
+
+        if num_shards > 1:
+            if logical_n % num_shards != 0:
+                raise ValueError(
+                    f"merged FP8 output {logical_n} is not divisible by "
+                    f"{num_shards} shards for {getattr(layer, 'prefix', '?')}"
+                )
+            shard_n = logical_n // num_shards
+            padded_shard_n = (shard_n + self.BLOCK - 1) // self.BLOCK * self.BLOCK
+            quant_shards = []
+            scale_shards = []
+            for shard in weight.chunk(num_shards, dim=0):
+                quant_shard, scale_shard = legacy_per_block_cast_to_fp8(
+                    shard, self.BLOCK
+                )
+                quant_shard = torch.nn.functional.pad(
+                    quant_shard,
+                    (0, padded_k - logical_k, 0, padded_shard_n - shard_n),
+                )
+                quant_shards.append(quant_shard)
+                scale_shards.append(scale_shard)
+            fp8_weight = torch.cat(quant_shards, dim=0)
+            scale = torch.cat(scale_shards, dim=0)
+            runtime_n = padded_shard_n * num_shards
+            logical_output_n = runtime_n
+        else:
+            fp8_weight, scale = legacy_per_block_cast_to_fp8(weight, self.BLOCK)
+            runtime_n = (logical_n + self.BLOCK - 1) // self.BLOCK * self.BLOCK
+            if runtime_n != logical_n or padded_k != logical_k:
+                fp8_weight = torch.nn.functional.pad(
+                    fp8_weight,
+                    (0, padded_k - logical_k, 0, runtime_n - logical_n),
+                )
+            logical_output_n = logical_n
+
+        expected_scale_shape = (
+            runtime_n // self.BLOCK,
+            padded_k // self.BLOCK,
+        )
+        if scale.shape != expected_scale_shape:
+            raise ValueError(
+                f"FP8 scale shape {tuple(scale.shape)} != {expected_scale_shape}"
+            )
 
         del layer.weight
         layer.register_parameter(
             "weight", nn.Parameter(fp8_weight.contiguous(), requires_grad=False)
         )
+        layer._fp8_logical_input_size = logical_k
+        layer._fp8_logical_output_size = logical_output_n
         del layer.weight_scale
         layer.register_parameter(
             "weight_scale",
@@ -821,9 +870,15 @@ class Fp8BlockOnlineLinearMethod(QuantizeMethodBase):
         input_2d = x.view(-1, x.shape[-1])
         if not input_2d.is_contiguous():
             input_2d = input_2d.contiguous()
-        M, K = input_2d.shape
-        N = layer.weight.shape[0]
-        output_shape = list(x.shape[:-1]) + [N]
+        M, logical_k = input_2d.shape
+        logical_n = getattr(layer, "_fp8_logical_output_size", layer.weight.shape[0])
+        padded_k = layer.weight.shape[1]
+        padded_n = layer.weight.shape[0]
+        if logical_k > padded_k:
+            raise ValueError(f"FP8 input K={logical_k} exceeds weight K={padded_k}")
+        if logical_k < padded_k:
+            input_2d = torch.nn.functional.pad(input_2d, (0, padded_k - logical_k))
+        output_shape = list(x.shape[:-1]) + [logical_n]
 
         # Online per-token-group activation quant (group_size=128).
         scale_ue8m0 = getattr(layer, "weight_scale", None) is not None and (
@@ -838,14 +893,30 @@ class Fp8BlockOnlineLinearMethod(QuantizeMethodBase):
             scale_ue8m0=scale_ue8m0,
         )
 
-        output = torch.empty(M, N, dtype=out_dtype, device=input_2d.device)
-        _resolve_fp8_gemm_nt()(
-            (qinput, x_scales),
-            (layer.weight, layer.weight_scale),
-            output,
-            c=None,
-            disable_ue8m0_cast=not scale_ue8m0,
-        )
+        output = torch.empty(M, padded_n, dtype=out_dtype, device=input_2d.device)
+        flashinfer_gemm = None
+        if M < 32 and not scale_ue8m0:
+            from rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_flashinfer_linear import (
+                _get_flashinfer_sm90_fp8_gemm,
+                is_sm90,
+            )
+
+            if is_sm90():
+                flashinfer_gemm = _get_flashinfer_sm90_fp8_gemm()
+        if flashinfer_gemm is not None:
+            flashinfer_gemm(
+                qinput, layer.weight, x_scales, layer.weight_scale, out=output
+            )
+        else:
+            _resolve_fp8_gemm_nt()(
+                (qinput, x_scales),
+                (layer.weight, layer.weight_scale),
+                output,
+                c=None,
+                disable_ue8m0_cast=not scale_ue8m0,
+            )
+
+        output = output[:, :logical_n]
 
         if not Fp8BlockOnlineLinearMethod._apply_logged:
             logger.info(
