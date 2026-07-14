@@ -343,8 +343,8 @@ class _BertNewLoaderBase(nn.Module):
             dropped,
         )
 
-    def _apply(self, fn):
-        super()._apply(fn)
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse=recurse)
         if self.weights is not None:
             self.weights = self._create_model_weights()
             self._add_custom_weights(self.weights)
