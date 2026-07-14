@@ -16,7 +16,12 @@ from rtp_llm.models_py.model_desc.module_base import GptModelBase
 from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 from rtp_llm.models_py.weight_mapper import WeightsMapper
-from rtp_llm.ops.compute_ops import LayerKVCache, PyModelInputs, PyModelOutputs
+from rtp_llm.ops.compute_ops import (
+    LayerKVCache,
+    PyModelInputs,
+    PyModelOutputs,
+    rtp_llm_ops,
+)
 
 
 class Qwen3MLP(RtpModule):
@@ -124,6 +129,26 @@ class Qwen3Attention(RtpModule):
         )
 
     def _apply_qk_norm(self, qkv: torch.Tensor) -> torch.Tensor:
+        if (
+            qkv.is_cuda
+            and qkv.dim() == 2
+            and getattr(torch.version, "hip", None) is not None
+        ):
+            qkv = qkv.contiguous()
+            m, n = qkv.shape
+            rtp_llm_ops.fused_qk_rmsnorm_v2(
+                qkv,
+                self.q_norm.weight.data,
+                self.k_norm.weight.data,
+                self.q_norm.eps,
+                self.num_heads_per_partition,
+                self.num_kv_heads_per_partition,
+                m,
+                n,
+                self.head_dim,
+            )
+            return qkv
+
         if qkv.is_cuda and qkv.dim() == 2:
             try:
                 import flashinfer

@@ -14,6 +14,20 @@ logger = logging.getLogger(__name__)
 _FP8_MIN_SCALE = 1e-12
 
 
+def _convert_e4m3fn_to_fnuz(
+    weight: torch.Tensor, scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match the legacy ROCm loader's lossless FP8 format conversion.
+
+    For an identical bit pattern, e4m3fnuz represents half the e4m3fn value,
+    so the scale must be doubled.  The e4m3fn negative-zero pattern (-128)
+    represents NaN in e4m3fnuz and is normalized to zero before the bitcast.
+    """
+    bits = weight.contiguous().view(torch.int8).clone()
+    bits[bits == -128] = 0
+    return bits.view(torch.float8_e4m3fnuz), scale.float() * 2.0
+
+
 def _runtime_fp8_dtype() -> torch.dtype:
     try:
         from rtp_llm.models_py.modules.factory.fused_moe.impl.rocm._utils import (
@@ -31,6 +45,12 @@ def _requant_per_tensor_to_runtime_fp8(
     runtime_dtype = _runtime_fp8_dtype()
     if weight.dtype == runtime_dtype:
         return weight.contiguous(), scale.view(1).contiguous()
+    if (
+        weight.dtype == torch.float8_e4m3fn
+        and runtime_dtype == torch.float8_e4m3fnuz
+    ):
+        converted, converted_scale = _convert_e4m3fn_to_fnuz(weight, scale)
+        return converted.contiguous(), converted_scale.view(1).contiguous()
 
     scale_scalar = scale.float().view(-1)[0]
     deq = weight.float() * scale_scalar
@@ -46,7 +66,14 @@ def _requant_per_channel_to_runtime_fp8(
     runtime_dtype = _runtime_fp8_dtype()
     scale_rows = scale.float().view(-1, 1)
     if weight.dtype == runtime_dtype:
-        return weight.contiguous(), scale_rows.view(1, -1).contiguous()
+        return weight.contiguous(), scale_rows.contiguous()
+
+    if (
+        weight.dtype == torch.float8_e4m3fn
+        and runtime_dtype == torch.float8_e4m3fnuz
+    ):
+        converted, converted_scale = _convert_e4m3fn_to_fnuz(weight, scale_rows)
+        return converted.contiguous(), converted_scale.contiguous()
 
     if scale_rows.shape[0] != weight.shape[0]:
         raise ValueError(
@@ -59,7 +86,38 @@ def _requant_per_channel_to_runtime_fp8(
         deq.abs().amax(dim=1, keepdim=True).clamp_min(_FP8_MIN_SCALE) / fp8_max
     )
     requant = (deq / new_scale).to(runtime_dtype)
-    return requant.contiguous(), new_scale.view(1, -1).to(torch.float32).contiguous()
+    return requant.contiguous(), new_scale.to(torch.float32).contiguous()
+
+
+def _is_hip_runtime() -> bool:
+    return getattr(torch.version, "hip", None) is not None
+
+
+def _shuffle_rocm_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
+    from aiter.ops.shuffle import shuffle_weight
+
+    return shuffle_weight(weight, layout=(16, 16))
+
+
+def _apply_rocm_fp8_per_channel(
+    input_2d: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    import aiter
+
+    from rtp_llm.models_py.kernels.rocm.fp8_kernel import rocm_per_token_quant_fp8
+
+    qinput, x_scale = rocm_per_token_quant_fp8(input_2d, eps=1e-10)
+    return aiter.gemm_a8w8_bpreshuffle(
+        qinput,
+        weight,
+        x_scale.to(torch.float32),
+        weight_scale,
+        None,
+        out_dtype,
+    )
 
 # Hoist kernel imports to module scope. apply() is on the per-token decode hot
 # path: doing the import inside apply() (even though sys.modules caches it)
@@ -560,9 +618,10 @@ class Fp8PerChannelLinearMethod(QuantizeMethodBase):
       - weight: float8_e4m3fn [N, K]
       - weight_scale: fp32 [N] or [N, 1]
 
-    Forward: torch._scaled_mm with online per-token activation quantization
-    (one fp32 scale per token-row of [M, K]), reusing
-    Fp8PerChannelOnlineLinearMethod's apply path.
+    On ROCm, forward uses the same AITer per-token quantization, shuffled
+    weight layout and gemm_a8w8_bpreshuffle kernel as the legacy loader.  This
+    is required for old/new loader numerical parity.  Other platforms use
+    torch._scaled_mm.
     """
 
     # Class-level flag: the diagnostic log fires at most once across ALL
@@ -594,10 +653,12 @@ class Fp8PerChannelLinearMethod(QuantizeMethodBase):
     def process_weights_after_loading(self, layer):
         # ckpt scale may arrive as [N] or [N, 1]. ROCm fp8 kernels expect the
         # platform runtime dtype (e4m3fnuz on MI308X), so convert already-FP8
-        # checkpoint weights once after loading and store scale as [1, N].
+        # checkpoint weights once after loading and store scale as [N, 1].
         fp8_weight, scale = _requant_per_channel_to_runtime_fp8(
             layer.weight.data, layer.weight_scale.data
         )
+        if _is_hip_runtime():
+            fp8_weight = _shuffle_rocm_fp8_weight(fp8_weight)
         del layer.weight
         layer.register_parameter(
             "weight", nn.Parameter(fp8_weight, requires_grad=False)
@@ -612,21 +673,19 @@ class Fp8PerChannelLinearMethod(QuantizeMethodBase):
         self, layer, x: torch.Tensor, bias: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         out_dtype = x.dtype
-        input_2d = x.view(-1, x.shape[-1])
+        input_2d = x.reshape(-1, x.shape[-1])
         if not input_2d.is_contiguous():
             input_2d = input_2d.contiguous()
         N = layer.weight.shape[0]
         output_shape = list(x.shape[:-1]) + [N]
 
-        qinput, x_scale = _resolve_per_token_quant()(input_2d)
-        # weight_scale was already shaped [1, N] contiguous in
-        # process_weights_after_loading — use it directly.
-        weight_scale_b = layer.weight_scale
-
         if not Fp8PerChannelLinearMethod._apply_logged:
             logger.info(
-                "[Fp8PerChannelLinearMethod] FIRST forward via torch._scaled_mm: "
+                "[Fp8PerChannelLinearMethod] FIRST forward via %s: "
                 "prefix=%r, x.shape=%s, weight.shape=%s, weight_scale.shape=%s",
+                "AITer gemm_a8w8_bpreshuffle"
+                if _is_hip_runtime()
+                else "torch._scaled_mm",
                 getattr(layer, "prefix", "?"),
                 tuple(x.shape),
                 tuple(layer.weight.shape),
@@ -634,16 +693,27 @@ class Fp8PerChannelLinearMethod(QuantizeMethodBase):
             )
             Fp8PerChannelLinearMethod._apply_logged = True
 
-        output = torch._scaled_mm(
-            qinput,
-            layer.weight.t(),
-            scale_a=x_scale,
-            scale_b=weight_scale_b,
-            bias=bias,
-            out_dtype=out_dtype,
-        )
-        if isinstance(output, tuple):
-            output = output[0]
+        if _is_hip_runtime():
+            output = _apply_rocm_fp8_per_channel(
+                input_2d,
+                layer.weight,
+                layer.weight_scale,
+                out_dtype,
+            )
+            if bias is not None:
+                output = output + bias.to(output.dtype)
+        else:
+            qinput, x_scale = _resolve_per_token_quant()(input_2d)
+            output = torch._scaled_mm(
+                qinput,
+                layer.weight.t(),
+                scale_a=x_scale,
+                scale_b=layer.weight_scale.t().contiguous(),
+                bias=bias,
+                out_dtype=out_dtype,
+            )
+            if isinstance(output, tuple):
+                output = output[0]
         return output.view(*output_shape)
 
 

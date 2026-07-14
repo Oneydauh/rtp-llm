@@ -14,6 +14,8 @@ tests are gated by `torch.cuda.is_available()`. Layer-level load_weights
 routing tests run on CPU.
 """
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -24,6 +26,10 @@ from rtp_llm.models_py.layers.linear import (
     RowParallelLinear,
 )
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
+from rtp_llm.models_py.quant_methods.fp8 import (
+    Fp8PerChannelLinearMethod,
+    _convert_e4m3fn_to_fnuz,
+)
 
 
 def _make_qc(quant_type: str) -> QuantizationConfig:
@@ -67,6 +73,20 @@ class TestFp8PerTensorLoad(unittest.TestCase):
 
 class TestFp8PerChannelLoad(unittest.TestCase):
     """Already-quantized FP8 per-channel (compressed/Quark) -> {Col,Row}Parallel."""
+
+    def test_e4m3fn_to_fnuz_matches_legacy_bit_conversion(self):
+        source_bits = torch.tensor([-128, -1, 0, 1, 127], dtype=torch.int8)
+        weight = source_bits.view(torch.float8_e4m3fn)
+        scale = torch.tensor([[0.5]], dtype=torch.float32)
+
+        converted, converted_scale = _convert_e4m3fn_to_fnuz(weight, scale)
+
+        self.assertEqual(converted.dtype, torch.float8_e4m3fnuz)
+        torch.testing.assert_close(
+            converted.view(torch.int8),
+            torch.tensor([0, -1, 0, 1, 127], dtype=torch.int8),
+        )
+        torch.testing.assert_close(converted_scale, torch.tensor([[1.0]]))
 
     def test_load_into_column_parallel_normalize_1d_scale(self):
         N, K = 16, 32
@@ -128,6 +148,62 @@ class TestFp8PerChannelLoad(unittest.TestCase):
 
         self.assertEqual(layer.weight.shape, (N, K // tp))
         self.assertEqual(layer.weight_scale.shape, (N, 1))
+
+    def test_rocm_process_preshuffles_weight(self):
+        N, K = 16, 32
+        layer = ColumnParallelLinear(
+            input_size=K,
+            output_size=N,
+            quant_config=_make_qc("fp8_per_channel"),
+            prefix="test",
+            params_dtype=torch.bfloat16,
+        )
+        weight = torch.zeros(N, K, dtype=torch.float8_e4m3fn)
+        scale = torch.ones(N, 1, dtype=torch.float32)
+        layer.load_weights({"test.weight": weight, "test.weight_scale": scale})
+
+        with mock.patch(
+            "rtp_llm.models_py.quant_methods.fp8._is_hip_runtime",
+            return_value=True,
+        ), mock.patch(
+            "rtp_llm.models_py.quant_methods.fp8._runtime_fp8_dtype",
+            return_value=torch.float8_e4m3fn,
+        ), mock.patch(
+            "rtp_llm.models_py.quant_methods.fp8._shuffle_rocm_fp8_weight",
+            side_effect=lambda tensor: tensor.contiguous(),
+        ) as shuffle:
+            layer.process_weights_after_loading()
+
+        shuffle.assert_called_once()
+        self.assertEqual(layer.weight_scale.shape, (N, 1))
+
+    def test_rocm_apply_uses_legacy_aiter_ptpc_path(self):
+        N, K = 16, 32
+        method = Fp8PerChannelLinearMethod()
+        layer = SimpleNamespace(
+            weight=torch.zeros(N, K, dtype=torch.float8_e4m3fn),
+            weight_scale=torch.ones(N, 1, dtype=torch.float32),
+            prefix="test",
+        )
+        x = torch.randn(2, K, dtype=torch.bfloat16)
+        expected = torch.randn(2, N, dtype=torch.bfloat16)
+
+        with mock.patch(
+            "rtp_llm.models_py.quant_methods.fp8._is_hip_runtime",
+            return_value=True,
+        ), mock.patch(
+            "rtp_llm.models_py.quant_methods.fp8._apply_rocm_fp8_per_channel",
+            return_value=expected,
+        ) as rocm_apply:
+            actual = method.apply(layer, x)
+
+        rocm_apply.assert_called_once()
+        args = rocm_apply.call_args.args
+        torch.testing.assert_close(args[0], x)
+        self.assertIs(args[1], layer.weight)
+        self.assertIs(args[2], layer.weight_scale)
+        self.assertEqual(args[3], torch.bfloat16)
+        torch.testing.assert_close(actual, expected)
 
 
 class TestMergedColumnPerChannelScale(unittest.TestCase):
