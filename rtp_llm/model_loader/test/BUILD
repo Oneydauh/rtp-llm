@@ -47,3 +47,9 @@ py_test(
         'gpu': 'MI308X-ROCM7',
     },
 )
+
+py_test(
+    name = "test_new_loader_config_forwarding",
+    srcs = ["test_new_loader_config_forwarding.py"],
+    deps = py_test_deps + ["//rtp_llm:rtp_llm_lib"],
+)

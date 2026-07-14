@@ -325,7 +325,10 @@ class BaseModel(object):
             compute_dtype=self.model_config.compute_dtype,
             device=device_str,
             parallelism_config=self.parallelism_config,
-            fmha_config=getattr(self.hw_kernel_config, "fmha_config", None),
+            # FMHAConfig is an independent runtime config.  Do not read it
+            # from HWKernelConfig: doing so silently passes None and makes the
+            # attention factory ignore use_asm_pa/use_triton_pa filtering.
+            fmha_config=self.fmha_config,
             device_resource_config=self.device_resource_config,
             moe_config=self.moe_config,
             force_cpu_load_weights=self.force_cpu_load_weights,
