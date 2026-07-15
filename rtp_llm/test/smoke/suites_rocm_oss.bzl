@@ -11,7 +11,7 @@ def rocm_oss_suites():
             smoke_test(
                 name="rocm_basic_qwen25_0_5b_tp1_newloader",
                 task_info="data/model/qwen25/q_r_s_fp16.json",
-                smoke_args="--seq_size_per_block 16 --use_aiter_pa 1 --use_asm_pa 1 --disable_flash_infer 1 --act_type FP16",
+                smoke_args="--seq_size_per_block 16 --use_aiter_pa 1 --use_asm_pa 1 --use_triton_pa 1 --disable_flash_infer 1 --act_type FP16",
                 gpu_type=["MI308X-ROCM7"],
             ),
             smoke_test(

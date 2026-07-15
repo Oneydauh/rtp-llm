@@ -1718,7 +1718,9 @@ class AiterDecodeImplAsm(AiterDecodeImplBase):
     def support(
         cls, attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs
     ) -> bool:
-        return True
+        # AITer's ASM decode pa_fwd only accepts head_size=128 and aborts the
+        # process for head_size=64 instead of reporting unsupported.
+        return attn_configs.size_per_head == 128
 
     def forward(
         self,

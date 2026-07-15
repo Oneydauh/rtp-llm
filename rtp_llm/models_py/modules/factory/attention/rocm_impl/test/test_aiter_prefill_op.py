@@ -36,6 +36,7 @@ except ImportError:
 
 try:
     from rtp_llm.models_py.modules.factory.attention.rocm_impl.aiter import (
+        AiterDecodeImplAsm,
         AiterPrefillAttnOp,
         AiterPrefillAttnOpPaged,
         AiterPrefillImplAsm,
@@ -1280,6 +1281,20 @@ class TestAiterPrefillImplNoKvRopeRealOp(unittest.TestCase):
 
     def test_nonasm_no_kv_rope_real_op_matches_reference(self):
         self._check_real_no_kv_rope_path(AiterPrefillImplNonAsm)
+
+
+@unittest.skipUnless(_OPS_IMPORTABLE, "Requires ROCm attention wrapper module")
+class TestAiterAsmDecodeHeadSizeSupport(unittest.TestCase):
+
+    def test_decode_asm_rejects_head_size_64(self):
+        cfg = _make_attn_configs(head_num=14, head_num_kv=2, head_dim=64)
+        self.assertTrue(AiterPrefillImplAsm.support(cfg, None))
+        self.assertFalse(AiterDecodeImplAsm.support(cfg, None))
+
+    def test_decode_asm_accepts_head_size_128(self):
+        cfg = _make_attn_configs(head_num=8, head_num_kv=2, head_dim=128)
+        self.assertTrue(AiterPrefillImplAsm.support(cfg, None))
+        self.assertTrue(AiterDecodeImplAsm.support(cfg, None))
 
 
 if __name__ == "__main__":
