@@ -783,16 +783,27 @@ class Fp8BlockOnlineLinearMethod(QuantizeMethodBase):
         num_shards = len(shard_names) if shard_names else 1
 
         if num_shards > 1:
-            if logical_n % num_shards != 0:
+            if hasattr(layer, "q_size") and hasattr(layer, "kv_size"):
+                shard_sizes = [layer.q_size, layer.kv_size, layer.kv_size]
+            elif logical_n % num_shards == 0:
+                shard_sizes = [logical_n // num_shards] * num_shards
+            else:
                 raise ValueError(
-                    f"merged FP8 output {logical_n} is not divisible by "
-                    f"{num_shards} shards for {getattr(layer, 'prefix', '?')}"
+                    f"cannot infer FP8 shard sizes for merged output {logical_n} "
+                    f"with {num_shards} shards in {getattr(layer, 'prefix', '?')}"
                 )
-            shard_n = logical_n // num_shards
-            padded_shard_n = (shard_n + self.BLOCK - 1) // self.BLOCK * self.BLOCK
+            if len(shard_sizes) != num_shards or sum(shard_sizes) != logical_n:
+                raise ValueError(
+                    f"FP8 shard sizes {shard_sizes} do not match merged output "
+                    f"{logical_n} in {getattr(layer, 'prefix', '?')}"
+                )
             quant_shards = []
             scale_shards = []
-            for shard in weight.chunk(num_shards, dim=0):
+            runtime_shard_sizes = []
+            for shard, shard_n in zip(
+                torch.split(weight, shard_sizes, dim=0), shard_sizes
+            ):
+                padded_shard_n = (shard_n + self.BLOCK - 1) // self.BLOCK * self.BLOCK
                 quant_shard, scale_shard = legacy_per_block_cast_to_fp8(
                     shard, self.BLOCK
                 )
@@ -802,9 +813,10 @@ class Fp8BlockOnlineLinearMethod(QuantizeMethodBase):
                 )
                 quant_shards.append(quant_shard)
                 scale_shards.append(scale_shard)
+                runtime_shard_sizes.append(padded_shard_n)
             fp8_weight = torch.cat(quant_shards, dim=0)
             scale = torch.cat(scale_shards, dim=0)
-            runtime_n = padded_shard_n * num_shards
+            runtime_n = sum(runtime_shard_sizes)
             logical_output_n = runtime_n
         else:
             fp8_weight, scale = legacy_per_block_cast_to_fp8(weight, self.BLOCK)

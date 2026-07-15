@@ -35,6 +35,9 @@ class Qwen3VLForCausalLM(Qwen3ForCausalLM):
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
         input_ids = inputs.input_ids
+        position_ids = inputs.combo_position_ids
+        token_type_ids = inputs.embedding_inputs.combo_tokens_type_ids
+        text_tokens_mask = inputs.embedding_inputs.text_tokens_mask
 
         mm = inputs.multimodal_inputs
         mm_features = mm.multimodal_features
@@ -47,7 +50,9 @@ class Qwen3VLForCausalLM(Qwen3ForCausalLM):
             else []
         )
 
-        inputs_embeds = self.embed_tokens(input_ids)
+        inputs_embeds = self.embed_tokens(
+            input_ids, position_ids, token_type_ids, text_tokens_mask
+        )
         hidden_states = self.multimodal_embedding_injector(
             inputs_embeds, mm_features, mm_feature_locs
         )

@@ -35,6 +35,11 @@ import torch.nn.functional as F
 
 from rtp_llm.models_py.module_base import RtpModule
 
+try:
+    from flash_attn import flash_attn_varlen_func
+except ImportError:
+    flash_attn_varlen_func = None
+
 
 class Qwen3VLVisionPatchEmbed(RtpModule):
     def __init__(
@@ -143,19 +148,33 @@ class Qwen3VLVisionAttention(RtpModule):
             cos, sin = emb.cos(), emb.sin()
             q, k = _apply_rotary_pos_emb_vision(q, k, cos, sin)
 
-        # Block-diagonal full attention per image/frame via cu_seqlens.
-        attn_mask = torch.zeros(
-            (1, seq_len, seq_len), dtype=torch.bool, device=x.device
-        )
-        for i in range(1, len(cu_seqlens)):
-            s, e = int(cu_seqlens[i - 1]), int(cu_seqlens[i])
-            attn_mask[..., s:e, s:e] = True
-
-        q = q.transpose(0, 1).unsqueeze(0)  # [1, heads, seq, head_dim]
-        k = k.transpose(0, 1).unsqueeze(0)
-        v = v.transpose(0, 1).unsqueeze(0)
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        out = out.squeeze(0).transpose(0, 1).reshape(seq_len, -1)
+        if flash_attn_varlen_func is not None:
+            max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+            out = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+            ).reshape(seq_len, -1)
+        else:
+            q = q.transpose(0, 1).unsqueeze(0)
+            k = k.transpose(0, 1).unsqueeze(0)
+            v = v.transpose(0, 1).unsqueeze(0)
+            lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+            q_chunks, k_chunks, v_chunks = (
+                torch.split(tensor, lengths, dim=2) for tensor in (q, k, v)
+            )
+            out = torch.cat(
+                [
+                    F.scaled_dot_product_attention(qc, kc, vc)
+                    for qc, kc, vc in zip(q_chunks, k_chunks, v_chunks)
+                ],
+                dim=2,
+            )
+            out = out.squeeze(0).transpose(0, 1).reshape(seq_len, -1)
         return self.proj(out)
 
 
@@ -189,8 +208,8 @@ class Qwen3VLVisionBlock(RtpModule):
         params_dtype: torch.dtype,
     ):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, dtype=params_dtype)
-        self.norm2 = nn.LayerNorm(hidden_size, dtype=params_dtype)
+        self.norm1 = nn.LayerNorm(hidden_size, eps=1e-6, dtype=params_dtype)
+        self.norm2 = nn.LayerNorm(hidden_size, eps=1e-6, dtype=params_dtype)
         self.attn = Qwen3VLVisionAttention(hidden_size, num_heads, params_dtype)
         self.mlp = Qwen3VLVisionMLP(hidden_size, intermediate_size, params_dtype)
 
@@ -226,7 +245,7 @@ class Qwen3VLVisionPatchMerger(RtpModule):
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.use_postshuffle_norm = use_postshuffle_norm
         norm_dim = self.hidden_size if use_postshuffle_norm else context_dim
-        self.norm = nn.LayerNorm(norm_dim, dtype=params_dtype)
+        self.norm = nn.LayerNorm(norm_dim, eps=1e-6, dtype=params_dtype)
         self.linear_fc1 = nn.Linear(
             self.hidden_size, self.hidden_size, bias=True, dtype=params_dtype
         )
@@ -240,7 +259,7 @@ class Qwen3VLVisionPatchMerger(RtpModule):
         else:
             x = self.norm(x).view(-1, self.hidden_size)
         x = self.linear_fc1(x)
-        x = F.gelu(x, approximate="tanh")
+        x = F.gelu(x)
         return self.linear_fc2(x)
 
 
@@ -280,6 +299,7 @@ class Qwen3VLVisionTransformer(RtpModule):
         self.pos_embed = nn.Embedding(
             self.num_position_embeddings, hidden_size, dtype=params_dtype
         )
+        self.num_grid_per_side = int(self.num_position_embeddings**0.5)
         head_dim = hidden_size // num_heads
         self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(head_dim // 2)
 
@@ -313,6 +333,12 @@ class Qwen3VLVisionTransformer(RtpModule):
                 for _ in range(len(self.deepstack_visual_indexes))
             ]
         )
+
+    def process_weights_after_loading(self):
+        # Preserve the established multimodal output contract: the legacy VIT
+        # loader installs checkpoint tensors through FP16 before compute dtype.
+        for parameter in self.parameters():
+            parameter.data.copy_(parameter.data.to(torch.float16).to(parameter.dtype))
 
     @property
     def dtype(self) -> torch.dtype:
@@ -370,23 +396,72 @@ class Qwen3VLVisionTransformer(RtpModule):
         return rotary
 
     def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        """Bicubic-interpolate the learned ``num_position_embeddings`` grid to
-        each image's (h, w), following HF's Qwen3-VL implementation."""
-        num_grid = int(self.num_position_embeddings**0.5)
-        pos_embed = self.pos_embed.weight  # [num_pos, hidden]
-        outputs = []
-        m = self.spatial_merge_size
-        for t, h, w in grid_thw:
-            t, h, w = int(t), int(h), int(w)
-            pe = pos_embed.reshape(1, num_grid, num_grid, -1).permute(0, 3, 1, 2)
-            pe = F.interpolate(
-                pe.float(), size=(h, w), mode="bicubic", align_corners=False
+        grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
+
+        idx_list = [[] for _ in range(4)]
+        weight_list = [[] for _ in range(4)]
+        device = self.pos_embed.weight.device
+        dtype = self.pos_embed.weight.dtype
+
+        for _t, h, w in zip(grid_ts, grid_hs, grid_ws):
+            h = int(h)
+            w = int(w)
+            h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
+            w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
+
+            h_idxs_floor = h_idxs.int()
+            w_idxs_floor = w_idxs.int()
+            h_idxs_ceil = (h_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+            w_idxs_ceil = (w_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+
+            dh = h_idxs - h_idxs_floor
+            dw = w_idxs - w_idxs_floor
+
+            base_h = h_idxs_floor * self.num_grid_per_side
+            base_h_ceil = h_idxs_ceil * self.num_grid_per_side
+
+            indices = [
+                (base_h[None].T + w_idxs_floor[None]).flatten(),
+                (base_h[None].T + w_idxs_ceil[None]).flatten(),
+                (base_h_ceil[None].T + w_idxs_floor[None]).flatten(),
+                (base_h_ceil[None].T + w_idxs_ceil[None]).flatten(),
+            ]
+
+            weights = [
+                ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
+                ((1 - dh)[None].T * dw[None]).flatten(),
+                (dh[None].T * (1 - dw)[None]).flatten(),
+                (dh[None].T * dw[None]).flatten(),
+            ]
+
+            for i in range(4):
+                idx_list[i].extend(indices[i].tolist())
+                weight_list[i].extend(weights[i].tolist())
+
+        idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
+        weight_tensor = torch.tensor(weight_list, dtype=dtype, device=device)
+        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
+        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+        patch_pos_embeds = patch_pos_embeds.split(
+            [int(h) * int(w) for h, w in zip(grid_hs, grid_ws)]
+        )
+
+        patch_pos_embeds_permute = []
+        merge_size = self.spatial_merge_size
+        for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
+            t = int(t)
+            h = int(h)
+            w = int(w)
+            pos_embed = pos_embed.repeat(t, 1)
+            pos_embed = (
+                pos_embed.view(
+                    t, h // merge_size, merge_size, w // merge_size, merge_size, -1
+                )
+                .permute(0, 1, 3, 2, 4, 5)
+                .flatten(0, 4)
             )
-            pe = pe.permute(0, 2, 3, 1).reshape(h, w, -1)
-            pe = pe.reshape(h // m, m, w // m, m, -1).permute(0, 2, 1, 3, 4)
-            pe = pe.reshape(-1, pe.shape[-1]).repeat(t, 1)
-            outputs.append(pe)
-        return torch.cat(outputs, dim=0).to(pos_embed.dtype)
+            patch_pos_embeds_permute.append(pos_embed)
+        return torch.cat(patch_pos_embeds_permute)
 
     # ---- forward ------------------------------------------------------------
     def forward(

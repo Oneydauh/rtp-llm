@@ -296,6 +296,19 @@ class BaseModel(object):
             self.custom_module.init(self.weight)
 
     def _use_new_loader(self) -> bool:
+        eplb_config = getattr(self.model_config, "eplb_config", None)
+        redundant_expert = (
+            getattr(eplb_config, "redundant_expert", 0)
+            if eplb_config is not None
+            else 0
+        )
+        if redundant_expert > 0:
+            logging.warning(
+                "NewModelLoader does not support redundant experts yet "
+                "(redundant_expert=%d); falling back to the legacy loader",
+                redundant_expert,
+            )
+            return False
         if os.environ.get("USE_NEW_LOADER", "0") == "1":
             return True
         if (

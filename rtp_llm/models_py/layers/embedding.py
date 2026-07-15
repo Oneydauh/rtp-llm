@@ -58,16 +58,27 @@ class VocabParallelEmbedding(nn.Module):
         token_types: Optional[torch.Tensor] = None,
         text_tokens_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if text_tokens_mask is not None:
+            text_mask = text_tokens_mask.to(device=input_ids.device, dtype=torch.bool)
+            safe_input_ids = torch.where(text_mask, input_ids, 0)
+        else:
+            text_mask = None
+            safe_input_ids = input_ids
+
         if self.tp_size > 1:
-            mask = (input_ids >= self.vocab_start_idx) & (
-                input_ids < self.vocab_end_idx
+            mask = (safe_input_ids >= self.vocab_start_idx) & (
+                safe_input_ids < self.vocab_end_idx
             )
-            masked_ids = (input_ids - self.vocab_start_idx) * mask
+            if text_mask is not None:
+                mask = mask & text_mask
+            masked_ids = (safe_input_ids - self.vocab_start_idx) * mask
             output = torch.nn.functional.embedding(masked_ids, self.weight)
             output = output * mask.unsqueeze(-1)
             output = all_reduce(output, group=Group.TP)
         else:
-            output = torch.nn.functional.embedding(input_ids, self.weight)
+            output = torch.nn.functional.embedding(safe_input_ids, self.weight)
+            if text_mask is not None:
+                output = output * text_mask.unsqueeze(-1)
         return output
 
 

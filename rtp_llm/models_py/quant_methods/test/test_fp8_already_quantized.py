@@ -566,6 +566,66 @@ class TestFp8BlockLoad(unittest.TestCase):
             layer.weight_scale[q_blocks + kv_blocks :], v_scale, rtol=0, atol=0
         )
 
+    def test_qkv_tp2_square_q_weight_keeps_output_row_layout(self):
+        hidden = 256
+        head_dim = 128
+        num_heads = 2
+        num_kv_heads = 2
+
+        def row_pattern(rows, offset):
+            values = (torch.arange(rows) % 16 + offset).view(rows, 1)
+            return values.expand(rows, hidden).to(torch.float8_e4m3fn)
+
+        q_w = row_pattern(num_heads * head_dim, 1)
+        k_w = row_pattern(num_kv_heads * head_dim, 33)
+        v_w = row_pattern(num_kv_heads * head_dim, 65)
+        q_scale = torch.arange(4, dtype=torch.float32).view(2, 2) + 1
+        k_scale = q_scale + 10
+        v_scale = q_scale + 20
+
+        for rank in range(2):
+            layer = QKVParallelLinear(
+                hidden_size=hidden,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                tp_size=2,
+                tp_rank=rank,
+                quant_config=_make_qc("fp8_block"),
+                prefix="qkv_proj",
+                params_dtype=torch.bfloat16,
+            )
+            layer.load_weights(
+                {
+                    "qkv_proj.q_proj.weight": q_w,
+                    "qkv_proj.q_proj.weight_scale_inv": q_scale,
+                    "qkv_proj.k_proj.weight": k_w,
+                    "qkv_proj.k_proj.weight_scale_inv": k_scale,
+                    "qkv_proj.v_proj.weight": v_w,
+                    "qkv_proj.v_proj.weight_scale_inv": v_scale,
+                }
+            )
+
+            start = rank * head_dim
+            expected_weight = torch.cat(
+                [
+                    q_w[start : start + head_dim],
+                    k_w[start : start + head_dim],
+                    v_w[start : start + head_dim],
+                ]
+            )
+            expected_scale = torch.cat(
+                [
+                    q_scale[rank : rank + 1],
+                    k_scale[rank : rank + 1],
+                    v_scale[rank : rank + 1],
+                ]
+            )
+            torch.testing.assert_close(layer.weight, expected_weight, rtol=0, atol=0)
+            torch.testing.assert_close(
+                layer.weight_scale_inv, expected_scale, rtol=0, atol=0
+            )
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA + DeepGEMM")
 class TestFp8BlockForward(unittest.TestCase):

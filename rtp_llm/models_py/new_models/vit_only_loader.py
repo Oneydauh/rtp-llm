@@ -88,13 +88,19 @@ def build_new_loader_vit(
                 yield name[n:], tensor
 
     wrapper.load_weights(_visual_iter())
+    hook_count = 0
+    for module in wrapper.modules():
+        if hasattr(module, "process_weights_after_loading"):
+            module.process_weights_after_loading()
+            hook_count += 1
     wrapper.to(device)
     logger.info(
         "[vit_only_loader] new-loader vit loaded "
-        "(model_type=%s, prefix=%s, device=%s)",
+        "(model_type=%s, prefix=%s, device=%s, post_load_hooks=%d)",
         model_type,
         prefix,
         device,
+        hook_count,
     )
     return getattr(wrapper, "vit", wrapper)
 
