@@ -1,4 +1,12 @@
 py_test(
+    name = "test_unquantized",
+    srcs = ["test_unquantized.py"],
+    deps = [
+        "//rtp_llm/models_py/standalone:py_standalone_testlib",
+    ],
+)
+
+py_test(
     name = "test_fp8_already_quantized",
     srcs = ["test_fp8_already_quantized.py"],
     deps = [

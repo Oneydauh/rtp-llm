@@ -33,7 +33,21 @@ class UnquantizedLinearMethod(QuantizeMethodBase):
         return torch.nn.functional.linear(x, layer.weight, bias)
 
     def process_weights_after_loading(self, layer):
-        pass
+        weight = layer.weight
+        if weight.ndim != 2 or weight.stride() == (1, weight.shape[0]):
+            return
+
+        # Keep the logical [out_features, in_features] shape expected by
+        # F.linear, but match the legacy loader's transpose-view layout.  On
+        # ROCm, contiguous and transpose-view BF16 weights can select kernels
+        # with different accumulation order and produce different smoke-test
+        # results even though their values are identical.
+        transposed_storage = weight.detach().T.contiguous()
+        transpose_view = transposed_storage.T
+        with torch.no_grad():
+            # Preserve the Parameter object so any references held by the
+            # module/loader remain valid.
+            weight.set_(transpose_view)
 
 
 @register_moe_quant_method("none", "")
