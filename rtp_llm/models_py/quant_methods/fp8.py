@@ -906,27 +906,17 @@ class Fp8BlockOnlineLinearMethod(QuantizeMethodBase):
         )
 
         output = torch.empty(M, padded_n, dtype=out_dtype, device=input_2d.device)
-        flashinfer_gemm = None
-        if M < 32 and not scale_ue8m0:
-            from rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_flashinfer_linear import (
-                _get_flashinfer_sm90_fp8_gemm,
-                is_sm90,
-            )
-
-            if is_sm90():
-                flashinfer_gemm = _get_flashinfer_sm90_fp8_gemm()
-        if flashinfer_gemm is not None:
-            flashinfer_gemm(
-                qinput, layer.weight, x_scales, layer.weight_scale, out=output
-            )
-        else:
-            _resolve_fp8_gemm_nt()(
-                (qinput, x_scales),
-                (layer.weight, layer.weight_scale),
-                output,
-                c=None,
-                disable_ue8m0_cast=not scale_ue8m0,
-            )
+        # Keep runtime selection aligned with the legacy FP8_PER_BLOCK linear,
+        # which uses DeepGEMM for both prefill and decode. Switching only the
+        # M < 32 decode path to FlashInfer changes accumulation enough to make
+        # old/new loader outputs diverge despite byte-identical weights.
+        _resolve_fp8_gemm_nt()(
+            (qinput, x_scales),
+            (layer.weight, layer.weight_scale),
+            output,
+            c=None,
+            disable_ue8m0_cast=not scale_ue8m0,
+        )
 
         output = output[:, :logical_n]
 

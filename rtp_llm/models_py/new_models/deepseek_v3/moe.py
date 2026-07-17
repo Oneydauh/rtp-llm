@@ -26,6 +26,7 @@ from rtp_llm.models_py.layers.linear import (
 from rtp_llm.models_py.layers.moe_experts import BaseMoEExperts
 from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.modules import GroupTopK, SelectTopk
+from rtp_llm.models_py.modules.base import FusedSiluAndMul
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 
 
@@ -107,6 +108,7 @@ class DeepSeekV32SharedExpertMLP(RtpModule):
         super().__init__()
         self.tp_size = tp_size
         self.hidden_size = hidden_size
+        self.act_fn = FusedSiluAndMul()
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=hidden_size,
             output_size=2 * intermediate_size,
@@ -131,8 +133,7 @@ class DeepSeekV32SharedExpertMLP(RtpModule):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)
-        gate, up = gate_up.chunk(2, dim=-1)
-        x = torch.nn.functional.silu(gate) * up
+        x = self.act_fn(gate_up)
         x = self.down_proj(x)
         return x
 
@@ -267,7 +268,7 @@ class DeepSeekV32MoEBlock(RtpModule):
 
         if self.shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
-            if self.tp_size > 1 and self.ep_size > 1:
+            if self.tp_size > 1:
                 shared_output = all_reduce(shared_output, group=Group.TP)
             experts_output = experts_output + shared_output
 

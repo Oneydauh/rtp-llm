@@ -23,9 +23,10 @@ from rtp_llm.models_py.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from rtp_llm.models_py.layers.norm import LayerNorm, RMSNorm
+from rtp_llm.models_py.layers.norm import LayerNorm, RMSNorm, RMSResNorm
 from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.modules import IndexerOp
+from rtp_llm.models_py.modules.base import FusedSiluAndMul
 from rtp_llm.models_py.modules.factory.attention.attn_factory import MlaImplBase
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 from rtp_llm.ops.compute_ops import LayerKVCache
@@ -286,6 +287,16 @@ class DeepSeekV32DenseMLP(RtpModule):
     ):
         super().__init__()
         self.tp_size = tp_size
+        self.intermediate_size = intermediate_size
+        quant_type = getattr(quant_config, "quant_type", "none")
+        if quant_type.startswith("fp8_block"):
+            block_size = getattr(quant_config, "weight_block_size", [128, 128])[0]
+            align_size = tp_size * block_size
+            intermediate_size = (
+                (intermediate_size + align_size - 1) // align_size * align_size
+            )
+        self.padded_intermediate_size = intermediate_size
+        self.act_fn = FusedSiluAndMul()
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=hidden_size,
             output_size=2 * intermediate_size,
@@ -308,10 +319,23 @@ class DeepSeekV32DenseMLP(RtpModule):
             params_dtype=params_dtype,
         )
 
+    def load_weights(self, weights):
+        """Pad dense FFN tensors before TP splitting, as the legacy loader does."""
+        items = weights.items() if isinstance(weights, dict) else weights
+        pad_size = self.padded_intermediate_size - self.intermediate_size
+        for name, tensor in items:
+            if pad_size > 0 and name in (
+                "gate_proj.weight",
+                "up_proj.weight",
+            ):
+                tensor = torch.nn.functional.pad(tensor, (0, 0, 0, pad_size))
+            elif pad_size > 0 and name == "down_proj.weight":
+                tensor = torch.nn.functional.pad(tensor, (0, pad_size, 0, 0))
+            super().load_weights({name: tensor})
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)
-        gate, up = gate_up.chunk(2, dim=-1)
-        x = torch.nn.functional.silu(gate) * up
+        x = self.act_fn(gate_up)
         x = self.down_proj(x)
         if self.tp_size > 1:
             x = all_reduce(x, group=Group.TP)
@@ -369,7 +393,7 @@ class DeepSeekV32DecoderLayer(RtpModule):
         self.is_sparse = is_sparse
         self.q_lora_rank = q_lora_rank
 
-        self.input_layernorm = RMSNorm(
+        self.input_layernorm = RMSResNorm(
             hidden_size, eps=layernorm_eps, params_dtype=params_dtype
         )
         self.self_attn = DeepSeekV32MlaAttention(
@@ -387,7 +411,7 @@ class DeepSeekV32DecoderLayer(RtpModule):
             params_dtype=params_dtype,
             layernorm_eps=layernorm_eps,
         )
-        self.post_attention_layernorm = RMSNorm(
+        self.post_attention_layernorm = RMSResNorm(
             hidden_size, eps=layernorm_eps, params_dtype=params_dtype
         )
 
@@ -462,26 +486,21 @@ class DeepSeekV32DecoderLayer(RtpModule):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor,
         fmha_impl: Any,
         kv_cache: Optional[LayerKVCache] = None,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         # self_attn.forward owns the sparse Indexer call internally,
         # mirroring legacy MlaAttention (modules/hybrid/mla_attention.py).
         attn_output = self.self_attn(hidden_states, fmha_impl, kv_cache)
-        hidden_states = residual + attn_output
+        hidden_states = attn_output
 
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         if isinstance(self.mlp, DeepSeekV32MoEBlock):
             hidden_states = self.mlp(hidden_states)
-            if self.mlp.ep_size <= 1 and self.mlp.tp_size > 1:
-                hidden_states = all_reduce(hidden_states, group=Group.TP)
         else:
             hidden_states = self.mlp(hidden_states)
 
-        hidden_states = residual + hidden_states
-        return hidden_states
+        return hidden_states, residual

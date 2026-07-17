@@ -353,6 +353,7 @@ class ModelFactory:
             and model_config.expert_num > 0
             and engine_config.parallelism_config.world_size > 1
             and engine_config.parallelism_config.ep_size > 1
+            and engine_config.moe_config.moe_strategy == "auto"
             and not explicit_disable_deepep
         ):
             if engine_config.moe_config.use_all_gather:

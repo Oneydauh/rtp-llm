@@ -8,7 +8,7 @@ Key design decisions:
   - process_weights_after_loading() fuses q_a_proj + kv_a_proj_with_mqa into
     _fused_qkv_a_w (following Qwen3Experts pattern), and stacks q_b_proj
     + kv_b_proj split into _fused_qkv_b_w.
-  - _build_weights_dict() assembles the W.* dict that the MlaImplBase kernel
+  - _build_mla_kernel_weights() assembles the W.* layout that MlaImplBase
     factory expects at forward time.
   - forward() mirrors MlaAttention.forward() exactly; the Indexer is a
     separate submodule built by the DecoderLayer when is_sparse is True.
@@ -25,8 +25,50 @@ from rtp_llm.models_py.layers.norm import RMSNorm
 from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.modules.factory.attention.attn_factory import MlaImplBase
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
+from rtp_llm.models_py.quant_methods.fp8 import (
+    _resolve_fp8_gemm_nt,
+    _resolve_sgl_per_token_group_quant,
+)
 from rtp_llm.ops.compute_ops import LayerKVCache
 from rtp_llm.utils.model_weight import W
+
+
+class _RuntimeFusedFp8Linear(nn.Module):
+    """Runtime-only fused view over independently loaded FP8 projections."""
+
+    def __init__(self, weight: torch.Tensor, weight_scale: torch.Tensor):
+        super().__init__()
+        self.register_buffer("weight", weight.contiguous(), persistent=False)
+        self.register_buffer(
+            "weight_scale", weight_scale.contiguous(), persistent=False
+        )
+        self._fp8_logical_output_size = weight.shape[0]
+        self.prefix = "fused_qkv_a_runtime"
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_2d = x.view(-1, x.shape[-1]).contiguous()
+        qinput, input_scales = _resolve_sgl_per_token_group_quant()(
+            input_2d,
+            group_size=128,
+            eps=1e-4,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=False,
+        )
+        output = torch.empty(
+            input_2d.shape[0],
+            self.weight.shape[0],
+            dtype=torch.bfloat16,
+            device=input_2d.device,
+        )
+        _resolve_fp8_gemm_nt()(
+            (qinput, input_scales),
+            (self.weight, self.weight_scale),
+            output,
+            c=None,
+            disable_ue8m0_cast=True,
+        )
+        return output.view(*x.shape[:-1], self.weight.shape[0])
 
 
 def _dequant_block_to_bf16(
@@ -37,10 +79,15 @@ def _dequant_block_to_bf16(
     scale is the [ceil(N/128), ceil(K/128)] block grid (standard orientation).
     """
     n, k = weight.shape
-    s = scale.to(torch.float32)
+    # The legacy MLA kc/vc derivation loads both the FP8 codes and block
+    # scales through the model compute dtype before dequantization.  Preserve
+    # that rounding only for these kernel-facing BF16 views; the projection
+    # modules themselves keep the original FP8 weight and FP32 scale.
+    w = weight.to(torch.bfloat16).to(torch.float32)
+    s = scale.to(torch.bfloat16).to(torch.float32)
     s = s.repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)
     s = s[:n, :k]
-    return (weight.to(torch.float32) * s).to(torch.bfloat16)
+    return (w * s).to(torch.bfloat16)
 
 
 def _linear_weight_bf16(linear: nn.Module) -> torch.Tensor:
@@ -111,12 +158,22 @@ class DeepSeekV32MlaAttention(RtpModule):
         self.q_head_dim = nope_head_dim + rope_head_dim
         self.layer_idx = layer_idx
         self.tp_size = tp_size
+        self.quant_config = quant_config
         self.softmax_scale = self.q_head_dim ** (-0.5)
 
-        # Legacy FP8_PER_BLOCK keeps the fused Q/KV A projection in BF16;
-        # only the B projections and output projection are block-quantized.
-        # Keep the new-loader effective quantization policy identical.
-        a_proj_quant_config = QuantizationConfig(quant_type="none")
+        # The checkpoint stores the A projections as FP8 per-block tensors.
+        # Preserve their scale parameters during streaming load. Postprocessing
+        # builds BF16 kernel views while forward keeps the fused FP8 execution.
+        # An unquantized allocation would silently drop weight_scale_inv and
+        # cast the raw FP8 codes to BF16 without applying their scales.
+        # Legacy MLA keeps A projections in BF16 for runtime/on-the-fly FP8.
+        # Pre-quantized checkpoints still need their stored FP8 scales preserved.
+        a_proj_quant_config = (
+            quant_config
+            if quant_config is not None
+            and not quant_config.quant_type.endswith("_online")
+            else QuantizationConfig(quant_type="none")
+        )
 
         # --- Independent submodules matching HF ckpt names ---
         # q_a_proj is either the LoRA down-projection (hidden -> q_lora_rank)
@@ -201,6 +258,7 @@ class DeepSeekV32MlaAttention(RtpModule):
 
         # --- Fused weights (built after loading) ---
         self._fused_qkv_a_w: Optional[nn.Parameter] = None
+        self._fused_qkv_a_runtime: Optional[nn.Module] = None
         self._fused_qkv_b_w: Optional[nn.Parameter] = None
         self._kv_b_w: Optional[nn.Parameter] = None
         self._kc_w: Optional[nn.Parameter] = None
@@ -232,8 +290,40 @@ class DeepSeekV32MlaAttention(RtpModule):
         # bf16 here. The forward projections still execute the fp8 weights via
         # the linear's DeepGEMM apply — this only affects the kc/vc + fused
         # views consumed by the MLA kernel.
+        q_a_scale = getattr(self.q_a_proj, "weight_scale_inv", None)
+        kv_a_scale = getattr(self.kv_a_proj_with_mqa, "weight_scale_inv", None)
+        if q_a_scale is not None and kv_a_scale is not None:
+            self._fused_qkv_a_runtime = _RuntimeFusedFp8Linear(
+                torch.cat(
+                    [
+                        self.q_a_proj.weight.detach(),
+                        self.kv_a_proj_with_mqa.weight.detach(),
+                    ],
+                    dim=0,
+                ),
+                torch.cat(
+                    [q_a_scale.detach(), kv_a_scale.detach()],
+                    dim=0,
+                ),
+            )
+
         q_a_w = _linear_weight_bf16(self.q_a_proj)
         kv_a_w = _linear_weight_bf16(self.kv_a_proj_with_mqa)
+        if (
+            self._fused_qkv_a_runtime is None
+            and self.quant_config is not None
+            and self.quant_config.quant_type == "fp8_block_online"
+        ):
+            from rtp_llm.model_loader.per_block_fp8_quant_weight import (
+                per_block_cast_to_fp8,
+            )
+
+            fused_a_fp8, fused_a_scale = per_block_cast_to_fp8(
+                torch.cat([q_a_w, kv_a_w], dim=0), 128
+            )
+            self._fused_qkv_a_runtime = _RuntimeFusedFp8Linear(
+                fused_a_fp8, fused_a_scale
+            )
         self._fused_qkv_a_w = nn.Parameter(
             torch.cat([q_a_w, kv_a_w], dim=0).contiguous(), requires_grad=False
         )
@@ -272,12 +362,12 @@ class DeepSeekV32MlaAttention(RtpModule):
             requires_grad=False,
         )
 
-    def _build_weights_dict(self) -> Dict[str, torch.Tensor]:
+    def _build_mla_kernel_weights(self) -> Dict[str, torch.Tensor]:
         """Assemble the W.* dict that MlaImplBase expects at forward time."""
         if self._fused_qkv_a_w is None:
             raise RuntimeError(
                 "process_weights_after_loading() must be called before "
-                "_build_weights_dict()"
+                "_build_mla_kernel_weights()"
             )
         weights: Dict[str, torch.Tensor] = {}
         if self.q_lora_rank > 0:
@@ -301,7 +391,9 @@ class DeepSeekV32MlaAttention(RtpModule):
                 else o_scale
             )
         else:
-            weights[W.attn_o_w] = o_weight.reshape(o_weight.shape[1], o_weight.shape[0])
+            # BF16 LinearFactory consumes the legacy [input, output] layout.
+            # Keep a transpose view so GEMM observes the correct stride.
+            weights[W.attn_o_w] = o_weight.t()
 
         # Prefill consumes kv_b through the attention factory. Preserve the
         # FP8 weight/scale pair so it selects the same block-quantized linear
@@ -365,10 +457,20 @@ class DeepSeekV32MlaAttention(RtpModule):
         q_c = None
 
         if self.q_lora_rank > 0:
-            # q_a projection
-            q = self.q_a_proj(hidden_states)
-            # kv_a projection (with rope)
-            kv_a = self.kv_a_proj_with_mqa(hidden_states)
+            # The legacy path executes q_a + kv_a as one FP8 GEMM. Keep the
+            # checkpoint-facing modules independent, but use their fused
+            # runtime view so activation quantization and accumulation match.
+            if self._fused_qkv_a_runtime is not None:
+                fused_qkv_a = self._fused_qkv_a_runtime(hidden_states)
+            else:
+                fused_qkv_a = torch.nn.functional.linear(
+                    hidden_states, self._fused_qkv_a_w
+                )
+            q, kv_a = torch.split(
+                fused_qkv_a,
+                [self.q_lora_rank, self.kv_lora_rank + self.rope_head_dim],
+                dim=-1,
+            )
             # split: q_a, then kv_a+rope
             compressed_kv = kv_a[..., : self.kv_lora_rank]
             k_pe = kv_a[..., self.kv_lora_rank :]
@@ -401,7 +503,6 @@ class DeepSeekV32MlaAttention(RtpModule):
         topk_indices = self._run_sparse_indexer(
             hidden_states, q_c, q_view, kv_cache, fmha_impl
         )
-
         attn_output = fmha_impl.forward(
             q_view, compressed_kv, k_pe, kv_cache, self.layer_idx, topk_indices
         )

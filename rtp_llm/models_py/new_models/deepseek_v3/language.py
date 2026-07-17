@@ -18,11 +18,11 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 
-from rtp_llm.model_loader.model_weight_info import ModelWeights
 from rtp_llm.models_py.layers.embedding import ParallelLMHead, VocabParallelEmbedding
-from rtp_llm.models_py.layers.norm import RMSNorm
+from rtp_llm.models_py.layers.norm import RMSResNorm
+from rtp_llm.models_py.model_desc.block_map import select_block_map_for_layer
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
-from rtp_llm.models_py.quant_methods.base import QuantizationConfig
+from rtp_llm.models_py.modules import AttnImplFactory
 from rtp_llm.models_py.weight_mapper import WeightsMapper
 from rtp_llm.ops.compute_ops import PyModelInputs, PyModelOutputs
 from rtp_llm.utils.model_weight import W
@@ -30,6 +30,28 @@ from rtp_llm.utils.model_weight import W
 from .model import DeepSeekV32DecoderLayer
 
 logger = logging.getLogger(__name__)
+
+
+class MlaKernelWeightLayout:
+    """Minimal W.* layout consumed by MLA kernels.
+
+    The tensors remain owned by the new-loader modules.  This object only
+    provides the legacy internal names required by the attention kernels; it
+    is not involved in checkpoint mapping or weight loading.
+    """
+
+    def __init__(
+        self,
+        layer_weights: list[Dict[str, torch.Tensor]],
+        cos_sin_cache: torch.Tensor,
+    ) -> None:
+        self.weights = layer_weights
+        self._cos_sin_cache = cos_sin_cache
+
+    def get_global_weight_or_none(self, name: str) -> Optional[torch.Tensor]:
+        if name == W.rope_cos_sin_cache:
+            return self._cos_sin_cache
+        return None
 
 
 # ------------------------------------------------------------------ #
@@ -68,15 +90,12 @@ def _build_rope_cache(
             device=device,
         )
     else:
-        # device kw is required: DeepSeekV32 uses yarn scaling, and IndexerOp
-        # stores cos_sin_cache as a plain Python attr (not a buffer), so any
-        # later .to(cuda) does NOT propagate into the indexer's copy. Build
-        # on cuda from the start so the indexer captures a cuda reference.
+        # Match the legacy loader's CPU sin/cos evaluation exactly, then move
+        # the finished cache to CUDA before the indexer captures its reference.
         rotary_emb = DeepseekV3YarnRotaryEmbedding(
             rope_head_dim,
             max_seq_len,
             rope_theta,
-            device=device,
             scaling_factor=rope_scaling["factor"],
             original_max_position_embeddings=rope_scaling[
                 "original_max_position_embeddings"
@@ -90,7 +109,11 @@ def _build_rope_cache(
     half_rope_dim = rope_head_dim // 2
     cos_cache = rotary_emb.cos_cached[:, :half_rope_dim]
     sin_cache = rotary_emb.sin_cached[:, :half_rope_dim]
-    return torch.cat([cos_cache, sin_cache], dim=-1).contiguous().to(torch.float32)
+    return (
+        torch.cat([cos_cache, sin_cache], dim=-1)
+        .contiguous()
+        .to(device=device, dtype=torch.float32)
+    )
 
 
 def _read_config_json(ckpt_path: str) -> Dict[str, Any]:
@@ -276,24 +299,38 @@ def _extract_config_values(
     indexer_is_neox_style = not indexer_rope_interleave
 
     # Parallelism
-    tp_size = getattr(load_config, "tp_size", 1)
-    tp_rank = getattr(load_config, "tp_rank", 0)
+    parallelism_config = getattr(load_config, "parallelism_config", None)
+    if parallelism_config is not None and hasattr(
+        parallelism_config, "get_attn_tp_size"
+    ):
+        # CP uses the physical TP group for communication, but attention,
+        # embedding, indexer and non-expert weights stay replicated. Match the
+        # legacy modules, which build those tensors with the effective attention
+        # TP view rather than parallelism_config.tp_size.
+        tp_size = int(parallelism_config.get_attn_tp_size())
+        tp_rank = int(parallelism_config.get_attn_tp_rank())
+    else:
+        tp_size = getattr(load_config, "tp_size", 1)
+        tp_rank = getattr(load_config, "tp_rank", 0)
+    lm_head_tp_size = int(
+        getattr(
+            parallelism_config,
+            "tp_size",
+            getattr(load_config, "lm_head_tp_size", tp_size),
+        )
+    )
+    lm_head_tp_rank = int(
+        getattr(
+            parallelism_config,
+            "tp_rank",
+            getattr(load_config, "lm_head_tp_rank", tp_rank),
+        )
+    )
     ep_size = getattr(load_config, "ep_size", 1)
     ep_rank = getattr(load_config, "ep_rank", 0)
     quant_config = getattr(load_config, "quant_config", None)
-    # DeepSeek-V3.2 runs its NON-expert linears (MLA q/kv/o projections, dense
-    # FFN, shared expert, indexer) in bf16: the MLA absorb path derives kc/vc
-    # via torch.bmm (no fp8 kernel), and fp8 GEMM diverges from the validated
-    # bf16 reference output. So for an already-quantized fp8-per-block ckpt,
-    # route those linears to the dequant-to-bf16 method. The routed experts
-    # keep fp8 — DeepSeekV32Experts._EXTRA_QUANT_MAP maps "fp8_block_dequant"
-    # back to "fp8_per_block".
-    if quant_config is not None and getattr(quant_config, "quant_type", "") == (
-        "fp8_block"
-    ):
-        quant_config = QuantizationConfig(quant_type="fp8_block_dequant")
     params_dtype = getattr(load_config, "compute_dtype", torch.bfloat16)
-    parallelism_config = getattr(load_config, "parallelism_config", None)
+    enable_fp32_lm_head = getattr(model_config, "enable_fp32_lm_head", True)
     moe_config = getattr(load_config, "moe_config", None)
 
     # Kernel tokens per block
@@ -334,10 +371,13 @@ def _extract_config_values(
         blocksize=blocksize,
         tp_size=tp_size,
         tp_rank=tp_rank,
+        lm_head_tp_size=lm_head_tp_size,
+        lm_head_tp_rank=lm_head_tp_rank,
         ep_size=ep_size,
         ep_rank=ep_rank,
         quant_config=quant_config,
         params_dtype=params_dtype,
+        lm_head_params_dtype=torch.float32 if enable_fp32_lm_head else params_dtype,
         model_config=model_config,
         parallelism_config=parallelism_config,
         moe_config=moe_config,
@@ -397,7 +437,13 @@ class DeepSeekV32ForCausalLM(GptModelBase):
                 "[DeepSeekV32] lm_head.weight not found in ckpt; "
                 "tying lm_head to embed_tokens"
             )
-            self.lm_head.weight.data.copy_(self.embed_tokens.weight.data)
+            embed_weight = self.embed_tokens.weight.data
+            if embed_weight.shape[0] != self.lm_head.weight.shape[0]:
+                start = self.lm_head.tp_rank * self.lm_head.vocab_size_per_partition
+                embed_weight = embed_weight[
+                    start : start + self.lm_head.vocab_size_per_partition
+                ]
+            self.lm_head.weight.data.copy_(embed_weight)
 
     def __init__(
         self,
@@ -498,7 +544,7 @@ class DeepSeekV32ForCausalLM(GptModelBase):
             self.layers.append(layer)
 
         # --- Final norm ---
-        self.norm = RMSNorm(
+        self.norm = RMSResNorm(
             cfg["hidden_size"],
             eps=cfg["rms_norm_eps"],
             params_dtype=cfg["params_dtype"],
@@ -508,25 +554,25 @@ class DeepSeekV32ForCausalLM(GptModelBase):
         self.lm_head = ParallelLMHead(
             vocab_size=cfg["vocab_size"],
             hidden_size=cfg["hidden_size"],
-            tp_size=cfg["tp_size"],
-            tp_rank=cfg["tp_rank"],
-            params_dtype=cfg["params_dtype"],
+            tp_size=cfg["lm_head_tp_size"],
+            tp_rank=cfg["lm_head_tp_rank"],
+            params_dtype=cfg["lm_head_params_dtype"],
         )
 
     def initialize(self, init_resource):
-        """Build ModelWeights view after all post-load hooks have run.
+        """Build the MLA kernel layout after all post-load hooks have run.
 
         Called by C++ PyWrappedModel after weight loading +
         process_weights_after_loading completes, before any prepare_fmha_impl /
         forward.  By this point every self_attn module has _fused_qkv_a_w /
-        _kc_w / _vc_w populated, so _build_weights_dict() is safe to call.
+        _kc_w / _vc_w populated, so the W.* kernel views are ready.
         """
         ok = super().initialize(init_resource)
-        self._ensure_weight_assembled()
+        self._ensure_mla_kernel_layout()
         return ok
 
-    def _ensure_weight_assembled(self):
-        """Build the ModelWeights view that prepare_fmha_impl / MlaImpl expects.
+    def _ensure_mla_kernel_layout(self) -> None:
+        """Reconstruct only the W.* tensor views required by MLA kernels.
 
         Cannot run inside __init__ (params not loaded yet) or inside
         process_weights_after_loading (parent hook fires before children's,
@@ -534,32 +580,39 @@ class DeepSeekV32ForCausalLM(GptModelBase):
         Called from initialize() once all child post-load hooks have run, and
         also kept as a lazy fallback in forward() for direct-execution paths.
         """
-        if self.weight is not None:
+        if getattr(self, "_mla_kernel_layout", None) is not None:
             return
-        num_layers = len(self.layers)
-        device = next(self.parameters()).device
-        weights = ModelWeights(
-            num_layers=num_layers,
-            device=str(device),
-            dtype=self.cos_sin_cache.dtype,
+        self._mla_kernel_layout = MlaKernelWeightLayout(
+            [layer.self_attn._build_mla_kernel_weights() for layer in self.layers],
+            self.cos_sin_cache,
         )
-        weights.set_global_weight(W.rope_cos_sin_cache, self.cos_sin_cache)
-        for i, layer in enumerate(self.layers):
-            for key, tensor in layer.self_attn._build_weights_dict().items():
-                weights.set_layer_weight(i, key, tensor)
-        self.weight = weights
+
+    def prepare_fmha_impl(
+        self, inputs: PyModelInputs, is_cuda_graph: bool = False
+    ) -> Any:
+        self._ensure_mla_kernel_layout()
+        return AttnImplFactory.get_fmha_impl(
+            self.config,
+            self.parallelism_config,
+            self._mla_kernel_layout,
+            inputs.attention_inputs,
+            self.fmha_config,
+            is_cuda_graph,
+        )
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
         input_ids = inputs.input_ids
         hidden_states = self.embed_tokens(input_ids)
+        residual = torch.zeros_like(hidden_states)
         if fmha_impl is None:
-            self._ensure_weight_assembled()
             fmha_impl = self.prepare_fmha_impl(inputs)
         for i, layer in enumerate(self.layers):
-            hidden_states = layer(
+            select_block_map_for_layer(inputs.attention_inputs, i)
+            hidden_states, residual = layer(
                 hidden_states,
+                residual,
                 fmha_impl,
                 kv_cache=self.kv_cache.get_layer_cache(i) if self.kv_cache else None,
             )
-        hidden_states = self.norm(hidden_states)
+        hidden_states, _ = self.norm(hidden_states, residual)
         return PyModelOutputs(hidden_states, fmha_impl.fmha_params)
