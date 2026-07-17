@@ -25,11 +25,13 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 
-from rtp_llm.model_loader.model_weight_info import ModelWeights
 from rtp_llm.models_py.layers.embedding import ParallelLMHead, VocabParallelEmbedding
-from rtp_llm.models_py.layers.norm import RMSNorm
+from rtp_llm.models_py.layers.norm import RMSResNorm
+from rtp_llm.models_py.model_desc.block_map import select_block_map_for_layer
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
+from rtp_llm.models_py.modules import AttnImplFactory
 from rtp_llm.models_py.new_models.deepseek_v3.language import (
+    MlaKernelWeightLayout,
     _build_rope_cache,
     _extract_config_values,
     _read_config_json,
@@ -38,7 +40,6 @@ from rtp_llm.models_py.new_models.deepseek_v3.model import DeepSeekV32DecoderLay
 from rtp_llm.models_py.new_models.mtp import MTPBlock
 from rtp_llm.models_py.weight_mapper import WeightsMapper
 from rtp_llm.ops.compute_ops import PyModelInputs, PyModelOutputs
-from rtp_llm.utils.model_weight import W
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +225,7 @@ class DeepSeekV32MTPForCausalLM(GptModelBase):
         self.layers.append(layer)
 
         # --- Final norm (from shared_head.norm) ---
-        self.norm = RMSNorm(
+        self.norm = RMSResNorm(
             cfg["hidden_size"],
             eps=cfg["rms_norm_eps"],
             params_dtype=cfg["params_dtype"],
@@ -234,50 +235,57 @@ class DeepSeekV32MTPForCausalLM(GptModelBase):
         self.lm_head = ParallelLMHead(
             vocab_size=cfg["vocab_size"],
             hidden_size=cfg["hidden_size"],
-            tp_size=cfg["tp_size"],
-            tp_rank=cfg["tp_rank"],
-            params_dtype=cfg["params_dtype"],
+            tp_size=cfg["lm_head_tp_size"],
+            tp_rank=cfg["lm_head_tp_rank"],
+            params_dtype=cfg["lm_head_params_dtype"],
         )
 
     def initialize(self, init_resource):
-        """Build ModelWeights view after all post-load hooks have run."""
+        """Build the MLA kernel layout after all post-load hooks have run."""
         ok = super().initialize(init_resource)
-        self._ensure_weight_assembled()
+        self._ensure_mla_kernel_layout()
         return ok
 
-    def _ensure_weight_assembled(self):
-        """Build the ModelWeights view that prepare_fmha_impl / MlaImpl expects."""
-        if self.weight is not None:
+    def _ensure_mla_kernel_layout(self) -> None:
+        """Reconstruct only the W.* tensor views required by MLA kernels."""
+        if getattr(self, "_mla_kernel_layout", None) is not None:
             return
-        num_layers = len(self.layers)
-        device = next(self.parameters()).device
-        weights = ModelWeights(
-            num_layers=num_layers,
-            device=str(device),
-            dtype=self.cos_sin_cache.dtype,
+        self._mla_kernel_layout = MlaKernelWeightLayout(
+            [layer.self_attn._build_mla_kernel_weights() for layer in self.layers],
+            self.cos_sin_cache,
         )
-        weights.set_global_weight(W.rope_cos_sin_cache, self.cos_sin_cache)
-        for i, layer in enumerate(self.layers):
-            for key, tensor in layer.self_attn._build_weights_dict().items():
-                weights.set_layer_weight(i, key, tensor)
-        self.weight = weights
+
+    def prepare_fmha_impl(
+        self, inputs: PyModelInputs, is_cuda_graph: bool = False
+    ) -> Any:
+        self._ensure_mla_kernel_layout()
+        return AttnImplFactory.get_fmha_impl(
+            self.config,
+            self.parallelism_config,
+            self._mla_kernel_layout,
+            inputs.attention_inputs,
+            self.fmha_config,
+            is_cuda_graph,
+        )
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
         # inputs_embeds from current token ids
         inputs_embeds = self.embed_tokens(inputs.input_ids)
         # MTP block: combine embed with last hidden states from the main model
         hidden_states = self.mtp_block(inputs_embeds, inputs.input_hiddens)
+        residual = torch.zeros_like(hidden_states)
 
         if fmha_impl is None:
-            self._ensure_weight_assembled()
             fmha_impl = self.prepare_fmha_impl(inputs)
 
         for i, layer in enumerate(self.layers):
-            hidden_states = layer(
+            select_block_map_for_layer(inputs.attention_inputs, i)
+            hidden_states, residual = layer(
                 hidden_states,
+                residual,
                 fmha_impl,
                 kv_cache=self.kv_cache.get_layer_cache(i) if self.kv_cache else None,
             )
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states, _ = self.norm(hidden_states, residual)
         return PyModelOutputs(hidden_states, fmha_impl.fmha_params)
