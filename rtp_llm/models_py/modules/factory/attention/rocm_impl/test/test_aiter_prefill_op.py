@@ -1435,6 +1435,9 @@ class TestAiterPrefillImplMropeRealOp(unittest.TestCase):
         )
 
     def test_prepare_in_place_refreshes_mrope_position_ids(self):
+        # This covers the persistent-buffer refresh used before graph replay.
+        # It does not perform a real graph capture/replay; that remains an
+        # engine-level integration coverage boundary.
         input_lengths = [3, 2]
         head_num = 4
         head_num_kv = 2
