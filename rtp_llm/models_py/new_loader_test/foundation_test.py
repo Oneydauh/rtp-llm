@@ -15,6 +15,7 @@ from rtp_llm.models_py.model_loader import (
     NewLoaderConfig,
     NewLoaderLoadMethod,
     NewModelLoader,
+    _ExpertRangeFilter,
 )
 from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.registry import (
@@ -464,13 +465,100 @@ class FoundationLoaderTest(unittest.TestCase):
             with self.assertRaisesRegex(TypeError, "Dtype mismatch"):
                 self._loader(model_path).load()
 
-    def test_explicit_fastsafetensors_is_rejected(self):
+    def test_explicit_fastsafetensors_streams_and_closes_loader(self):
+        close = mock.Mock()
+
+        class FakeSingleGroup:
+            def rank(self):
+                return 0
+
+        class FakeParallelLoader:
+            def __init__(self, **kwargs):
+                self.files = kwargs["hf_weights_files"]
+                self.loader = types.SimpleNamespace(close=close)
+
+            def iterate_weights(self):
+                yield from get_all_weights(self.files, device="cpu")
+
+        fake_fastsafetensors = types.ModuleType("fastsafetensors")
+        fake_fastsafetensors.ParallelLoader = FakeParallelLoader
+        fake_fastsafetensors.SingleGroup = FakeSingleGroup
+
         with tempfile.TemporaryDirectory() as model_path:
             save_file(_weights(), os.path.join(model_path, "model.safetensors"))
-            with self.assertRaisesRegex(RuntimeError, "not part of.*foundation"):
+            with mock.patch.dict(
+                sys.modules, {"fastsafetensors": fake_fastsafetensors}
+            ):
+                model = self._loader(
+                    model_path, load_method=NewLoaderLoadMethod.FASTSAFETENSORS
+                ).load()
+
+        self.assertTrue(torch.equal(model.final, _weights()["final"]))
+        self.assertEqual(model.post_count, 1)
+        close.assert_called_once_with()
+
+    def test_fastsafetensors_rejects_pytorch_checkpoint(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            torch.save(_weights(), os.path.join(model_path, "model.pt"))
+            with self.assertRaisesRegex(ValueError, "requires safetensors"):
                 self._loader(
                     model_path, load_method=NewLoaderLoadMethod.FASTSAFETENSORS
                 ).load()
+
+    def test_fastsafetensors_rejects_staged_online_quantization(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            save_file(_weights(), os.path.join(model_path, "model.safetensors"))
+            with mock.patch.object(
+                _FoundationModel,
+                "requires_staged_device_postprocess",
+                return_value=True,
+            ), self.assertRaisesRegex(RuntimeError, "online quantization staging"):
+                self._loader(
+                    model_path, load_method=NewLoaderLoadMethod.FASTSAFETENSORS
+                ).load()
+
+    def test_fastsafetensors_expands_only_local_stacked_experts(self):
+        close = mock.Mock()
+        stacked = torch.arange(16, dtype=torch.float32).reshape(4, 2, 2)
+
+        class FakeSingleGroup:
+            def rank(self):
+                return 0
+
+        class FakeParallelLoader:
+            def __init__(self, **kwargs):
+                self.loader = types.SimpleNamespace(close=close)
+
+            def iterate_weights(self):
+                yield "layers.0.experts.gate_up_proj.weight", stacked
+
+        fake_fastsafetensors = types.ModuleType("fastsafetensors")
+        fake_fastsafetensors.ParallelLoader = FakeParallelLoader
+        fake_fastsafetensors.SingleGroup = FakeSingleGroup
+        expert_filter = _ExpertRangeFilter(num_experts=4, ep_size=2, ep_rank=1)
+
+        with mock.patch.dict(
+            sys.modules, {"fastsafetensors": fake_fastsafetensors}
+        ):
+            loaded = list(
+                NewModelLoader._fastsafetensors_weights_iterator(
+                    ["unused.safetensors"],
+                    "cpu",
+                    lambda _: True,
+                    expert_filter,
+                )
+            )
+
+        self.assertEqual(
+            [name for name, _ in loaded],
+            [
+                "layers.0.experts.2.gate_up_proj.weight",
+                "layers.0.experts.3.gate_up_proj.weight",
+            ],
+        )
+        self.assertTrue(torch.equal(loaded[0][1], stacked[2]))
+        self.assertTrue(torch.equal(loaded[1][1], stacked[3]))
+        close.assert_called_once_with()
 
     def test_invalid_load_method_is_rejected(self):
         with tempfile.TemporaryDirectory() as model_path:

@@ -5,7 +5,7 @@ import re
 import time
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -331,10 +331,6 @@ class NewModelLoader:
                 configured = NewLoaderLoadMethod.SCRATCH
             if configured == NewLoaderLoadMethod.AUTO:
                 configured = NewLoaderLoadMethod.SCRATCH
-        if configured == NewLoaderLoadMethod.FASTSAFETENSORS:
-            raise RuntimeError(
-                "fastsafetensors is not part of the newloader foundation; use scratch"
-            )
         return configured
 
     def _model_type(self) -> str:
@@ -562,6 +558,91 @@ class NewModelLoader:
                 hook()
 
     @staticmethod
+    def _requires_staged_device_postprocess(model: nn.Module) -> bool:
+        return any(
+            isinstance(module, RtpModule)
+            and module.requires_staged_device_postprocess()
+            for module in model.modules()
+        )
+
+    @staticmethod
+    def _fastsafetensors_weights_iterator(
+        checkpoint_files: List[str],
+        device: str,
+        name_filter: Optional[Callable[[str], bool]],
+        safetensor_slice_expander: Optional[_ExpertRangeFilter],
+    ) -> Iterator[Tuple[str, torch.Tensor]]:
+        """Stream safetensors directly to the model's runtime device.
+
+        The yielded tensor is consumed synchronously by ``RtpModule.load_weights``
+        before the iterator advances. Expert slices are cloned because the
+        fastsafetensors batch backing storage may be released on the next yield.
+        """
+        try:
+            from fastsafetensors import ParallelLoader, SingleGroup
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise RuntimeError(
+                "NewLoader fastsafetensors requires the fastsafetensors package; "
+                "install it or use LOAD_METHOD=scratch"
+            ) from exc
+
+        if torch.distributed.is_initialized():
+            process_group = torch.distributed.group.WORLD
+        else:
+            process_group = SingleGroup()
+
+        target_device = torch.device(device)
+        loader_device = str(target_device)
+        if target_device.type == "cuda" and target_device.index is None:
+            loader_device = f"cuda:{process_group.rank()}"
+        use_nogds = (
+            target_device.type == "cpu"
+            or os.environ.get("FASTSAFETENSORS_NOGDS", "0") == "1"
+        )
+        loader = ParallelLoader(
+            pg=process_group,
+            hf_weights_files=sorted(os.fspath(path) for path in checkpoint_files),
+            use_tqdm_on_load=True,
+            device=loader_device,
+            bbuf_size_kb=2 * 1024 * 1024,
+            use_shm=not use_nogds,
+            nogds=use_nogds,
+        )
+        seen = set()
+        try:
+            for name, tensor in loader.iterate_weights():
+                if name_filter is not None and not name_filter(name):
+                    continue
+                if (
+                    safetensor_slice_expander is not None
+                    and safetensor_slice_expander.handles_safetensor(name)
+                ):
+                    shape = tuple(tensor.shape)
+                    for expanded_name, index in (
+                        safetensor_slice_expander.expand_safetensor(name, shape)
+                    ):
+                        if expanded_name in seen:
+                            raise RuntimeError(
+                                f"Checkpoint tensor {expanded_name!r} appears more "
+                                "than once during fastsafetensors loading"
+                            )
+                        seen.add(expanded_name)
+                        yield expanded_name, tensor[index].clone()
+                    continue
+                if name in seen:
+                    raise RuntimeError(
+                        f"Checkpoint tensor {name!r} appears more than once during "
+                        "fastsafetensors loading"
+                    )
+                seen.add(name)
+                yield name, tensor
+        finally:
+            backing_loader = getattr(loader, "loader", None)
+            close = getattr(backing_loader, "close", None)
+            if callable(close):
+                close()
+
+    @staticmethod
     def _validate_runtime_backends(model: nn.Module, device: str) -> None:
         target_device = torch.device(device)
         for module in model.modules():
@@ -619,12 +700,31 @@ class NewModelLoader:
     @torch.inference_mode()
     def load(self) -> nn.Module:
         method = self._resolve_load_method()
-        if method != NewLoaderLoadMethod.SCRATCH:
-            raise RuntimeError(f"Resolved unsupported load method: {method}")
         checkpoint_files = self._checkpoint_files()
         expert_filter = self._expert_filter()
         self._validate_ep_checkpoint_format(checkpoint_files, expert_filter)
-        model = self._create_model()
+        if method == NewLoaderLoadMethod.FASTSAFETENSORS:
+            non_safetensors = [
+                path
+                for path in checkpoint_files
+                if not os.fspath(path).lower().endswith(".safetensors")
+            ]
+            if non_safetensors:
+                raise ValueError(
+                    "NewLoader fastsafetensors requires safetensors checkpoints, "
+                    f"got {non_safetensors}"
+                )
+            with torch.device(self.load_config.device):
+                model = self._create_model()
+            if self._requires_staged_device_postprocess(model):
+                raise RuntimeError(
+                    "NewLoader fastsafetensors does not yet support online "
+                    "quantization staging; use LOAD_METHOD=scratch"
+                )
+        elif method == NewLoaderLoadMethod.SCRATCH:
+            model = self._create_model()
+        else:
+            raise RuntimeError(f"Resolved unsupported load method: {method}")
         if weight_mapper.is_rank_local_checkpoint(checkpoint_files) and not bool(
             getattr(model, "supports_rank_local_checkpoint", False)
         ):
@@ -632,6 +732,7 @@ class NewModelLoader:
                 f"{type(model).__name__} does not support rank-local consolidated "
                 "checkpoints; use a global HF checkpoint"
             )
+        self._validate_runtime_backends(model, self.load_config.device)
         started = time.time()
         model_filter = self._model_checkpoint_name_filter(model)
         name_filter = self._checkpoint_name_filter(model_filter, expert_filter)
@@ -644,19 +745,30 @@ class NewModelLoader:
                 len(selected_files),
                 len(checkpoint_files),
             )
-        model.load_weights(
-            weight_mapper.get_all_weights(
+        if method == NewLoaderLoadMethod.FASTSAFETENSORS:
+            weights = self._fastsafetensors_weights_iterator(
+                selected_files,
+                self.load_config.device,
+                name_filter,
+                expert_filter,
+            )
+        else:
+            weights = weight_mapper.get_all_weights(
                 selected_files,
                 device="cpu",
                 name_filter=name_filter,
                 safetensor_slice_expander=expert_filter,
             )
-        )
+        model.load_weights(weights)
         self._validate_loaded_weights(model)
-        logger.info("Streamed checkpoint tensors in %.2fs", time.time() - started)
+        logger.info(
+            "Streamed checkpoint tensors with %s in %.2fs",
+            method.value,
+            time.time() - started,
+        )
 
-        self._validate_runtime_backends(model, self.load_config.device)
-        self._migrate_staged_modules(model, self.load_config.device)
+        if method == NewLoaderLoadMethod.SCRATCH:
+            self._migrate_staged_modules(model, self.load_config.device)
         model.to(self.load_config.device)
         self._validate_loaded_weights(model)
         self._run_post_load_hooks(model)
