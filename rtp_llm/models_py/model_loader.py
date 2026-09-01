@@ -23,6 +23,19 @@ _STACKED_EXPERT_RE = re.compile(
     r"(?P<projection>gate_up_proj|down_proj)"
     r"(?P<suffix>(?:\..+)?)$"
 )
+_FASTSAFETENSORS_REQUIRED_ARGUMENTS = frozenset(
+    {
+        "pg",
+        "hf_weights_files",
+        "use_tqdm_on_load",
+        "device",
+        "bbuf_size_kb",
+        "use_shm",
+        "nogds",
+    }
+)
+_FASTSAFETENSORS_MIN_BBUF_SIZE_KB = 16 * 1024
+_FASTSAFETENSORS_MAX_BBUF_SIZE_KB = 2 * 1024 * 1024
 
 
 def _require_callable_name_filter(
@@ -327,10 +340,6 @@ class NewModelLoader:
                     raise ValueError(
                         f"Unsupported LOAD_METHOD environment value {env_method!r}"
                     ) from exc
-            else:
-                configured = NewLoaderLoadMethod.SCRATCH
-            if configured == NewLoaderLoadMethod.AUTO:
-                configured = NewLoaderLoadMethod.SCRATCH
         return configured
 
     def _model_type(self) -> str:
@@ -566,6 +575,253 @@ class NewModelLoader:
         )
 
     @staticmethod
+    def _fastsafetensors_api():
+        try:
+            from fastsafetensors import ParallelLoader, SingleGroup
+        except (ImportError, ModuleNotFoundError, OSError) as exc:
+            raise RuntimeError(
+                "the fastsafetensors package is unavailable or failed to import: "
+                f"{exc}"
+            ) from exc
+
+        for symbol_name, symbol in (
+            ("ParallelLoader", ParallelLoader),
+            ("SingleGroup", SingleGroup),
+        ):
+            if not callable(symbol):
+                raise RuntimeError(
+                    f"fastsafetensors.{symbol_name} must be callable"
+                )
+        try:
+            parameters = inspect.signature(ParallelLoader.__init__).parameters
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "cannot inspect fastsafetensors.ParallelLoader constructor"
+            ) from exc
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        missing = _FASTSAFETENSORS_REQUIRED_ARGUMENTS - set(parameters)
+        if missing and not accepts_kwargs:
+            raise RuntimeError(
+                "fastsafetensors.ParallelLoader is incompatible with NewLoader; "
+                f"missing constructor arguments {sorted(missing)}"
+            )
+        return ParallelLoader, SingleGroup
+
+    @staticmethod
+    def _duplicate_safetensor_names(checkpoint_files: List[str]) -> List[str]:
+        from safetensors import safe_open
+
+        seen = set()
+        duplicates = set()
+        for path in checkpoint_files:
+            with safe_open(path, framework="pt", device="cpu") as handle:
+                for name in handle.keys():
+                    if name in seen:
+                        duplicates.add(name)
+                    seen.add(name)
+        return sorted(duplicates)
+
+    @staticmethod
+    def _fastsafetensors_bbuf_size_kb(checkpoint_files: List[str]) -> int:
+        max_shard_bytes = max(os.path.getsize(path) for path in checkpoint_files)
+        max_shard_kb = (max_shard_bytes + 1023) // 1024
+        return min(
+            _FASTSAFETENSORS_MAX_BBUF_SIZE_KB,
+            max(_FASTSAFETENSORS_MIN_BBUF_SIZE_KB, max_shard_kb),
+        )
+
+    @staticmethod
+    def _model_storage_bytes(model: nn.Module) -> int:
+        seen = set()
+        total = 0
+        tensors = list(
+            model.named_parameters(recurse=True, remove_duplicate=False)
+        ) + list(model.named_buffers(recurse=True, remove_duplicate=False))
+        for _, tensor in tensors:
+            if tensor is None or id(tensor) in seen:
+                continue
+            if tensor.is_meta:
+                raise RuntimeError(
+                    "model contains meta tensors that cannot be sized for automatic "
+                    "fastsafetensors selection"
+                )
+            seen.add(id(tensor))
+            total += tensor.numel() * tensor.element_size()
+        return total
+
+    def _fastsafetensors_prerequisite_reason(
+        self,
+        model: nn.Module,
+        checkpoint_files: List[str],
+        *,
+        automatic: bool,
+    ) -> Optional[str]:
+        if not checkpoint_files:
+            return "checkpoint shard selection is empty"
+        non_safetensors = [
+            os.fspath(path)
+            for path in checkpoint_files
+            if not os.fspath(path).lower().endswith(".safetensors")
+        ]
+        if non_safetensors:
+            return f"checkpoint contains non-safetensors files {non_safetensors}"
+        if self._requires_staged_device_postprocess(model):
+            return (
+                "the model requires staged device postprocessing (for example "
+                "online quantization), which is currently memory-bounded only by "
+                "the scratch path"
+            )
+
+        target_device = torch.device(self.load_config.device)
+        if target_device.type not in ("cpu", "cuda"):
+            return f"runtime device {target_device} is not supported"
+        if automatic and target_device.type == "cpu":
+            return (
+                "the runtime device is CPU, where direct accelerator loading "
+                "has no benefit"
+            )
+        if target_device.type == "cuda":
+            if not torch.cuda.is_available():
+                return f"runtime device {target_device} is unavailable"
+            if (
+                torch.version.hip is not None
+                and os.environ.get("FASTSAFETENSORS_NOGDS", "0") == "1"
+            ):
+                return (
+                    "FASTSAFETENSORS_NOGDS=1 is unsupported on ROCm by the "
+                    "installed fastsafetensors backend"
+                )
+            device_index = (
+                torch.cuda.current_device()
+                if target_device.index is None
+                else target_device.index
+            )
+            device_count = torch.cuda.device_count()
+            if not 0 <= device_index < device_count:
+                return (
+                    f"runtime device index {device_index} is outside the available "
+                    f"CUDA device range [0, {device_count})"
+                )
+
+        try:
+            self._fastsafetensors_api()
+        except RuntimeError as exc:
+            return str(exc)
+        try:
+            duplicates = self._duplicate_safetensor_names(checkpoint_files)
+        except (OSError, RuntimeError, ValueError) as exc:
+            return f"failed to inspect safetensors metadata: {exc}"
+        if duplicates:
+            sample = duplicates[:10]
+            suffix = (
+                f" (+{len(duplicates) - len(sample)} more)"
+                if len(duplicates) > 10
+                else ""
+            )
+            return f"checkpoint tensor names are duplicated: {sample}{suffix}"
+        if automatic:
+            device_index = (
+                torch.cuda.current_device()
+                if target_device.index is None
+                else target_device.index
+            )
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(device_index)
+                model_bytes = self._model_storage_bytes(model)
+                max_shard_bytes = max(
+                    os.path.getsize(path) for path in checkpoint_files
+                )
+                bbuf_bytes = (
+                    self._fastsafetensors_bbuf_size_kb(checkpoint_files) * 1024
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                return f"cannot determine fastsafetensors memory safety: {exc}"
+            required_bytes = model_bytes + 3 * max(max_shard_bytes, bbuf_bytes)
+            logger.info(
+                "NewLoader fastsafetensors memory check: free=%.2fGiB, "
+                "model=%.2fGiB, max_shard=%.2fGiB, bbuf=%.2fGiB, "
+                "required=%.2fGiB",
+                free_bytes / (1024**3),
+                model_bytes / (1024**3),
+                max_shard_bytes / (1024**3),
+                bbuf_bytes / (1024**3),
+                required_bytes / (1024**3),
+            )
+            if free_bytes <= required_bytes:
+                return (
+                    f"insufficient accelerator memory: free={free_bytes} bytes, "
+                    f"required>{required_bytes} bytes"
+                )
+        return None
+
+    @staticmethod
+    def _synchronize_fastsafetensors_prerequisite(
+        local_reason: Optional[str],
+    ) -> Optional[str]:
+        """Require every distributed rank to make the same loader decision."""
+        if not torch.distributed.is_initialized():
+            return local_reason
+        world_size = torch.distributed.get_world_size()
+        if world_size <= 1:
+            return local_reason
+        reasons: List[Optional[str]] = [None] * world_size
+        try:
+            torch.distributed.all_gather_object(reasons, local_reason)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return (
+                "cannot synchronize fastsafetensors prerequisites across ranks: "
+                f"{exc}"
+            )
+        failures = [
+            f"rank {rank}: {reason}"
+            for rank, reason in enumerate(reasons)
+            if reason is not None
+        ]
+        if not failures:
+            return None
+        sample = failures[:4]
+        suffix = (
+            f" (+{len(failures) - len(sample)} more)"
+            if len(failures) > len(sample)
+            else ""
+        )
+        return f"distributed prerequisite failure: {'; '.join(sample)}{suffix}"
+
+    def _select_load_method(
+        self,
+        requested: NewLoaderLoadMethod,
+        model: nn.Module,
+        checkpoint_files: List[str],
+    ) -> NewLoaderLoadMethod:
+        if requested == NewLoaderLoadMethod.SCRATCH:
+            return requested
+        automatic = requested == NewLoaderLoadMethod.AUTO
+        reason = self._fastsafetensors_prerequisite_reason(
+            model,
+            checkpoint_files,
+            automatic=automatic,
+        )
+        reason = self._synchronize_fastsafetensors_prerequisite(reason)
+        if reason is None:
+            selected = NewLoaderLoadMethod.FASTSAFETENSORS
+            logger.info(
+                "NewLoader selected fastsafetensors (%s)",
+                "automatic" if automatic else "explicit",
+            )
+            return selected
+        if automatic:
+            logger.info(
+                "NewLoader automatic fastsafetensors selection fell back to "
+                "scratch: %s",
+                reason,
+            )
+            return NewLoaderLoadMethod.SCRATCH
+        raise RuntimeError(f"NewLoader fastsafetensors prerequisite failed: {reason}")
+
+    @staticmethod
     def _fastsafetensors_weights_iterator(
         checkpoint_files: List[str],
         device: str,
@@ -578,13 +834,7 @@ class NewModelLoader:
         before the iterator advances. Expert slices are cloned because the
         fastsafetensors batch backing storage may be released on the next yield.
         """
-        try:
-            from fastsafetensors import ParallelLoader, SingleGroup
-        except (ImportError, ModuleNotFoundError) as exc:
-            raise RuntimeError(
-                "NewLoader fastsafetensors requires the fastsafetensors package; "
-                "install it or use LOAD_METHOD=scratch"
-            ) from exc
+        ParallelLoader, SingleGroup = NewModelLoader._fastsafetensors_api()
 
         if torch.distributed.is_initialized():
             process_group = torch.distributed.group.WORLD
@@ -594,17 +844,20 @@ class NewModelLoader:
         target_device = torch.device(device)
         loader_device = str(target_device)
         if target_device.type == "cuda" and target_device.index is None:
-            loader_device = f"cuda:{process_group.rank()}"
+            loader_device = f"cuda:{torch.cuda.current_device()}"
         use_nogds = (
             target_device.type == "cpu"
             or os.environ.get("FASTSAFETENSORS_NOGDS", "0") == "1"
+        )
+        bbuf_size_kb = NewModelLoader._fastsafetensors_bbuf_size_kb(
+            checkpoint_files
         )
         loader = ParallelLoader(
             pg=process_group,
             hf_weights_files=sorted(os.fspath(path) for path in checkpoint_files),
             use_tqdm_on_load=True,
             device=loader_device,
-            bbuf_size_kb=2 * 1024 * 1024,
+            bbuf_size_kb=bbuf_size_kb,
             use_shm=not use_nogds,
             nogds=use_nogds,
         )
@@ -699,32 +952,12 @@ class NewModelLoader:
 
     @torch.inference_mode()
     def load(self) -> nn.Module:
-        method = self._resolve_load_method()
+        requested_method = self._resolve_load_method()
         checkpoint_files = self._checkpoint_files()
         expert_filter = self._expert_filter()
         self._validate_ep_checkpoint_format(checkpoint_files, expert_filter)
-        if method == NewLoaderLoadMethod.FASTSAFETENSORS:
-            non_safetensors = [
-                path
-                for path in checkpoint_files
-                if not os.fspath(path).lower().endswith(".safetensors")
-            ]
-            if non_safetensors:
-                raise ValueError(
-                    "NewLoader fastsafetensors requires safetensors checkpoints, "
-                    f"got {non_safetensors}"
-                )
-            with torch.device(self.load_config.device):
-                model = self._create_model()
-            if self._requires_staged_device_postprocess(model):
-                raise RuntimeError(
-                    "NewLoader fastsafetensors does not yet support online "
-                    "quantization staging; use LOAD_METHOD=scratch"
-                )
-        elif method == NewLoaderLoadMethod.SCRATCH:
+        with torch.device("cpu"):
             model = self._create_model()
-        else:
-            raise RuntimeError(f"Resolved unsupported load method: {method}")
         if weight_mapper.is_rank_local_checkpoint(checkpoint_files) and not bool(
             getattr(model, "supports_rank_local_checkpoint", False)
         ):
@@ -733,7 +966,6 @@ class NewModelLoader:
                 "checkpoints; use a global HF checkpoint"
             )
         self._validate_runtime_backends(model, self.load_config.device)
-        started = time.time()
         model_filter = self._model_checkpoint_name_filter(model)
         name_filter = self._checkpoint_name_filter(model_filter, expert_filter)
         selected_files = weight_mapper.select_safetensor_files(
@@ -745,6 +977,17 @@ class NewModelLoader:
                 len(selected_files),
                 len(checkpoint_files),
             )
+        method = self._select_load_method(
+            requested_method, model, selected_files
+        )
+        logger.info(
+            "NewLoader load method: requested=%s, selected=%s",
+            requested_method.value,
+            method.value,
+        )
+        started = time.time()
+        if method == NewLoaderLoadMethod.FASTSAFETENSORS:
+            model.to(self.load_config.device)
         if method == NewLoaderLoadMethod.FASTSAFETENSORS:
             weights = self._fastsafetensors_weights_iterator(
                 selected_files,
@@ -759,7 +1002,12 @@ class NewModelLoader:
                 name_filter=name_filter,
                 safetensor_slice_expander=expert_filter,
             )
-        model.load_weights(weights)
+        try:
+            model.load_weights(weights)
+        finally:
+            close_weights = getattr(weights, "close", None)
+            if callable(close_weights):
+                close_weights()
         self._validate_loaded_weights(model)
         logger.info(
             "Streamed checkpoint tensors with %s in %.2fs",

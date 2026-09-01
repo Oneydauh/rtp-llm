@@ -5,7 +5,11 @@ import unittest
 
 import torch
 import torch.nn as nn
-from rtp_llm.models_py.model_loader import NewLoaderConfig, NewModelLoader
+from rtp_llm.models_py.model_loader import (
+    NewLoaderConfig,
+    NewLoaderLoadMethod,
+    NewModelLoader,
+)
 from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.registry import register_model
 from safetensors.torch import save_file
@@ -61,7 +65,11 @@ class FoundationGpuTest(unittest.TestCase):
             )
             model = NewModelLoader(
                 types.SimpleNamespace(model_type="foundation_gpu_model"),
-                NewLoaderConfig(device="cuda:0", compute_dtype=torch.float32),
+                NewLoaderConfig(
+                    device="cuda:0",
+                    compute_dtype=torch.float32,
+                    load_method=NewLoaderLoadMethod.SCRATCH,
+                ),
                 model_path=model_path,
             ).load()
         self.assertEqual(model.scale.device.type, "cuda")
@@ -81,7 +89,9 @@ class FoundationGpuTest(unittest.TestCase):
             )
             model = NewModelLoader(
                 types.SimpleNamespace(model_type="foundation_gpu_alias_model"),
-                NewLoaderConfig(device="cuda:0"),
+                NewLoaderConfig(
+                    device="cuda:0", load_method=NewLoaderLoadMethod.SCRATCH
+                ),
                 model_path=model_path,
             ).load()
         self.assertIs(model.same, model.same_alias)
