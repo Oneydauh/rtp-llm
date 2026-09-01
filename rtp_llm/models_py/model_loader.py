@@ -634,6 +634,36 @@ class NewModelLoader:
         )
 
     @staticmethod
+    def _cuda_cufile_available() -> bool:
+        """Use fastsafetensors' native probe as the GDS source of truth."""
+        try:
+            from fastsafetensors import cpp as fastsafetensors_cpp
+        except (ImportError, OSError, RuntimeError):
+            return False
+        try:
+            return bool(fastsafetensors_cpp.is_cufile_found())
+        except (AttributeError, OSError, RuntimeError):
+            return False
+
+    @staticmethod
+    def _fastsafetensors_use_nogds(device: torch.device) -> bool:
+        if device.type == "cpu":
+            return True
+        if os.environ.get("FASTSAFETENSORS_NOGDS", "0") == "1":
+            return True
+        if (
+            device.type == "cuda"
+            and torch.version.hip is None
+            and not NewModelLoader._cuda_cufile_available()
+        ):
+            logger.warning(
+                "libcufile.so is unavailable; NewLoader fastsafetensors is "
+                "falling back to the CUDA nogds path"
+            )
+            return True
+        return False
+
+    @staticmethod
     def _model_storage_bytes(model: nn.Module) -> int:
         seen = set()
         total = 0
@@ -686,6 +716,12 @@ class NewModelLoader:
         if target_device.type == "cuda":
             if not torch.cuda.is_available():
                 return f"runtime device {target_device} is unavailable"
+            if automatic and torch.version.hip is not None:
+                return (
+                    "automatic fastsafetensors selection is disabled on ROCm "
+                    "until its GDS/shared-memory backend is validated; request "
+                    "fastsafetensors explicitly to override"
+                )
             if (
                 torch.version.hip is not None
                 and os.environ.get("FASTSAFETENSORS_NOGDS", "0") == "1"
@@ -845,10 +881,7 @@ class NewModelLoader:
         loader_device = str(target_device)
         if target_device.type == "cuda" and target_device.index is None:
             loader_device = f"cuda:{torch.cuda.current_device()}"
-        use_nogds = (
-            target_device.type == "cpu"
-            or os.environ.get("FASTSAFETENSORS_NOGDS", "0") == "1"
-        )
+        use_nogds = NewModelLoader._fastsafetensors_use_nogds(target_device)
         bbuf_size_kb = NewModelLoader._fastsafetensors_bbuf_size_kb(
             checkpoint_files
         )
