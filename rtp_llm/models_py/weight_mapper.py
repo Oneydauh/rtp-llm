@@ -16,6 +16,7 @@ from typing import (
 )
 
 import torch
+from rtp_llm.models_py.read_spec import ReadSpec
 
 _SAFETENSORS_INDEX = "model.safetensors.index.json"
 _PYTORCH_INDEX = "pytorch_model.bin.index.json"
@@ -100,6 +101,10 @@ class SafetensorSliceExpander(Protocol):
     ) -> Sequence[Tuple[str, int]]: ...
 
 
+class ReadSpecResolver(Protocol):
+    def __call__(self, name: str, shape: Tuple[int, ...]) -> ReadSpec: ...
+
+
 def _unwrap_pytorch_state_dict(payload: object) -> Mapping[str, object]:
     if not isinstance(payload, Mapping):
         raise TypeError(
@@ -117,6 +122,7 @@ def _load_safetensors(
     device: str,
     name_filter: Optional[Callable[[str], bool]] = None,
     slice_expander: Optional[SafetensorSliceExpander] = None,
+    read_spec_resolver: Optional[ReadSpecResolver] = None,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     from safetensors import safe_open
 
@@ -139,6 +145,15 @@ def _load_safetensors(
                     # safetensors backend materializes exactly one expert.
                     yield expanded_name, source[index : index + 1][0]
                 continue
+            if read_spec_resolver is not None:
+                source = handle.get_slice(name)
+                shape = tuple(source.get_shape())
+                read_spec = read_spec_resolver(name, shape)
+                if not read_spec.load:
+                    continue
+                if read_spec.slices is not None:
+                    yield read_spec.output_name, read_spec.materialize(source)
+                    continue
             yield name, handle.get_tensor(name)
 
 
@@ -146,6 +161,7 @@ def _load_pytorch(
     path: str,
     device: str,
     name_filter: Optional[Callable[[str], bool]] = None,
+    read_spec_resolver: Optional[ReadSpecResolver] = None,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     payload = torch.load(path, map_location=device, weights_only=True)
     state_dict = _unwrap_pytorch_state_dict(payload)
@@ -155,6 +171,13 @@ def _load_pytorch(
             and isinstance(tensor, torch.Tensor)
             and (name_filter is None or name_filter(name))
         ):
+            if read_spec_resolver is not None:
+                read_spec = read_spec_resolver(name, tuple(tensor.shape))
+                if not read_spec.load:
+                    continue
+                if read_spec.slices is not None:
+                    yield read_spec.output_name, read_spec.materialize(tensor)
+                    continue
             yield name, tensor
 
 
@@ -163,12 +186,17 @@ def get_all_weights(
     device: str = "cpu",
     name_filter: Optional[Callable[[str], bool]] = None,
     safetensor_slice_expander: Optional[SafetensorSliceExpander] = None,
+    read_spec_resolver: Optional[ReadSpecResolver] = None,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     seen = set()
     for path in ckpt_paths:
         if path.endswith(".safetensors"):
             weights = _load_safetensors(
-                path, device, name_filter, safetensor_slice_expander
+                path,
+                device,
+                name_filter,
+                safetensor_slice_expander,
+                read_spec_resolver,
             )
         elif path.endswith((".bin", ".pt", ".pth")):
             if safetensor_slice_expander is not None:
@@ -176,7 +204,7 @@ def get_all_weights(
                     "Safetensor slice expansion cannot be used with a PyTorch "
                     f"checkpoint: {path}"
                 )
-            weights = _load_pytorch(path, device, name_filter)
+            weights = _load_pytorch(path, device, name_filter, read_spec_resolver)
         else:
             raise ValueError(f"Unsupported checkpoint format: {path}")
         for name, tensor in weights:

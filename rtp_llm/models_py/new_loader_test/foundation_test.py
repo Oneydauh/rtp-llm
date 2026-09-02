@@ -9,6 +9,7 @@ from unittest import mock
 
 import torch
 import torch.nn as nn
+from rtp_llm.models_py.fastsafetensors_read_spec import iter_read_spec_tensors
 from rtp_llm.models_py.model_loader import (
     NewLoaderConfig,
     NewLoaderLoadMethod,
@@ -16,6 +17,12 @@ from rtp_llm.models_py.model_loader import (
     _ExpertRangeFilter,
 )
 from rtp_llm.models_py.module_base import RtpModule
+from rtp_llm.models_py.read_spec import (
+    LoadedCheckpointTensor,
+    ReadSpec,
+    make_sharded_read_spec,
+    unwrap_checkpoint_tensor,
+)
 from rtp_llm.models_py.registry import (
     get_model_class,
     is_model_registered,
@@ -62,6 +69,54 @@ class _FoundationModel(RtpModule):
 register_model("foundation_test_model")(_FoundationModel)
 
 
+class _TPLeaf(RtpModule):
+    def __init__(self, shape, shard_dim, tp_size, tp_rank):
+        super().__init__()
+        self.global_shape = tuple(shape)
+        self.shard_dim = shard_dim
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
+        local_shape = list(shape)
+        local_shape[shard_dim] //= tp_size
+        self.weight = nn.Parameter(
+            torch.empty(local_shape, dtype=torch.float32), requires_grad=False
+        )
+
+    def checkpoint_read_spec(self, name, shape):
+        if name != "weight" or tuple(shape) != self.global_shape:
+            return None
+        return make_sharded_read_spec(
+            name, tuple(shape), self.shard_dim, self.tp_size, self.tp_rank
+        )
+
+    def load_weights(self, weights):
+        for name, checkpoint_value in weights.items():
+            if name != "weight":
+                raise RuntimeError(f"Unsupported test tensor {name!r}")
+            tensor, read_spec = unwrap_checkpoint_tensor(checkpoint_value)
+            if read_spec is None:
+                width = self.global_shape[self.shard_dim] // self.tp_size
+                tensor = tensor.narrow(
+                    self.shard_dim, self.tp_rank * width, width
+                ).contiguous()
+            if not self._assign_weight(self, name, tensor):
+                raise RuntimeError(f"Failed to assign test tensor {name!r}")
+
+
+class _TPFoundationModel(RtpModule):
+    def __init__(self, model_config, load_config):
+        super().__init__()
+        tp_size = load_config.tp_size
+        tp_rank = load_config.tp_rank
+        self.column = _TPLeaf((6, 4), 0, tp_size, tp_rank)
+        self.row = _TPLeaf((4, 6), 1, tp_size, tp_rank)
+        self.embedding = _TPLeaf((8, 4), 0, tp_size, tp_rank)
+        self.lm_head = _TPLeaf((8, 4), 0, tp_size, tp_rank)
+
+
+register_model("foundation_tp_test_model")(_TPFoundationModel)
+
+
 def _weights():
     return {
         "layers.0.weight": torch.arange(4, dtype=torch.float32).reshape(2, 2),
@@ -99,6 +154,250 @@ class FoundationLoaderTest(unittest.TestCase):
             device="cpu", compute_dtype=torch.float32, **kwargs
         )
         return NewModelLoader(config, load_config, model_path=model_path)
+
+    def _tp_loader(self, model_path, **kwargs):
+        config = types.SimpleNamespace(model_type="foundation_tp_test_model")
+        load_config = NewLoaderConfig(
+            device="cpu",
+            compute_dtype=torch.float32,
+            tp_size=2,
+            tp_rank=1,
+            load_method=NewLoaderLoadMethod.SCRATCH,
+            **kwargs,
+        )
+        return NewModelLoader(config, load_config, model_path=model_path)
+
+    @staticmethod
+    def _tp_weights():
+        return {
+            "column.weight": torch.arange(24, dtype=torch.float32).reshape(6, 4),
+            "row.weight": torch.arange(24, dtype=torch.float32).reshape(4, 6),
+            "embedding.weight": torch.arange(32, dtype=torch.float32).reshape(8, 4),
+            "lm_head.weight": torch.arange(32, dtype=torch.float32).reshape(8, 4),
+        }
+
+    def test_scratch_read_spec_materializes_only_local_tp_slices(self):
+        checkpoint_weights = self._tp_weights()
+        with tempfile.TemporaryDirectory() as model_path:
+            save_file(checkpoint_weights, os.path.join(model_path, "model.safetensors"))
+            model = self._tp_loader(model_path).load()
+
+        self.assertTrue(
+            torch.equal(model.column.weight, checkpoint_weights["column.weight"][3:])
+        )
+        self.assertTrue(
+            torch.equal(model.row.weight, checkpoint_weights["row.weight"][:, 3:])
+        )
+        self.assertTrue(
+            torch.equal(
+                model.embedding.weight, checkpoint_weights["embedding.weight"][4:]
+            )
+        )
+        self.assertTrue(
+            torch.equal(model.lm_head.weight, checkpoint_weights["lm_head.weight"][4:])
+        )
+
+    def test_read_spec_resolver_reports_tp_dimension_and_ep_targets(self):
+        loader = self._tp_loader("unused")
+        model = _TPFoundationModel(None, loader.load_config)
+        resolver = loader._checkpoint_read_spec_resolver(model, None, None)
+
+        column = resolver("column.weight", (6, 4))
+        row = resolver("row.weight", (4, 6))
+        self.assertEqual(
+            (column.shard_dim, column.shard_count, column.shard_rank), (0, 2, 1)
+        )
+        self.assertEqual((row.shard_dim, row.shard_count, row.shard_rank), (1, 2, 1))
+
+        ep_loader = NewModelLoader(
+            types.SimpleNamespace(model_type="foundation_test_model"),
+            NewLoaderConfig(
+                device="cpu",
+                compute_dtype=torch.float32,
+                ep_size=2,
+                ep_rank=1,
+            ),
+            model_path="unused",
+        )
+        expert_filter = _ExpertRangeFilter(4, 2, 1)
+        ep_resolver = ep_loader._checkpoint_read_spec_resolver(
+            _FoundationModel(None, None), None, expert_filter
+        )
+        remote_expert = ep_resolver("layers.0.experts.0.weight", (4, 4))
+        local_expert = ep_resolver("layers.0.experts.3.weight", (4, 4))
+        self.assertFalse(remote_expert.load)
+        self.assertEqual(remote_expert.target_ranks, (0,))
+        self.assertTrue(local_expert.load)
+        self.assertEqual(local_expert.target_ranks, (1,))
+
+    def test_fst_read_spec_uses_get_sharded_before_yield(self):
+        source = torch.arange(24, dtype=torch.float32).reshape(4, 6)
+
+        class FakeGroup:
+            def size(self):
+                return 2
+
+            def rank(self):
+                return 1
+
+        class FakeFileBuffer:
+            pg = FakeGroup()
+
+            def __init__(self):
+                self.sharded_dims = []
+
+            def get_shape(self, key):
+                return source.shape
+
+            def get_sharded(self, key, dim):
+                self.sharded_dims.append(dim)
+                return source[:, 3:].clone()
+
+            def get_tensor(self, key):
+                raise AssertionError("full-tensor broadcast must not be used")
+
+        file_buffer = FakeFileBuffer()
+        resolver = lambda name, shape: make_sharded_read_spec(name, shape, 1, 2, 1)
+        result = list(iter_read_spec_tensors(file_buffer, ["row.weight"], resolver))
+
+        self.assertEqual(file_buffer.sharded_dims, [1])
+        self.assertEqual(len(result), 1)
+        name, value = result[0]
+        self.assertEqual(name, "row.weight")
+        self.assertIsInstance(value, LoadedCheckpointTensor)
+        self.assertTrue(torch.equal(value.tensor, source[:, 3:]))
+
+    def test_fst_read_spec_routes_per_expert_tensor_only_to_owner(self):
+        source = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+        class FakeGroup:
+            def size(self):
+                return 2
+
+            def rank(self):
+                return 1
+
+        class FakeFileBuffer:
+            pg = FakeGroup()
+
+            def __init__(self):
+                self.pushes = []
+
+            def get_shape(self, key):
+                return source.shape
+
+            def _get_rank_lidx(self, key):
+                return 0, 0
+
+            def push_tensor(self, key, target_rank):
+                self.pushes.append(target_rank)
+                return source.clone() if target_rank == self.pg.rank() else None
+
+            def get_tensor(self, key):
+                raise AssertionError("WORLD broadcast must not be used")
+
+        file_buffer = FakeFileBuffer()
+
+        def resolver(name, shape):
+            return ReadSpec.full(name, shape).with_targets((1,), load=True)
+
+        result = list(
+            iter_read_spec_tensors(file_buffer, ["experts.3.weight"], resolver)
+        )
+        self.assertEqual(file_buffer.pushes, [1])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], "experts.3.weight")
+        self.assertTrue(torch.equal(result[0][1], source))
+
+    def test_fst_read_spec_broadcasts_when_expert_has_multiple_owners(self):
+        source = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+        class FakeGroup:
+            def size(self):
+                return 4
+
+            def rank(self):
+                return 3
+
+        class FakeFileBuffer:
+            pg = FakeGroup()
+
+            def __init__(self):
+                self.broadcasts = []
+
+            def get_shape(self, key):
+                return source.shape
+
+            def _get_rank_lidx(self, key):
+                return 0, 0
+
+            def push_tensor(self, key, target_rank):
+                raise AssertionError("repeated targeted push is unsafe")
+
+            def get_tensor(self, key):
+                self.broadcasts.append(key)
+                return source.clone()
+
+        file_buffer = FakeFileBuffer()
+
+        def resolver(name, shape):
+            return ReadSpec.full(name, shape).with_targets((1, 3), load=True)
+
+        result = list(
+            iter_read_spec_tensors(file_buffer, ["experts.3.weight"], resolver)
+        )
+        self.assertEqual(file_buffer.broadcasts, ["experts.3.weight"])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], "experts.3.weight")
+        self.assertTrue(torch.equal(result[0][1], source))
+
+    def test_fst_read_spec_shards_stacked_experts_before_expansion(self):
+        source = torch.arange(32, dtype=torch.float32).reshape(4, 2, 4)
+
+        class FakeGroup:
+            def size(self):
+                return 2
+
+            def rank(self):
+                return 1
+
+        class FakeFileBuffer:
+            pg = FakeGroup()
+
+            def __init__(self):
+                self.sharded_dims = []
+
+            def get_shape(self, key):
+                return source.shape
+
+            def get_sharded(self, key, dim):
+                self.sharded_dims.append(dim)
+                return source[2:].clone()
+
+            def get_tensor(self, key):
+                raise AssertionError("all-expert broadcast must not be used")
+
+        file_buffer = FakeFileBuffer()
+        expert_filter = _ExpertRangeFilter(num_experts=4, ep_size=2, ep_rank=1)
+        result = list(
+            iter_read_spec_tensors(
+                file_buffer,
+                ["layers.0.experts.gate_up_proj.weight"],
+                lambda name, shape: ReadSpec.full(name, shape),
+                expert_filter,
+            )
+        )
+
+        self.assertEqual(file_buffer.sharded_dims, [0])
+        self.assertEqual(
+            [name for name, _ in result],
+            [
+                "layers.0.experts.2.gate_up_proj.weight",
+                "layers.0.experts.3.gate_up_proj.weight",
+            ],
+        )
+        self.assertTrue(torch.equal(result[0][1], source[2]))
+        self.assertTrue(torch.equal(result[1][1], source[3]))
 
     def test_auto_load_method_is_preserved_without_environment_override(self):
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -781,7 +1080,7 @@ class FoundationLoaderTest(unittest.TestCase):
         ), self.assertRaisesRegex(RuntimeError, "incompatible"):
             NewModelLoader._fastsafetensors_api()
 
-    def test_fastsafetensors_rejects_stacked_experts_before_streaming(self):
+    def test_fastsafetensors_accepts_stacked_experts_for_ep_world(self):
         stacked = torch.arange(16, dtype=torch.float32).reshape(4, 2, 2)
         expert_filter = _ExpertRangeFilter(num_experts=4, ep_size=2, ep_rank=1)
 
@@ -789,17 +1088,69 @@ class FoundationLoaderTest(unittest.TestCase):
             checkpoint = os.path.join(model_path, "model.safetensors")
             save_file({"layers.0.experts.gate_up_proj.weight": stacked}, checkpoint)
             loader = self._loader(
-                model_path, load_method=NewLoaderLoadMethod.FASTSAFETENSORS
+                model_path,
+                ep_size=2,
+                ep_rank=1,
+                load_method=NewLoaderLoadMethod.FASTSAFETENSORS,
+            )
+            compatible_loader = type(
+                "CompatibleParallelLoader", (), {"_consume_single_batch": lambda: None}
             )
             with mock.patch.object(
-                loader, "_fastsafetensors_api", return_value=(mock.Mock(), mock.Mock())
-            ), self.assertRaisesRegex(RuntimeError, "stacked all-expert"):
-                loader._select_load_method(
-                    NewLoaderLoadMethod.FASTSAFETENSORS,
+                loader,
+                "_fastsafetensors_api",
+                return_value=(compatible_loader, mock.Mock()),
+            ), mock.patch.object(
+                torch.distributed, "is_initialized", return_value=True
+            ), mock.patch.object(
+                torch.distributed, "get_world_size", return_value=2
+            ), mock.patch.object(
+                torch.distributed, "get_rank", return_value=1
+            ):
+                reason = loader._fastsafetensors_prerequisite_reason(
                     _FoundationModel(None, None),
                     [checkpoint],
-                    expert_filter,
+                    automatic=False,
+                    expert_filter=expert_filter,
                 )
+        self.assertIsNone(reason)
+
+    def test_fastsafetensors_rejects_stacked_experts_with_repeated_ep_ranks(self):
+        stacked = torch.arange(16, dtype=torch.float32).reshape(4, 2, 2)
+        expert_filter = _ExpertRangeFilter(num_experts=4, ep_size=2, ep_rank=1)
+
+        with tempfile.TemporaryDirectory() as model_path:
+            checkpoint = os.path.join(model_path, "model.safetensors")
+            save_file({"layers.0.experts.gate_up_proj.weight": stacked}, checkpoint)
+            loader = self._loader(
+                model_path,
+                tp_size=4,
+                tp_rank=1,
+                ep_size=2,
+                ep_rank=1,
+                load_method=NewLoaderLoadMethod.FASTSAFETENSORS,
+            )
+            compatible_loader = type(
+                "CompatibleParallelLoader", (), {"_consume_single_batch": lambda: None}
+            )
+            with mock.patch.object(
+                loader,
+                "_fastsafetensors_api",
+                return_value=(compatible_loader, mock.Mock()),
+            ), mock.patch.object(
+                torch.distributed, "is_initialized", return_value=True
+            ), mock.patch.object(
+                torch.distributed, "get_world_size", return_value=4
+            ), mock.patch.object(
+                torch.distributed, "get_rank", return_value=1
+            ):
+                reason = loader._fastsafetensors_prerequisite_reason(
+                    _FoundationModel(None, None),
+                    [checkpoint],
+                    automatic=False,
+                    expert_filter=expert_filter,
+                )
+        self.assertIn("stacked all-expert", reason)
 
     def test_fastsafetensors_rejects_rank_local_checkpoint(self):
         with tempfile.TemporaryDirectory() as model_path:

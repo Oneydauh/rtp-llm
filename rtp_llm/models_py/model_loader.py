@@ -12,6 +12,7 @@ import rtp_llm.models_py.weight_mapper as weight_mapper
 import torch
 import torch.nn as nn
 from rtp_llm.models_py.module_base import RtpModule, collect_loaded_tensor_ids
+from rtp_llm.models_py.read_spec import LoadedCheckpointTensor, ReadSpec
 from rtp_llm.models_py.registry import get_model_class, list_models
 
 logger = logging.getLogger(__name__)
@@ -72,15 +73,38 @@ class _ExpertRangeFilter:
         self.ep_size = ep_size
         self.num_experts = num_experts
 
-    def should_load(self, name: str) -> bool:
+    def expert_id(self, name: str) -> Optional[int]:
         match = _EXPERT_ID_RE.search(name)
-        if match is not None:
-            expert_id = int(match.group(1))
-            if not 0 <= expert_id < self.num_experts:
-                raise ValueError(
-                    f"Checkpoint tensor {name!r} has expert id {expert_id} outside "
-                    f"[0, {self.num_experts})"
-                )
+        if match is None:
+            return None
+        expert_id = int(match.group(1))
+        if not 0 <= expert_id < self.num_experts:
+            raise ValueError(
+                f"Checkpoint tensor {name!r} has expert id {expert_id} outside "
+                f"[0, {self.num_experts})"
+            )
+        return expert_id
+
+    def target_ep_rank(self, name: str) -> Optional[int]:
+        expert_id = self.expert_id(name)
+        if expert_id is None:
+            return None
+        experts_per_rank = self.num_experts // self.ep_size
+        return expert_id // experts_per_rank
+
+    def target_world_ranks(
+        self, name: str, world_size: int
+    ) -> Optional[Tuple[int, ...]]:
+        target_ep_rank = self.target_ep_rank(name)
+        if target_ep_rank is None:
+            return None
+        return tuple(
+            rank for rank in range(world_size) if rank % self.ep_size == target_ep_rank
+        )
+
+    def should_load(self, name: str) -> bool:
+        expert_id = self.expert_id(name)
+        if expert_id is not None:
             return self.start_expert <= expert_id < self.end_expert
         if self.ep_size > 1 and _STACKED_EXPERT_RE.fullmatch(name):
             raise ValueError(
@@ -474,6 +498,48 @@ class NewModelLoader:
 
         return should_load
 
+    @staticmethod
+    def _mapped_checkpoint_name(model: RtpModule, name: str) -> str:
+        mapper = getattr(model, "WEIGHTS_MAPPER", None)
+        map_name = getattr(mapper, "map_name", None)
+        return map_name(name) if callable(map_name) else name
+
+    def _checkpoint_read_spec_resolver(
+        self,
+        model: RtpModule,
+        model_filter: Optional[Callable[[str], bool]],
+        expert_filter: Optional[_ExpertRangeFilter],
+    ) -> Callable[[str, Tuple[int, ...]], ReadSpec]:
+        model_filter = _require_callable_name_filter(model_filter, "model_filter")
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+        else:
+            world_size = max(self.load_config.tp_size, self.load_config.ep_size)
+
+        def resolve(name: str, shape: Tuple[int, ...]) -> ReadSpec:
+            shape = tuple(shape)
+            if model_filter is not None and not model_filter(name):
+                return ReadSpec.skip(name, shape)
+            if not model.allow_checkpoint_read_spec(name):
+                return ReadSpec.full(name, shape)
+
+            mapped_name = self._mapped_checkpoint_name(model, name)
+            read_spec = model.resolve_checkpoint_read_spec(mapped_name, shape)
+            if read_spec is None:
+                read_spec = ReadSpec.full(name, shape)
+            else:
+                read_spec = read_spec.for_checkpoint_name(name)
+
+            if expert_filter is not None:
+                target_ranks = expert_filter.target_world_ranks(name, world_size)
+                if target_ranks is not None:
+                    read_spec = read_spec.with_targets(
+                        target_ranks, expert_filter.should_load(name)
+                    )
+            return read_spec
+
+        return resolve
+
     def _validate_ep_checkpoint_format(
         self,
         checkpoint_files,
@@ -837,7 +903,7 @@ class NewModelLoader:
             return distributed_reason
 
         try:
-            self._fastsafetensors_api()
+            ParallelLoader, _ = self._fastsafetensors_api()
         except RuntimeError as exc:
             return str(exc)
         try:
@@ -855,18 +921,20 @@ class NewModelLoader:
             )
             return f"checkpoint tensor names are duplicated: {sample}{suffix}"
         if expert_filter is not None and stacked_experts:
-            sample = stacked_experts[:10]
-            suffix = (
-                f" (+{len(stacked_experts) - len(sample)} more)"
-                if len(stacked_experts) > len(sample)
-                else ""
+            expected_world_size = max(
+                self.load_config.tp_size, self.load_config.ep_size
             )
-            return (
-                "EP fastsafetensors loading does not support stacked all-expert "
-                "tensors because ParallelLoader materializes non-local experts "
-                f"before slicing: {sample}{suffix}; use scratch or a per-expert "
-                "checkpoint"
-            )
+            if self.load_config.ep_size != expected_world_size:
+                return (
+                    "stacked all-expert FST loading requires ep_size to equal "
+                    "the WORLD size so get_sharded(dim=0) maps one expert range "
+                    "to each EP rank"
+                )
+            if not hasattr(ParallelLoader, "_consume_single_batch"):
+                return (
+                    "the installed fastsafetensors ParallelLoader does not expose "
+                    "the batch hook required for stacked all-expert sharding"
+                )
         if automatic:
             device_index = (
                 torch.cuda.current_device()
@@ -972,6 +1040,7 @@ class NewModelLoader:
         device: str,
         name_filter: Optional[Callable[[str], bool]],
         safetensor_slice_expander: Optional[_ExpertRangeFilter],
+        read_spec_resolver: Optional[Callable[[str, Tuple[int, ...]], ReadSpec]] = None,
     ) -> Iterator[Tuple[str, torch.Tensor]]:
         """Stream safetensors directly to the model's runtime device.
 
@@ -992,7 +1061,7 @@ class NewModelLoader:
             loader_device = f"cuda:{torch.cuda.current_device()}"
         use_nogds = NewModelLoader._fastsafetensors_use_nogds(target_device)
         bbuf_size_kb = NewModelLoader._fastsafetensors_bbuf_size_kb(checkpoint_files)
-        loader = ParallelLoader(
+        loader_kwargs = dict(
             pg=process_group,
             hf_weights_files=sorted(os.fspath(path) for path in checkpoint_files),
             use_tqdm_on_load=True,
@@ -1001,9 +1070,50 @@ class NewModelLoader:
             use_shm=not use_nogds,
             nogds=use_nogds,
         )
+        loader_handles_read_specs = False
+        if read_spec_resolver is not None and hasattr(
+            ParallelLoader, "_consume_single_batch"
+        ):
+            try:
+                from fastsafetensors.parallel_loader import TimingContext
+                from rtp_llm.models_py.fastsafetensors_read_spec import (
+                    build_read_spec_parallel_loader,
+                )
+
+                read_spec_loader = build_read_spec_parallel_loader(
+                    ParallelLoader, TimingContext
+                )
+                loader = read_spec_loader(
+                    read_spec_resolver=read_spec_resolver,
+                    safetensor_slice_expander=safetensor_slice_expander,
+                    **loader_kwargs,
+                )
+                loader_handles_read_specs = True
+            except (ImportError, TypeError, ValueError) as exc:
+                if safetensor_slice_expander is not None:
+                    raise RuntimeError(
+                        "fastsafetensors does not expose compatible internals "
+                        "required for EP stacked expert sharding"
+                    ) from exc
+                logger.warning(
+                    "fastsafetensors does not expose compatible ReadSpec "
+                    "internals; applying slices after tensor materialization"
+                )
+                loader = ParallelLoader(**loader_kwargs)
+        else:
+            loader = ParallelLoader(**loader_kwargs)
         seen = set()
         try:
-            for name, tensor in loader.iterate_weights():
+            for name, checkpoint_value in loader.iterate_weights():
+                if isinstance(checkpoint_value, LoadedCheckpointTensor):
+                    tensor_value = checkpoint_value.tensor
+                else:
+                    tensor_value = checkpoint_value
+                if read_spec_resolver is not None and not loader_handles_read_specs:
+                    read_spec = read_spec_resolver(name, tuple(tensor_value.shape))
+                    if not read_spec.load:
+                        continue
+                    checkpoint_value = read_spec.materialize(tensor_value)
                 if name_filter is not None and not name_filter(name):
                     continue
                 if (
@@ -1011,8 +1121,8 @@ class NewModelLoader:
                     and safetensor_slice_expander.handles_safetensor(name)
                 ):
                     raise RuntimeError(
-                        "EP fastsafetensors preflight failed to reject stacked "
-                        f"all-expert tensor {name!r} before device materialization"
+                        "EP fastsafetensors backend failed to shard and expand "
+                        f"stacked all-expert tensor {name!r}"
                     )
                 if name in seen:
                     raise RuntimeError(
@@ -1020,7 +1130,7 @@ class NewModelLoader:
                         "fastsafetensors loading"
                     )
                 seen.add(name)
-                yield name, tensor
+                yield name, checkpoint_value
         finally:
             backing_loader = getattr(loader, "loader", None)
             close = getattr(backing_loader, "close", None)
@@ -1100,6 +1210,9 @@ class NewModelLoader:
         self._validate_runtime_backends(model, self.load_config.device)
         model_filter = self._model_checkpoint_name_filter(model)
         name_filter = self._checkpoint_name_filter(model_filter, expert_filter)
+        read_spec_resolver = self._checkpoint_read_spec_resolver(
+            model, model_filter, expert_filter
+        )
         selected_files = weight_mapper.select_safetensor_files(
             self._resolved_model_path(), checkpoint_files, model_filter
         )
@@ -1129,6 +1242,7 @@ class NewModelLoader:
                 self.load_config.device,
                 name_filter,
                 expert_filter,
+                read_spec_resolver,
             )
         else:
             weights = weight_mapper.get_all_weights(
@@ -1136,6 +1250,7 @@ class NewModelLoader:
                 device="cpu",
                 name_filter=name_filter,
                 safetensor_slice_expander=expert_filter,
+                read_spec_resolver=read_spec_resolver,
             )
         try:
             model.load_weights(weights)

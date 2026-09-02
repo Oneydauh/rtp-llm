@@ -2,9 +2,13 @@ from typing import Dict
 
 import torch
 import torch.nn as nn
-
 from rtp_llm.models_py.distributed.collective_torch import Group, all_gather, all_reduce
 from rtp_llm.models_py.module_base import RtpModule
+from rtp_llm.models_py.read_spec import (
+    ReadSpec,
+    make_sharded_read_spec,
+    unwrap_checkpoint_tensor,
+)
 
 
 def _positive_int(value: int, label: str) -> None:
@@ -54,16 +58,43 @@ class VocabParallelEmbedding(RtpModule):
             requires_grad=False,
         )
 
+    def checkpoint_read_spec(
+        self, name: str, shape: tuple[int, ...]
+    ) -> ReadSpec | None:
+        if (
+            self.tp_size <= 1
+            or name != "weight"
+            or shape != (self.vocab_size, self.embedding_dim)
+        ):
+            return None
+        return make_sharded_read_spec(name, shape, 0, self.tp_size, self.tp_rank)
+
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
-        for name, tensor in weights.items():
+        for name, checkpoint_value in weights.items():
+            tensor, read_spec = unwrap_checkpoint_tensor(checkpoint_value)
             if name != "weight":
                 raise RuntimeError(f"Unsupported embedding tensor {name!r}")
-            if tensor.shape[0] != self.vocab_size:
+            expected_rows = (
+                self.vocab_size_per_partition
+                if read_spec is not None
+                else self.vocab_size
+            )
+            if read_spec is None and tensor.shape[0] != self.vocab_size:
                 raise ValueError(
                     f"Embedding checkpoint rows must be {self.vocab_size}, "
                     f"got {tensor.shape[0]}"
                 )
-            local = tensor[self.vocab_start_idx : self.vocab_end_idx]
+            if tensor.shape != (expected_rows, self.embedding_dim):
+                raise ValueError(
+                    f"Embedding checkpoint shape must be "
+                    f"{(expected_rows, self.embedding_dim)}, got "
+                    f"{tuple(tensor.shape)}"
+                )
+            local = (
+                tensor
+                if read_spec is not None
+                else tensor[self.vocab_start_idx : self.vocab_end_idx]
+            )
             if not self._assign_weight(self, "weight", local.contiguous()):
                 raise RuntimeError("Failed to assign embedding weight")
 
@@ -109,14 +140,34 @@ class ParallelLMHead(RtpModule):
             requires_grad=False,
         )
 
-    def _copy_weight(self, tensor: torch.Tensor) -> None:
-        if tensor.shape[0] != self.vocab_size:
+    def checkpoint_read_spec(
+        self, name: str, shape: tuple[int, ...]
+    ) -> ReadSpec | None:
+        if (
+            self.tp_size <= 1
+            or name != "weight"
+            or shape != (self.vocab_size, self.hidden_size)
+        ):
+            return None
+        return make_sharded_read_spec(name, shape, 0, self.tp_size, self.tp_rank)
+
+    def _copy_weight(self, tensor: torch.Tensor, local_shard: bool = False) -> None:
+        expected_rows = (
+            self.vocab_size_per_partition if local_shard else self.vocab_size
+        )
+        if not local_shard and tensor.shape[0] != self.vocab_size:
             raise ValueError(
                 f"LM head checkpoint rows must be {self.vocab_size}, "
                 f"got {tensor.shape[0]}"
             )
-        start = self.tp_rank * self.vocab_size_per_partition
-        tensor = tensor[start : start + self.vocab_size_per_partition]
+        if tensor.shape != (expected_rows, self.hidden_size):
+            raise ValueError(
+                f"LM head checkpoint shape must be "
+                f"{(expected_rows, self.hidden_size)}, got {tuple(tensor.shape)}"
+            )
+        if not local_shard:
+            start = self.tp_rank * self.vocab_size_per_partition
+            tensor = tensor[start : start + self.vocab_size_per_partition]
         if not self._assign_weight(self, "weight", tensor.contiguous()):
             raise RuntimeError("Failed to assign LM head weight")
 
@@ -130,10 +181,11 @@ class ParallelLMHead(RtpModule):
             raise RuntimeError("Failed to assign tied LM head weight")
 
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
-        for name, tensor in weights.items():
+        for name, checkpoint_value in weights.items():
+            tensor, read_spec = unwrap_checkpoint_tensor(checkpoint_value)
             if name != "weight":
                 raise RuntimeError(f"Unsupported LM head tensor {name!r}")
-            self._copy_weight(tensor)
+            self._copy_weight(tensor, local_shard=read_spec is not None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         output = torch.nn.functional.linear(x, self.weight)

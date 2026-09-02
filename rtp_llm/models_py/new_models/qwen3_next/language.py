@@ -1763,6 +1763,20 @@ class Qwen3NextForCausalLM(GptModelBase):
     def checkpoint_weight_name_filter(self) -> Optional[Callable[[str], bool]]:
         return self._is_core_checkpoint_weight
 
+    def allow_checkpoint_read_spec(self, checkpoint_name: str) -> bool:
+        # q_proj contains both q and the linear-attention gate in this source
+        # checkpoint. ``load_weights`` must split those logical tensors before
+        # either consumer can declare its own TP slice.
+        return not any(
+            checkpoint_name.endswith(f"self_attn.q_proj.{suffix}")
+            for suffix in (
+                "weight",
+                "weight_scale",
+                "weight_scale_inv",
+                "input_scale",
+            )
+        )
+
     def load_weights(self, weights):
         if isinstance(weights, dict):
             weights_iter = iter(weights.items())

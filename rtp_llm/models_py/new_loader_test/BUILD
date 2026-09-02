@@ -24,3 +24,12 @@ py_test(
         "//rtp_llm:torch",
     ],
 )
+
+py_test(
+    name = "read_spec_test",
+    srcs = ["read_spec_test.py"],
+    deps = [
+        "//rtp_llm/models_py:new_weight_loader",
+        "//rtp_llm:torch",
+    ],
+)

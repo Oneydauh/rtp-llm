@@ -3,10 +3,14 @@ from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
-
 from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
 from rtp_llm.models_py.module_base import RtpModule, copy_weight_
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
+from rtp_llm.models_py.read_spec import (
+    ReadSpec,
+    make_sharded_read_spec,
+    unwrap_checkpoint_tensor,
+)
 
 
 def _require_positive_int(value: int, label: str) -> None:
@@ -190,8 +194,45 @@ class ColumnParallelLinear(LinearBase):
             params_dtype=params_dtype,
         )
 
+    def checkpoint_read_spec(
+        self, name: str, shape: tuple[int, ...]
+    ) -> Optional[ReadSpec]:
+        if self.tp_size <= 1:
+            return None
+        param_name = self._get_param_name(name)
+        global_output = self.output_size_per_partition * self.tp_size
+        dim = None
+        if param_name == "weight":
+            if shape == (global_output, self.input_size):
+                dim = 0
+            elif shape == (self.input_size, global_output):
+                dim = 1
+        elif param_name == "bias" and shape == (global_output,):
+            dim = 0
+        elif param_name in ("weight_scale", "input_scale"):
+            if len(shape) > 0 and shape[0] == global_output:
+                dim = 0
+        elif param_name == "weight_scale_inv" and len(shape) > 0:
+            block_n, _ = self.fp8_scale_block_size()
+            start_row = self.tp_rank * self.output_size_per_partition
+            if (
+                start_row % block_n != 0
+                or self.output_size_per_partition % block_n != 0
+            ):
+                raise ValueError(
+                    f"{self.prefix}.weight_scale_inv TP output shard must align "
+                    f"to FP8 block {block_n}: start={start_row}, "
+                    f"rows={self.output_size_per_partition}"
+                )
+            dim = 0
+        if dim is None:
+            return None
+        return make_sharded_read_spec(name, shape, dim, self.tp_size, self.tp_rank)
+
     def load_weights(self, weights: Dict[str, torch.Tensor]):
-        for name, tensor in weights.items():
+        for name, checkpoint_value in weights.items():
+            tensor, read_spec = unwrap_checkpoint_tensor(checkpoint_value)
+            local_shard = read_spec is not None
             param_name = self._get_param_name(name)
             if param_name is None:
                 continue
@@ -204,22 +245,28 @@ class ColumnParallelLinear(LinearBase):
 
             if param_name == "weight":
                 global_output = self.output_size_per_partition * self.tp_size
-                expected = (global_output, self.input_size)
+                expected_output = (
+                    self.output_size_per_partition if local_shard else global_output
+                )
+                expected = (expected_output, self.input_size)
                 if tuple(tensor.shape) == expected:
                     pass
-                elif tuple(tensor.shape) == (self.input_size, global_output):
+                elif tuple(tensor.shape) == (self.input_size, expected_output):
                     tensor = tensor.t().contiguous()
                 else:
                     raise ValueError(
                         f"{self.prefix}.weight checkpoint shape must be {expected}, "
                         f"got {tuple(tensor.shape)}"
                     )
-                tensor = self._split_weight(tensor, dim=0)
+                if not local_shard:
+                    tensor = self._split_weight(tensor, dim=0)
             elif param_name == "bias":
-                tensor = self._split_weight(tensor, dim=0)
+                if not local_shard:
+                    tensor = self._split_weight(tensor, dim=0)
             elif param_name in ("weight_scale", "input_scale"):
                 if (
-                    tensor.numel() > 1
+                    not local_shard
+                    and tensor.numel() > 1
                     and tensor.shape[0] == self.output_size_per_partition * self.tp_size
                 ):
                     tensor = self._split_weight(tensor, dim=0)
@@ -236,7 +283,8 @@ class ColumnParallelLinear(LinearBase):
                             f"align to FP8 block {block_n}: start={start_row}, "
                             f"rows={self.output_size_per_partition}"
                         )
-                    tensor = self._split_weight(tensor, dim=0)
+                    if not local_shard:
+                        tensor = self._split_weight(tensor, dim=0)
             if (
                 param_name != "weight"
                 and tensor.shape != param.shape
@@ -323,8 +371,43 @@ class RowParallelLinear(LinearBase):
             params_dtype=params_dtype,
         )
 
+    def checkpoint_read_spec(
+        self, name: str, shape: tuple[int, ...]
+    ) -> Optional[ReadSpec]:
+        if self.tp_size <= 1:
+            return None
+        param_name = self._get_param_name(name)
+        global_input = self.input_size_per_partition * self.tp_size
+        dim = None
+        if param_name == "weight":
+            if shape == (self.output_size, global_input):
+                dim = 1
+            elif shape == (global_input, self.output_size):
+                dim = 0
+        elif param_name in ("weight_scale", "input_scale"):
+            if len(shape) > 0 and shape[-1] == global_input:
+                dim = len(shape) - 1
+        elif param_name == "weight_scale_inv" and len(shape) > 1:
+            _, block_k = self.fp8_scale_block_size()
+            start_column = self.tp_rank * self.input_size_per_partition
+            if (
+                start_column % block_k != 0
+                or self.input_size_per_partition % block_k != 0
+            ):
+                raise ValueError(
+                    f"{self.prefix}.weight_scale_inv TP input shard must align "
+                    f"to FP8 block {block_k}: start={start_column}, "
+                    f"columns={self.input_size_per_partition}"
+                )
+            dim = 1
+        if dim is None:
+            return None
+        return make_sharded_read_spec(name, shape, dim, self.tp_size, self.tp_rank)
+
     def load_weights(self, weights: Dict[str, torch.Tensor]):
-        for name, tensor in weights.items():
+        for name, checkpoint_value in weights.items():
+            tensor, read_spec = unwrap_checkpoint_tensor(checkpoint_value)
+            local_shard = read_spec is not None
             param_name = self._get_param_name(name)
             if param_name is None:
                 continue
@@ -337,22 +420,27 @@ class RowParallelLinear(LinearBase):
 
             if param_name == "weight":
                 global_input = self.input_size_per_partition * self.tp_size
-                expected = (self.output_size, global_input)
+                expected_input = (
+                    self.input_size_per_partition if local_shard else global_input
+                )
+                expected = (self.output_size, expected_input)
                 if tuple(tensor.shape) == expected:
                     pass
-                elif tuple(tensor.shape) == (global_input, self.output_size):
+                elif tuple(tensor.shape) == (expected_input, self.output_size):
                     tensor = tensor.t().contiguous()
                 else:
                     raise ValueError(
                         f"{self.prefix}.weight checkpoint shape must be {expected}, "
                         f"got {tuple(tensor.shape)}"
                     )
-                tensor = self._split_weight(tensor, dim=1)
+                if not local_shard:
+                    tensor = self._split_weight(tensor, dim=1)
             elif param_name in ("weight_scale", "input_scale"):
                 if tensor.numel() == param.numel():
                     tensor = tensor.reshape(param.shape)
                 elif (
-                    tensor.numel() > 1
+                    not local_shard
+                    and tensor.numel() > 1
                     and tensor.shape[-1] == self.input_size_per_partition * self.tp_size
                 ):
                     tensor = self._split_weight(tensor, dim=-1)
@@ -369,7 +457,8 @@ class RowParallelLinear(LinearBase):
                             f"align to FP8 block {block_k}: start={start_column}, "
                             f"columns={self.input_size_per_partition}"
                         )
-                    tensor = self._split_weight(tensor, dim=1)
+                    if not local_shard:
+                        tensor = self._split_weight(tensor, dim=1)
             if (
                 param_name != "weight"
                 and tensor.shape != param.shape
@@ -422,6 +511,46 @@ class RowParallelLinear(LinearBase):
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
 
+    def checkpoint_read_spec(
+        self, name: str, shape: tuple[int, ...]
+    ) -> Optional[ReadSpec]:
+        if self.tp_size <= 1:
+            return None
+        shard_id = self._get_shard_id(name)
+        if shard_id < 0:
+            # A fused checkpoint key requires one disjoint range per logical
+            # projection. Keep that layout on the existing full-tensor path.
+            return None
+        param_name = self._get_param_name(name)
+        shard_size = self.output_size_per_partition // len(self.shard_names)
+        global_rows = shard_size * self.tp_size
+        dim = None
+        if param_name == "weight":
+            if shape == (global_rows, self.input_size):
+                dim = 0
+            elif shape == (self.input_size, global_rows):
+                dim = 1
+        elif param_name == "bias" and shape == (global_rows,):
+            dim = 0
+        elif param_name == "weight_scale_inv" and len(shape) > 0:
+            block_n, _ = self.fp8_scale_block_size()
+            if global_rows % block_n or shard_size % block_n:
+                raise ValueError(
+                    f"{self.prefix}.{param_name} shard must align to FP8 "
+                    f"output block {block_n}: global_rows={global_rows}, "
+                    f"local_rows={shard_size}"
+                )
+            dim = 0
+        elif (
+            param_name in ("weight_scale", "input_scale")
+            and len(shape) > 0
+            and shape[0] == global_rows
+        ):
+            dim = 0
+        if dim is None:
+            return None
+        return make_sharded_read_spec(name, shape, dim, self.tp_size, self.tp_rank)
+
     def __init__(
         self,
         input_size: int,
@@ -464,7 +593,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         num_shards = len(self.shard_names) if self.shard_names else 1
         shard_size = self.output_size_per_partition // num_shards
 
-        for full_name, tensor in weights.items():
+        for full_name, checkpoint_value in weights.items():
+            tensor, read_spec = unwrap_checkpoint_tensor(checkpoint_value)
+            local_shard = read_spec is not None
             param_name = self._get_param_name(full_name)
             shard_id = self._get_shard_id(full_name)
             if param_name == "bias" and self.bias is None:
@@ -547,7 +678,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                         )
                     blocks_per_shard = self._ceil_div(shard_size, block_n)
                     if (
-                        self.tp_size > 1
+                        not local_shard
+                        and self.tp_size > 1
                         and tensor.shape[0] == blocks_per_shard * self.tp_size
                     ):
                         start = self.tp_rank * blocks_per_shard
@@ -589,7 +721,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 # Per-channel/per-shard tensor: TP-slice + offset copy along dim 0.
                 # Convention: ckpt tensor's dim-0 covers one shard's full output
                 # (= shard_size * tp_size).
-                if self.tp_size > 1 and tensor.shape[0] == shard_size * self.tp_size:
+                if (
+                    not local_shard
+                    and self.tp_size > 1
+                    and tensor.shape[0] == shard_size * self.tp_size
+                ):
                     start = self.tp_rank * shard_size
                     tensor = tensor.narrow(0, start, shard_size).contiguous()
                 offset = shard_id * shard_size
@@ -669,17 +805,18 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
             if param_name == "weight":
                 global_shard = shard_size * self.tp_size
-                expected = (global_shard, self.input_size)
+                expected_rows = shard_size if local_shard else global_shard
+                expected = (expected_rows, self.input_size)
                 if tuple(tensor.shape) == expected:
                     pass
-                elif tuple(tensor.shape) == (self.input_size, global_shard):
+                elif tuple(tensor.shape) == (self.input_size, expected_rows):
                     tensor = tensor.t().contiguous()
                 else:
                     raise ValueError(
                         f"{self.prefix}.{self.shard_names[shard_id]}.weight rows "
-                        f"must be {global_shard}, got {tensor.shape[0]}"
+                        f"must be {expected_rows}, got {tensor.shape[0]}"
                     )
-            if self.tp_size > 1:
+            if self.tp_size > 1 and not local_shard:
                 _require_divisible(
                     tensor.shape[0], self.tp_size, "checkpoint merged shard"
                 )
@@ -823,6 +960,61 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
 class QKVParallelLinear(ColumnParallelLinear):
 
+    def checkpoint_read_spec(
+        self, name: str, shape: tuple[int, ...]
+    ) -> Optional[ReadSpec]:
+        if self.tp_size <= 1:
+            return None
+        projection = _projection_name(name, self.shard_names)
+        qkv_key = {
+            "q_proj": "q",
+            "k_proj": "k",
+            "v_proj": "v",
+        }.get(projection)
+        if qkv_key is None:
+            # A fused QKV key needs three disjoint ranges with potentially
+            # different replication factors.
+            return None
+
+        param_name = self._get_param_name(name)
+        if qkv_key == "q":
+            num_heads = self.num_heads
+            shard_count = self.tp_size
+            shard_rank = self.tp_rank
+        else:
+            num_heads = self.num_kv_heads
+            shard_count = math.gcd(self.num_kv_heads, self.tp_size)
+            shard_rank = self.kv_head_rank
+        global_rows = num_heads * self.head_dim
+        dim = None
+        if param_name == "weight":
+            if shape == (global_rows, self.hidden_size):
+                dim = 0
+            elif shape == (self.hidden_size, global_rows):
+                dim = 1
+        elif param_name == "bias" and shape == (global_rows,):
+            dim = 0
+        elif param_name == "weight_scale_inv" and len(shape) > 0:
+            block_n, _ = self.fp8_scale_block_size()
+            local_rows = global_rows // shard_count
+            start_row = shard_rank * local_rows
+            if start_row % block_n or local_rows % block_n:
+                raise ValueError(
+                    f"{self.prefix}.{qkv_key}.weight_scale_inv TP shard must "
+                    f"align to FP8 output block {block_n}: "
+                    f"start={start_row}, rows={local_rows}"
+                )
+            dim = 0
+        elif (
+            param_name in ("weight_scale", "input_scale")
+            and len(shape) > 0
+            and shape[0] == global_rows
+        ):
+            dim = 0
+        if dim is None:
+            return None
+        return make_sharded_read_spec(name, shape, dim, shard_count, shard_rank)
+
     shard_names: List[str] = ["q_proj", "k_proj", "v_proj"]
 
     def __init__(
@@ -905,7 +1097,9 @@ class QKVParallelLinear(ColumnParallelLinear):
         # NewModelLoader._run_post_load_hooks invokes
         # process_weights_after_loading after every shard has landed; see
         # LinearBase.
-        for full_name, tensor in weights.items():
+        for full_name, checkpoint_value in weights.items():
+            tensor, read_spec = unwrap_checkpoint_tensor(checkpoint_value)
+            local_shard = read_spec is not None
             param_name = self._get_param_name(full_name)
             if param_name is None:
                 continue
@@ -994,9 +1188,17 @@ class QKVParallelLinear(ColumnParallelLinear):
                         )
                 continue
 
-            self._dispatch_qkv_shard(qkv_key, param_name, tensor)
+            self._dispatch_qkv_shard(
+                qkv_key, param_name, tensor, local_shard=local_shard
+            )
 
-    def _dispatch_qkv_shard(self, qkv_key: str, param_name: str, tensor: torch.Tensor):
+    def _dispatch_qkv_shard(
+        self,
+        qkv_key: str,
+        param_name: str,
+        tensor: torch.Tensor,
+        local_shard: bool = False,
+    ):
         """Write a single q/k/v shard into the merged parameter at its offset."""
         # Resolve per-shard size and offset in the merged QKV layout.
         if qkv_key == "q":
@@ -1012,7 +1214,7 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         if param_name == "weight":
             self._ensure_parameter_shard_not_loaded(param_name, qkv_key)
-            expected_rows = num_heads * self.head_dim
+            expected_rows = size if local_shard else num_heads * self.head_dim
             expected = (expected_rows, self.hidden_size)
             if tuple(tensor.shape) == expected:
                 pass
@@ -1023,7 +1225,11 @@ class QKVParallelLinear(ColumnParallelLinear):
                     f"{self.prefix}.{qkv_key}.weight shape must be "
                     f"{(expected_rows, self.hidden_size)}, got {tuple(tensor.shape)}"
                 )
-            split = self._split_qkv(tensor, num_heads, self.head_dim, qkv_key)
+            split = (
+                tensor
+                if local_shard
+                else self._split_qkv(tensor, num_heads, self.head_dim, qkv_key)
+            )
             _copy_checked(
                 self.weight.data[offset : offset + size],
                 split,
@@ -1037,7 +1243,11 @@ class QKVParallelLinear(ColumnParallelLinear):
             if self.bias is None:
                 raise RuntimeError(f"Unexpected bias tensor for {self.prefix}")
             self._ensure_parameter_shard_not_loaded(param_name, qkv_key)
-            split = self._split_qkv(tensor, num_heads, self.head_dim, qkv_key)
+            split = (
+                tensor
+                if local_shard
+                else self._split_qkv(tensor, num_heads, self.head_dim, qkv_key)
+            )
             _copy_checked(
                 self.bias.data[offset : offset + size],
                 split,
@@ -1060,7 +1270,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             block_n, _ = self.fp8_scale_block_size()
             rank = self.tp_rank if qkv_key == "q" else self.kv_head_rank
             self._ensure_parameter_shard_not_loaded(param_name, qkv_key)
-            if self.tp_size > 1:
+            if self.tp_size > 1 and not local_shard:
                 heads_pp = (
                     self.num_heads_per_partition
                     if qkv_key == "q"
@@ -1121,7 +1331,11 @@ class QKVParallelLinear(ColumnParallelLinear):
             return
 
         # Per-channel along output dim: TP-slice and write into [offset:offset+size).
-        split = self._split_qkv(tensor, num_heads, self.head_dim, qkv_key)
+        split = (
+            tensor
+            if local_shard
+            else self._split_qkv(tensor, num_heads, self.head_dim, qkv_key)
+        )
         if split.shape[0] != size:
             raise ValueError(
                 f"Shape mismatch for QKV shard {self.prefix}.{param_name}/{qkv_key}: "

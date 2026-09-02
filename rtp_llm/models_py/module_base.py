@@ -3,6 +3,11 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import torch.nn as nn
+from rtp_llm.models_py.read_spec import (
+    LoadedCheckpointTensor,
+    ReadSpec,
+    unwrap_checkpoint_tensor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +154,70 @@ class RtpModule(nn.Module):
         """Return a pre-materialization checkpoint name filter, if needed."""
         return None
 
+    def checkpoint_read_spec(
+        self, name: str, shape: tuple[int, ...]
+    ) -> Optional[ReadSpec]:
+        """Return this leaf's pre-materialization slice, if it is safe.
+
+        Container traversal is implemented by ``resolve_checkpoint_read_spec``.
+        Leaves should return ``None`` for layouts that still require their
+        existing full-tensor ``load_weights`` implementation.
+        """
+        return None
+
+    def allow_checkpoint_read_spec(self, checkpoint_name: str) -> bool:
+        """Whether backend slicing may run before this model's name transforms."""
+        return True
+
+    def _resolve_checkpoint_read_spec(
+        self, module: nn.Module, name: str, shape: tuple[int, ...]
+    ) -> Optional[ReadSpec]:
+        if isinstance(module, RtpModule):
+            local_spec = module.checkpoint_read_spec(name, shape)
+            if local_spec is not None:
+                return local_spec
+        if "." not in name:
+            return None
+        prefix, rest = name.split(".", 1)
+        child = module._modules.get(prefix)
+        if child is None:
+            child = self._fused_shard_target(module, prefix)
+            if child is not None and isinstance(child, RtpModule):
+                return child.checkpoint_read_spec(name, shape)
+        if isinstance(child, nn.ModuleList):
+            if "." not in rest:
+                return None
+            index_text, child_name = rest.split(".", 1)
+            try:
+                index = int(index_text)
+            except ValueError:
+                return None
+            if not 0 <= index < len(child):
+                return None
+            target = child[index]
+            child_loader = getattr(type(target), "load_weights", None)
+            if child_loader is not None and child_loader is not RtpModule.load_weights:
+                if isinstance(target, RtpModule):
+                    return target.checkpoint_read_spec(child_name, shape)
+                return None
+            return self._resolve_checkpoint_read_spec(target, child_name, shape)
+        if not isinstance(child, nn.Module):
+            return None
+        child_loader = getattr(type(child), "load_weights", None)
+        if child_loader is not None and child_loader is not RtpModule.load_weights:
+            if isinstance(child, RtpModule):
+                return child.checkpoint_read_spec(rest, shape)
+            return None
+        return self._resolve_checkpoint_read_spec(child, rest, shape)
+
+    def resolve_checkpoint_read_spec(
+        self, name: str, shape: tuple[int, ...]
+    ) -> Optional[ReadSpec]:
+        """Resolve a mapped checkpoint name to its consumer's ``ReadSpec``."""
+        if not isinstance(name, str) or not name:
+            raise ValueError("checkpoint name must be a non-empty string")
+        return self._resolve_checkpoint_read_spec(self, name, tuple(shape))
+
     def requires_staged_device_postprocess(self) -> bool:
         """Whether this leaf must postprocess immediately after device migration."""
         return False
@@ -160,9 +229,8 @@ class RtpModule(nn.Module):
         _restore_tensor_aliases(alias_groups)
         return result
 
-    def _assign_weight(
-        self, module: nn.Module, name: str, tensor: torch.Tensor
-    ) -> bool:
+    def _assign_weight(self, module: nn.Module, name: str, tensor: Any) -> bool:
+        tensor, _ = unwrap_checkpoint_tensor(tensor)
         if "." in name:
             prefix, rest = name.split(".", 1)
             child = module._modules.get(prefix)
@@ -271,8 +339,13 @@ class RtpModule(nn.Module):
         iterator = weights.items() if isinstance(weights, dict) else weights
         dropped: List[str] = []
         for name, tensor in iterator:
-            if not isinstance(name, str) or not isinstance(tensor, torch.Tensor):
-                raise TypeError("Weights must be (str, torch.Tensor) pairs")
+            if not isinstance(name, str) or not isinstance(
+                tensor, (torch.Tensor, LoadedCheckpointTensor)
+            ):
+                raise TypeError(
+                    "Weights must be (str, torch.Tensor or "
+                    "LoadedCheckpointTensor) pairs"
+                )
             if not self._dispatch(self, name, tensor):
                 dropped.append(name)
 

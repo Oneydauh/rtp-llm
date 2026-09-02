@@ -153,8 +153,10 @@ py_library(
     name = "new_loader_core",
     srcs = [
         "__init__.py",
+        "fastsafetensors_read_spec.py",
         "model_loader.py",
         "module_base.py",
+        "read_spec.py",
         "registry.py",
         "weight_mapper.py",
     ],
