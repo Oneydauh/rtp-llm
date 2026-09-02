@@ -246,6 +246,43 @@ def _resolve_index_shard_path(
     return shard_path
 
 
+def safetensor_index_entries(
+    model_path: str,
+) -> Optional[List[Tuple[str, str]]]:
+    """Return validated ``(tensor_name, shard_path)`` index entries.
+
+    Callers that only need checkpoint metadata can use the Hugging Face index
+    without opening every safetensors shard header again.  ``None`` means the
+    checkpoint has no safetensors index and the caller must inspect the files.
+    """
+    index = _read_checkpoint_index(model_path, _SAFETENSORS_INDEX)
+    if index is None:
+        return None
+    index_path, weight_map = index
+    model_root = os.path.realpath(model_path)
+    entries = []
+    shard_paths = {}
+    for name, shard_name in weight_map.items():
+        if not isinstance(name, str):
+            raise ValueError(
+                f"Checkpoint index {index_path} contains non-string tensor name"
+            )
+        if not isinstance(shard_name, str):
+            raise ValueError(
+                f"Checkpoint index {index_path} contains invalid shard "
+                f"{shard_name!r}"
+            )
+        if shard_name not in shard_paths:
+            shard_paths[shard_name] = _resolve_index_shard_path(
+                model_root,
+                index_path,
+                shard_name,
+                ".safetensors",
+            )
+        entries.append((name, shard_paths[shard_name]))
+    return entries
+
+
 def select_safetensor_files(
     model_path: str,
     checkpoint_files: Sequence[str],
@@ -267,35 +304,15 @@ def select_safetensor_files(
 
     discovered = {os.path.realpath(path): path for path in files}
     selected_identities = set()
-    index = _read_checkpoint_index(model_path, _SAFETENSORS_INDEX)
-    if index is not None:
-        index_path, weight_map = index
-        model_root = os.path.realpath(model_path)
-        shard_identities = {}
-        for name, shard_name in weight_map.items():
-            if not isinstance(name, str):
-                raise ValueError(
-                    f"Checkpoint index {index_path} contains non-string tensor name"
-                )
-            if not isinstance(shard_name, str):
-                raise ValueError(
-                    f"Checkpoint index {index_path} contains invalid shard "
-                    f"{shard_name!r}"
-                )
-            if shard_name not in shard_identities:
-                shard_path = _resolve_index_shard_path(
-                    model_root,
-                    index_path,
-                    shard_name,
-                    ".safetensors",
-                )
-                shard_identities[shard_name] = os.path.realpath(shard_path)
-            identity = shard_identities[shard_name]
+    index_entries = safetensor_index_entries(model_path)
+    if index_entries is not None:
+        for name, shard_path in index_entries:
+            identity = os.path.realpath(shard_path)
             if name_filter(name):
                 if identity not in discovered:
                     raise ValueError(
-                        f"Checkpoint index {index_path} references undiscovered shard "
-                        f"{shard_name!r}"
+                        "Checkpoint index references an undiscovered shard for "
+                        f"tensor {name!r}: {shard_path!r}"
                     )
                 selected_identities.add(identity)
     else:

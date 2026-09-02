@@ -9,8 +9,6 @@ from unittest import mock
 
 import torch
 import torch.nn as nn
-from safetensors.torch import save_file
-
 from rtp_llm.models_py.model_loader import (
     NewLoaderConfig,
     NewLoaderLoadMethod,
@@ -30,6 +28,7 @@ from rtp_llm.models_py.weight_mapper import (
     select_safetensor_files,
 )
 from rtp_llm.utils.new_loader import is_new_loader_enabled
+from safetensors.torch import save_file
 
 
 class _Block(RtpModule):
@@ -141,6 +140,13 @@ class FoundationLoaderTest(unittest.TestCase):
             with mock.patch.object(
                 loader, "_fastsafetensors_api", return_value=(mock.Mock(), mock.Mock())
             ), mock.patch.object(
+                loader,
+                "_accelerator_backend_name",
+                return_value="Cuda",
+            ), mock.patch(
+                "rtp_llm.models_py.model_loader.platform.machine",
+                return_value="x86_64",
+            ), mock.patch.object(
                 torch.version, "hip", None
             ), mock.patch.object(
                 torch.cuda, "is_available", return_value=True
@@ -166,6 +172,13 @@ class FoundationLoaderTest(unittest.TestCase):
             model = _FoundationModel(None, None)
             with mock.patch.object(
                 loader, "_fastsafetensors_api", return_value=(mock.Mock(), mock.Mock())
+            ), mock.patch.object(
+                loader,
+                "_accelerator_backend_name",
+                return_value="Cuda",
+            ), mock.patch(
+                "rtp_llm.models_py.model_loader.platform.machine",
+                return_value="x86_64",
             ), mock.patch.object(
                 torch.version, "hip", None
             ), mock.patch.object(
@@ -220,9 +233,7 @@ class FoundationLoaderTest(unittest.TestCase):
                 loader,
                 "_fastsafetensors_api",
                 side_effect=RuntimeError("package unavailable"),
-            ), mock.patch.object(
-                torch.version, "hip", None
-            ), mock.patch.object(
+            ), mock.patch.object(torch.version, "hip", None), mock.patch.object(
                 torch.cuda, "is_available", return_value=True
             ), mock.patch.object(
                 torch.cuda, "device_count", return_value=1
@@ -658,6 +669,34 @@ class FoundationLoaderTest(unittest.TestCase):
         self.assertEqual(loader_kwargs["bbuf_size_kb"], 16 * 1024)
         close.assert_called_once_with()
 
+    def test_fastsafetensors_closes_loader_when_dispatch_fails(self):
+        close = mock.Mock()
+
+        class FakeSingleGroup:
+            pass
+
+        class FakeParallelLoader:
+            def __init__(self, **kwargs):
+                self.loader = types.SimpleNamespace(close=close)
+
+            def iterate_weights(self):
+                yield "unexpected.weight", torch.ones(1)
+
+        fake_fastsafetensors = types.ModuleType("fastsafetensors")
+        fake_fastsafetensors.ParallelLoader = FakeParallelLoader
+        fake_fastsafetensors.SingleGroup = FakeSingleGroup
+
+        with tempfile.TemporaryDirectory() as model_path:
+            save_file(_weights(), os.path.join(model_path, "model.safetensors"))
+            with mock.patch.dict(
+                sys.modules, {"fastsafetensors": fake_fastsafetensors}
+            ), self.assertRaisesRegex(RuntimeError, "could not dispatch"):
+                self._loader(
+                    model_path, load_method=NewLoaderLoadMethod.FASTSAFETENSORS
+                ).load()
+
+        close.assert_called_once_with()
+
     def test_fastsafetensors_rejects_pytorch_checkpoint(self):
         with tempfile.TemporaryDirectory() as model_path:
             torch.save(_weights(), os.path.join(model_path, "model.pt"))
@@ -697,6 +736,37 @@ class FoundationLoaderTest(unittest.TestCase):
                     [first, second],
                 )
 
+    def test_fastsafetensors_metadata_uses_index_without_opening_headers(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            dense = os.path.join(model_path, "model-00001-of-00002.safetensors")
+            experts = os.path.join(model_path, "model-00002-of-00002.safetensors")
+            stacked_name = "layers.0.experts.gate_up_proj.weight"
+            save_file({"dense.weight": torch.ones(1)}, dense)
+            save_file({stacked_name: torch.ones(4, 2, 2)}, experts)
+            with open(
+                os.path.join(model_path, "model.safetensors.index.json"), "w"
+            ) as handle:
+                json.dump(
+                    {
+                        "weight_map": {
+                            "dense.weight": os.path.basename(dense),
+                            stacked_name: os.path.basename(experts),
+                        }
+                    },
+                    handle,
+                )
+
+            with mock.patch(
+                "safetensors.safe_open",
+                side_effect=AssertionError("indexed preflight opened shard headers"),
+            ):
+                duplicates, stacked = NewModelLoader._safetensor_metadata_summary(
+                    model_path, [dense, experts]
+                )
+
+        self.assertEqual(duplicates, [])
+        self.assertEqual(stacked, [stacked_name])
+
     def test_fastsafetensors_rejects_incompatible_parallel_loader_api(self):
         class IncompatibleParallelLoader:
             def __init__(self, files):
@@ -711,51 +781,100 @@ class FoundationLoaderTest(unittest.TestCase):
         ), self.assertRaisesRegex(RuntimeError, "incompatible"):
             NewModelLoader._fastsafetensors_api()
 
-    def test_fastsafetensors_expands_only_local_stacked_experts(self):
-        close = mock.Mock()
+    def test_fastsafetensors_rejects_stacked_experts_before_streaming(self):
         stacked = torch.arange(16, dtype=torch.float32).reshape(4, 2, 2)
-
-        class FakeSingleGroup:
-            def rank(self):
-                return 0
-
-        class FakeParallelLoader:
-            def __init__(self, **kwargs):
-                self.loader = types.SimpleNamespace(close=close)
-
-            def iterate_weights(self):
-                yield "layers.0.experts.gate_up_proj.weight", stacked
-
-        fake_fastsafetensors = types.ModuleType("fastsafetensors")
-        fake_fastsafetensors.ParallelLoader = FakeParallelLoader
-        fake_fastsafetensors.SingleGroup = FakeSingleGroup
         expert_filter = _ExpertRangeFilter(num_experts=4, ep_size=2, ep_rank=1)
 
         with tempfile.TemporaryDirectory() as model_path:
             checkpoint = os.path.join(model_path, "model.safetensors")
-            save_file({"placeholder": torch.ones(1)}, checkpoint)
+            save_file({"layers.0.experts.gate_up_proj.weight": stacked}, checkpoint)
+            loader = self._loader(
+                model_path, load_method=NewLoaderLoadMethod.FASTSAFETENSORS
+            )
+            with mock.patch.object(
+                loader, "_fastsafetensors_api", return_value=(mock.Mock(), mock.Mock())
+            ), self.assertRaisesRegex(RuntimeError, "stacked all-expert"):
+                loader._select_load_method(
+                    NewLoaderLoadMethod.FASTSAFETENSORS,
+                    _FoundationModel(None, None),
+                    [checkpoint],
+                    expert_filter,
+                )
+
+    def test_fastsafetensors_rejects_rank_local_checkpoint(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            checkpoint = os.path.join(model_path, "consolidated.00.safetensors")
+            save_file(_weights(), checkpoint)
+            with self.assertRaisesRegex(RuntimeError, "rank-local consolidated"):
+                self._loader(
+                    model_path, load_method=NewLoaderLoadMethod.FASTSAFETENSORS
+                )._select_load_method(
+                    NewLoaderLoadMethod.FASTSAFETENSORS,
+                    _FoundationModel(None, None),
+                    [checkpoint],
+                )
+
+    def test_fastsafetensors_tp_requires_matching_world_group(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            checkpoint = os.path.join(model_path, "model.safetensors")
+            save_file(_weights(), checkpoint)
+            loader = self._loader(
+                model_path,
+                tp_size=2,
+                tp_rank=0,
+                load_method=NewLoaderLoadMethod.FASTSAFETENSORS,
+            )
+            reason = loader._fastsafetensors_prerequisite_reason(
+                _FoundationModel(None, None),
+                [checkpoint],
+                automatic=False,
+            )
+            self.assertIn("requires an initialized distributed WORLD group", reason)
+
+            with mock.patch.object(
+                torch.distributed, "is_initialized", return_value=True
+            ), mock.patch.object(
+                torch.distributed, "get_world_size", return_value=4
+            ), mock.patch.object(
+                torch.distributed, "get_rank", return_value=0
+            ):
+                reason = loader._fastsafetensors_prerequisite_reason(
+                    _FoundationModel(None, None),
+                    [checkpoint],
+                    automatic=False,
+                )
+            self.assertIn("WORLD group does not match", reason)
+
+    def test_fastsafetensors_uses_world_group_when_distributed(self):
+        loader_kwargs = {}
+
+        class FakeParallelLoader:
+            def __init__(self, **kwargs):
+                loader_kwargs.update(kwargs)
+                self.loader = types.SimpleNamespace(close=mock.Mock())
+
+            def iterate_weights(self):
+                return iter(())
+
+        fake_fastsafetensors = types.ModuleType("fastsafetensors")
+        fake_fastsafetensors.ParallelLoader = FakeParallelLoader
+        fake_fastsafetensors.SingleGroup = mock.Mock
+
+        with tempfile.TemporaryDirectory() as model_path:
+            checkpoint = os.path.join(model_path, "model.safetensors")
+            save_file({"value": torch.ones(1)}, checkpoint)
             with mock.patch.dict(
                 sys.modules, {"fastsafetensors": fake_fastsafetensors}
+            ), mock.patch.object(
+                torch.distributed, "is_initialized", return_value=True
             ):
-                loaded = list(
+                list(
                     NewModelLoader._fastsafetensors_weights_iterator(
-                        [checkpoint],
-                        "cpu",
-                        lambda _: True,
-                        expert_filter,
+                        [checkpoint], "cpu", None, None
                     )
                 )
 
-        self.assertEqual(
-            [name for name, _ in loaded],
-            [
-                "layers.0.experts.2.gate_up_proj.weight",
-                "layers.0.experts.3.gate_up_proj.weight",
-            ],
-        )
-        self.assertTrue(torch.equal(loaded[0][1], stacked[2]))
-        self.assertTrue(torch.equal(loaded[1][1], stacked[3]))
-        close.assert_called_once_with()
+        self.assertIs(loader_kwargs["pg"], torch.distributed.group.WORLD)
 
     def test_fastsafetensors_uses_shared_memory_on_rocm(self):
         loader_kwargs = {}
@@ -815,9 +934,7 @@ class FoundationLoaderTest(unittest.TestCase):
             save_file({"value": torch.ones(1)}, checkpoint)
             with mock.patch.dict(
                 sys.modules, {"fastsafetensors": fake_fastsafetensors}
-            ), mock.patch.object(
-                torch.version, "hip", None
-            ), mock.patch.object(
+            ), mock.patch.object(torch.version, "hip", None), mock.patch.object(
                 NewModelLoader, "_cuda_cufile_available", return_value=False
             ):
                 list(
@@ -842,20 +959,12 @@ class FoundationLoaderTest(unittest.TestCase):
 
     def test_cuda_cufile_probe_uses_fastsafetensors_backend(self):
         fake_fastsafetensors = types.ModuleType("fastsafetensors")
-        fake_fastsafetensors.cpp = types.SimpleNamespace(
-            is_cufile_found=lambda: False
-        )
-        with mock.patch.dict(
-            sys.modules, {"fastsafetensors": fake_fastsafetensors}
-        ):
+        fake_fastsafetensors.cpp = types.SimpleNamespace(is_cufile_found=lambda: False)
+        with mock.patch.dict(sys.modules, {"fastsafetensors": fake_fastsafetensors}):
             self.assertFalse(NewModelLoader._cuda_cufile_available())
 
-        fake_fastsafetensors.cpp = types.SimpleNamespace(
-            is_cufile_found=lambda: True
-        )
-        with mock.patch.dict(
-            sys.modules, {"fastsafetensors": fake_fastsafetensors}
-        ):
+        fake_fastsafetensors.cpp = types.SimpleNamespace(is_cufile_found=lambda: True)
+        with mock.patch.dict(sys.modules, {"fastsafetensors": fake_fastsafetensors}):
             self.assertTrue(NewModelLoader._cuda_cufile_available())
 
     def test_auto_falls_back_on_rocm(self):
@@ -874,6 +983,49 @@ class FoundationLoaderTest(unittest.TestCase):
             )
         self.assertEqual(selected, NewLoaderLoadMethod.SCRATCH)
 
+    def test_auto_falls_back_on_ppu(self):
+        loader = NewModelLoader(
+            types.SimpleNamespace(model_type="foundation_test_model"),
+            NewLoaderConfig(device="cuda:0", compute_dtype=torch.float32),
+            model_path="unused",
+        )
+        with mock.patch.object(
+            torch.cuda, "is_available", return_value=True
+        ), mock.patch.object(
+            loader,
+            "_accelerator_backend_name",
+            return_value="Ppu",
+        ):
+            selected = loader._select_load_method(
+                NewLoaderLoadMethod.AUTO,
+                _FoundationModel(None, None),
+                ["unused.safetensors"],
+            )
+        self.assertEqual(selected, NewLoaderLoadMethod.SCRATCH)
+
+    def test_auto_falls_back_on_unvalidated_cuda_arm(self):
+        loader = NewModelLoader(
+            types.SimpleNamespace(model_type="foundation_test_model"),
+            NewLoaderConfig(device="cuda:0", compute_dtype=torch.float32),
+            model_path="unused",
+        )
+        with mock.patch.object(
+            torch.cuda, "is_available", return_value=True
+        ), mock.patch.object(
+            loader,
+            "_accelerator_backend_name",
+            return_value="Cuda",
+        ), mock.patch(
+            "rtp_llm.models_py.model_loader.platform.machine",
+            return_value="aarch64",
+        ):
+            selected = loader._select_load_method(
+                NewLoaderLoadMethod.AUTO,
+                _FoundationModel(None, None),
+                ["unused.safetensors"],
+            )
+        self.assertEqual(selected, NewLoaderLoadMethod.SCRATCH)
+
     def test_auto_falls_back_when_nogds_is_forced_on_rocm(self):
         loader = NewModelLoader(
             types.SimpleNamespace(model_type="foundation_test_model"),
@@ -882,9 +1034,7 @@ class FoundationLoaderTest(unittest.TestCase):
         )
         with mock.patch.dict(
             os.environ, {"FASTSAFETENSORS_NOGDS": "1"}, clear=True
-        ), mock.patch.object(
-            torch.version, "hip", "test-rocm"
-        ), mock.patch.object(
+        ), mock.patch.object(torch.version, "hip", "test-rocm"), mock.patch.object(
             torch.cuda, "is_available", return_value=True
         ):
             selected = loader._select_load_method(

@@ -1,16 +1,16 @@
 import inspect
 import logging
 import os
+import platform
 import re
 import time
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Callable, Iterator, List, Optional, Tuple
 
+import rtp_llm.models_py.weight_mapper as weight_mapper
 import torch
 import torch.nn as nn
-
-import rtp_llm.models_py.weight_mapper as weight_mapper
 from rtp_llm.models_py.module_base import RtpModule, collect_loaded_tensor_ids
 from rtp_llm.models_py.registry import get_model_class, list_models
 
@@ -589,9 +589,7 @@ class NewModelLoader:
             ("SingleGroup", SingleGroup),
         ):
             if not callable(symbol):
-                raise RuntimeError(
-                    f"fastsafetensors.{symbol_name} must be callable"
-                )
+                raise RuntimeError(f"fastsafetensors.{symbol_name} must be callable")
         try:
             parameters = inspect.signature(ParallelLoader.__init__).parameters
         except (TypeError, ValueError) as exc:
@@ -611,18 +609,83 @@ class NewModelLoader:
         return ParallelLoader, SingleGroup
 
     @staticmethod
-    def _duplicate_safetensor_names(checkpoint_files: List[str]) -> List[str]:
+    def _safetensor_metadata_summary(
+        model_path: str, checkpoint_files: List[str]
+    ) -> Tuple[List[str], List[str]]:
+        """Return duplicate names and stacked expert names without reading data.
+
+        A valid Hugging Face index is the preferred metadata source.  The
+        streaming iterator still detects duplicate names while loading, so an
+        index avoids a second full header walk without weakening correctness.
+        Header inspection remains the fallback for unindexed checkpoints.
+        """
+        selected_identities = {
+            os.path.realpath(os.fspath(path)) for path in checkpoint_files
+        }
+        index_entries = weight_mapper.safetensor_index_entries(model_path)
+        if index_entries is not None:
+            indexed_identities = {
+                os.path.realpath(shard_path) for _, shard_path in index_entries
+            }
+            if selected_identities.issubset(indexed_identities):
+                stacked = [
+                    name
+                    for name, shard_path in index_entries
+                    if os.path.realpath(shard_path) in selected_identities
+                    and _STACKED_EXPERT_RE.fullmatch(name)
+                ]
+                return [], stacked
+
         from safetensors import safe_open
 
         seen = set()
         duplicates = set()
+        stacked = []
         for path in checkpoint_files:
             with safe_open(path, framework="pt", device="cpu") as handle:
                 for name in handle.keys():
                     if name in seen:
                         duplicates.add(name)
                     seen.add(name)
-        return sorted(duplicates)
+                    if _STACKED_EXPERT_RE.fullmatch(name):
+                        stacked.append(name)
+        return sorted(duplicates), sorted(stacked)
+
+    def _fastsafetensors_distributed_reason(self) -> Optional[str]:
+        """Validate that WORLD is exactly the loader's TP/EP participant set."""
+        expected_world_size = max(
+            self.load_config.tp_size,
+            self.load_config.ep_size,
+        )
+        if not torch.distributed.is_initialized():
+            if expected_world_size > 1:
+                return (
+                    "TP/EP fastsafetensors loading requires an initialized "
+                    f"distributed WORLD group of size {expected_world_size}"
+                )
+            return None
+
+        world_size = torch.distributed.get_world_size()
+        if world_size != expected_world_size:
+            return (
+                "distributed WORLD group does not match the NewLoader TP/EP "
+                f"topology: world_size={world_size}, expected={expected_world_size}"
+            )
+        world_rank = torch.distributed.get_rank()
+        expected_tp_rank = world_rank % self.load_config.tp_size
+        expected_ep_rank = world_rank % self.load_config.ep_size
+        if (
+            self.load_config.tp_rank != expected_tp_rank
+            or self.load_config.ep_rank != expected_ep_rank
+        ):
+            return (
+                "distributed WORLD rank does not match the NewLoader TP/EP "
+                f"ranks: world_rank={world_rank}, loader_tp_rank="
+                f"{self.load_config.tp_rank}, expected_tp_rank={expected_tp_rank}, "
+                f"loader_ep_rank={self.load_config.ep_rank}, "
+                f"expected_ep_rank={expected_ep_rank}"
+            )
+        return None
 
     @staticmethod
     def _fastsafetensors_bbuf_size_kb(checkpoint_files: List[str]) -> int:
@@ -644,6 +707,18 @@ class NewModelLoader:
             return bool(fastsafetensors_cpp.is_cufile_found())
         except (AttributeError, OSError, RuntimeError):
             return False
+
+    @staticmethod
+    def _accelerator_backend_name() -> str:
+        """Identify CUDA-compatible runtimes without importing the device package."""
+        if torch.version.hip is not None:
+            return "ROCm"
+        if (
+            os.environ.get("PPU_HOME")
+            or "ppu" in getattr(torch, "__version__", "").lower()
+        ):
+            return "Ppu"
+        return "Cuda"
 
     @staticmethod
     def _fastsafetensors_use_nogds(device: torch.device) -> bool:
@@ -688,6 +763,7 @@ class NewModelLoader:
         checkpoint_files: List[str],
         *,
         automatic: bool,
+        expert_filter: Optional[_ExpertRangeFilter] = None,
     ) -> Optional[str]:
         if not checkpoint_files:
             return "checkpoint shard selection is empty"
@@ -698,6 +774,12 @@ class NewModelLoader:
         ]
         if non_safetensors:
             return f"checkpoint contains non-safetensors files {non_safetensors}"
+        if weight_mapper.is_rank_local_checkpoint(checkpoint_files):
+            return (
+                "rank-local consolidated checkpoints cannot use the collective "
+                "WORLD fastsafetensors loader; use scratch until a rank-local "
+                "SingleGroup path is validated"
+            )
         if self._requires_staged_device_postprocess(model):
             return (
                 "the model requires staged device postprocessing (for example "
@@ -716,10 +798,18 @@ class NewModelLoader:
         if target_device.type == "cuda":
             if not torch.cuda.is_available():
                 return f"runtime device {target_device} is unavailable"
-            if automatic and torch.version.hip is not None:
+            backend = self._accelerator_backend_name()
+            if automatic and backend != "Cuda":
                 return (
-                    "automatic fastsafetensors selection is disabled on ROCm "
-                    "until its GDS/shared-memory backend is validated; request "
+                    "automatic fastsafetensors selection is disabled on the "
+                    f"unvalidated {backend} backend; request "
+                    "fastsafetensors explicitly to override"
+                )
+            machine = platform.machine().lower()
+            if automatic and machine not in ("amd64", "x86_64"):
+                return (
+                    "automatic fastsafetensors selection is disabled on the "
+                    f"unvalidated {machine or 'unknown'} architecture; request "
                     "fastsafetensors explicitly to override"
                 )
             if (
@@ -742,12 +832,18 @@ class NewModelLoader:
                     f"CUDA device range [0, {device_count})"
                 )
 
+        distributed_reason = self._fastsafetensors_distributed_reason()
+        if distributed_reason is not None:
+            return distributed_reason
+
         try:
             self._fastsafetensors_api()
         except RuntimeError as exc:
             return str(exc)
         try:
-            duplicates = self._duplicate_safetensor_names(checkpoint_files)
+            duplicates, stacked_experts = self._safetensor_metadata_summary(
+                self._resolved_model_path(), checkpoint_files
+            )
         except (OSError, RuntimeError, ValueError) as exc:
             return f"failed to inspect safetensors metadata: {exc}"
         if duplicates:
@@ -758,6 +854,19 @@ class NewModelLoader:
                 else ""
             )
             return f"checkpoint tensor names are duplicated: {sample}{suffix}"
+        if expert_filter is not None and stacked_experts:
+            sample = stacked_experts[:10]
+            suffix = (
+                f" (+{len(stacked_experts) - len(sample)} more)"
+                if len(stacked_experts) > len(sample)
+                else ""
+            )
+            return (
+                "EP fastsafetensors loading does not support stacked all-expert "
+                "tensors because ParallelLoader materializes non-local experts "
+                f"before slicing: {sample}{suffix}; use scratch or a per-expert "
+                "checkpoint"
+            )
         if automatic:
             device_index = (
                 torch.cuda.current_device()
@@ -770,9 +879,7 @@ class NewModelLoader:
                 max_shard_bytes = max(
                     os.path.getsize(path) for path in checkpoint_files
                 )
-                bbuf_bytes = (
-                    self._fastsafetensors_bbuf_size_kb(checkpoint_files) * 1024
-                )
+                bbuf_bytes = self._fastsafetensors_bbuf_size_kb(checkpoint_files) * 1024
             except (OSError, RuntimeError, ValueError) as exc:
                 return f"cannot determine fastsafetensors memory safety: {exc}"
             required_bytes = model_bytes + 3 * max(max_shard_bytes, bbuf_bytes)
@@ -831,6 +938,7 @@ class NewModelLoader:
         requested: NewLoaderLoadMethod,
         model: nn.Module,
         checkpoint_files: List[str],
+        expert_filter: Optional[_ExpertRangeFilter] = None,
     ) -> NewLoaderLoadMethod:
         if requested == NewLoaderLoadMethod.SCRATCH:
             return requested
@@ -839,6 +947,7 @@ class NewModelLoader:
             model,
             checkpoint_files,
             automatic=automatic,
+            expert_filter=expert_filter,
         )
         reason = self._synchronize_fastsafetensors_prerequisite(reason)
         if reason is None:
@@ -867,8 +976,8 @@ class NewModelLoader:
         """Stream safetensors directly to the model's runtime device.
 
         The yielded tensor is consumed synchronously by ``RtpModule.load_weights``
-        before the iterator advances. Expert slices are cloned because the
-        fastsafetensors batch backing storage may be released on the next yield.
+        before the iterator advances. Stacked EP tensors must have been rejected
+        by metadata preflight before this iterator constructs ``ParallelLoader``.
         """
         ParallelLoader, SingleGroup = NewModelLoader._fastsafetensors_api()
 
@@ -882,9 +991,7 @@ class NewModelLoader:
         if target_device.type == "cuda" and target_device.index is None:
             loader_device = f"cuda:{torch.cuda.current_device()}"
         use_nogds = NewModelLoader._fastsafetensors_use_nogds(target_device)
-        bbuf_size_kb = NewModelLoader._fastsafetensors_bbuf_size_kb(
-            checkpoint_files
-        )
+        bbuf_size_kb = NewModelLoader._fastsafetensors_bbuf_size_kb(checkpoint_files)
         loader = ParallelLoader(
             pg=process_group,
             hf_weights_files=sorted(os.fspath(path) for path in checkpoint_files),
@@ -903,18 +1010,10 @@ class NewModelLoader:
                     safetensor_slice_expander is not None
                     and safetensor_slice_expander.handles_safetensor(name)
                 ):
-                    shape = tuple(tensor.shape)
-                    for expanded_name, index in (
-                        safetensor_slice_expander.expand_safetensor(name, shape)
-                    ):
-                        if expanded_name in seen:
-                            raise RuntimeError(
-                                f"Checkpoint tensor {expanded_name!r} appears more "
-                                "than once during fastsafetensors loading"
-                            )
-                        seen.add(expanded_name)
-                        yield expanded_name, tensor[index].clone()
-                    continue
+                    raise RuntimeError(
+                        "EP fastsafetensors preflight failed to reject stacked "
+                        f"all-expert tensor {name!r} before device materialization"
+                    )
                 if name in seen:
                     raise RuntimeError(
                         f"Checkpoint tensor {name!r} appears more than once during "
@@ -1011,7 +1110,10 @@ class NewModelLoader:
                 len(checkpoint_files),
             )
         method = self._select_load_method(
-            requested_method, model, selected_files
+            requested_method,
+            model,
+            selected_files,
+            expert_filter,
         )
         logger.info(
             "NewLoader load method: requested=%s, selected=%s",
