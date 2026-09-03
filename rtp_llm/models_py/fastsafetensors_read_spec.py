@@ -1,9 +1,84 @@
+import copy
 from typing import Any, Callable, Iterator, Optional, Tuple, Type
 
 import torch
 from rtp_llm.models_py.read_spec import ReadSpec
 
 ReadSpecResolver = Callable[[str, Tuple[int, ...]], ReadSpec]
+
+_FLOAT8_DTYPES = tuple(
+    getattr(torch, name)
+    for name in (
+        "float8_e4m3fn",
+        "float8_e4m3fnuz",
+        "float8_e5m2",
+        "float8_e5m2fnuz",
+        "float8_e8m0fnu",
+    )
+    if hasattr(torch, name)
+)
+
+
+def _transport_tensor(tensor):
+    """Return an FST tensor wrapper with a NCCL-safe view of float8 bytes."""
+
+    raw_tensor = getattr(tensor, "real_tensor", None)
+    if (
+        not isinstance(raw_tensor, torch.Tensor)
+        or raw_tensor.dtype not in _FLOAT8_DTYPES
+    ):
+        return tensor
+    transport = copy.copy(tensor)
+    transport.real_tensor = raw_tensor.view(torch.uint8)
+    return transport
+
+
+class _Float8SafeProcessGroup:
+    """Preserve float8 payload bits across collectives unsupported by NCCL.
+
+    Some PyTorch/NCCL combinations reject float8 in broadcast, scatter, send,
+    and recv. FST's tensor wrappers expose the backing tensor as
+    ``real_tensor``; an equal-sized uint8 view makes those collectives portable
+    without allocating or converting the payload.
+    """
+
+    def __init__(self, process_group):
+        self._process_group = process_group
+
+    def __getattr__(self, name):
+        return getattr(self._process_group, name)
+
+    def size(self):
+        return self._process_group.size()
+
+    def rank(self):
+        return self._process_group.rank()
+
+    def broadcast(self, dst, rank):
+        return self._process_group.broadcast(_transport_tensor(dst), rank)
+
+    def scatter(self, dst, scatter_list, src):
+        return self._process_group.scatter(
+            _transport_tensor(dst),
+            [_transport_tensor(tensor) for tensor in scatter_list],
+            src,
+        )
+
+    def send(self, tensor, dst_rank, tag):
+        return self._process_group.send(
+            _transport_tensor(tensor), dst_rank, tag
+        )
+
+    def recv(self, tensor, src_rank, tag):
+        return self._process_group.recv(
+            _transport_tensor(tensor), src_rank, tag
+        )
+
+
+def _install_float8_safe_process_group(file_buffer):
+    if not isinstance(file_buffer.pg, _Float8SafeProcessGroup):
+        file_buffer.pg = _Float8SafeProcessGroup(file_buffer.pg)
+    return file_buffer.pg
 
 
 def iter_read_spec_tensors(
@@ -21,7 +96,7 @@ def iter_read_spec_tensors(
     tensors use ``get_sharded(dim=0)`` before expansion into per-expert keys.
     """
 
-    pg = file_buffer.pg
+    pg = _install_float8_safe_process_group(file_buffer)
     pg_size = pg.size()
     pg_rank = pg.rank()
     all_ranks = tuple(range(pg_size))

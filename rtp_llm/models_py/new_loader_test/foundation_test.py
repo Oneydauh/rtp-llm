@@ -267,6 +267,67 @@ class FoundationLoaderTest(unittest.TestCase):
         self.assertIsInstance(value, LoadedCheckpointTensor)
         self.assertTrue(torch.equal(value.tensor, source[:, 3:]))
 
+    @unittest.skipUnless(
+        hasattr(torch, "float8_e4m3fn"), "torch does not expose float8_e4m3fn"
+    )
+    def test_fst_read_spec_transports_float8_shards_as_uint8(self):
+        source_bytes = torch.arange(24, dtype=torch.uint8).reshape(4, 6)
+        source = source_bytes.view(torch.float8_e4m3fn)
+
+        class WrappedTensor:
+            def __init__(self, tensor):
+                self.real_tensor = tensor
+
+        class FakeGroup:
+            def __init__(self):
+                self.transport_dtypes = []
+
+            def size(self):
+                return 2
+
+            def rank(self):
+                return 1
+
+            def scatter(self, dst, scatter_list, src):
+                self.transport_dtypes.append(dst.real_tensor.dtype)
+                self.transport_dtypes.extend(
+                    tensor.real_tensor.dtype for tensor in scatter_list
+                )
+                dst.real_tensor.copy_(scatter_list[self.rank()].real_tensor)
+
+        class FakeFileBuffer:
+            def __init__(self):
+                self.pg = FakeGroup()
+                self.base_group = self.pg
+
+            def get_shape(self, key):
+                return source.shape
+
+            def get_sharded(self, key, dim):
+                dst = WrappedTensor(torch.empty((4, 3), dtype=source.dtype))
+                scatter_list = [
+                    WrappedTensor(source[:, :3].contiguous()),
+                    WrappedTensor(source[:, 3:].contiguous()),
+                ]
+                self.pg.scatter(dst, scatter_list, 0)
+                return dst.real_tensor
+
+            def get_tensor(self, key):
+                raise AssertionError("full-tensor broadcast must not be used")
+
+        file_buffer = FakeFileBuffer()
+        resolver = lambda name, shape: make_sharded_read_spec(name, shape, 1, 2, 1)
+        result = list(iter_read_spec_tensors(file_buffer, ["row.weight"], resolver))
+
+        self.assertEqual(
+            file_buffer.base_group.transport_dtypes,
+            [torch.uint8, torch.uint8, torch.uint8],
+        )
+        self.assertEqual(result[0][1].tensor.dtype, torch.float8_e4m3fn)
+        self.assertTrue(
+            torch.equal(result[0][1].tensor.view(torch.uint8), source_bytes[:, 3:])
+        )
+
     def test_fst_read_spec_routes_per_expert_tensor_only_to_owner(self):
         source = torch.arange(8, dtype=torch.float32).reshape(2, 4)
 
