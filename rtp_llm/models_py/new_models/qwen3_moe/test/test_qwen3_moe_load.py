@@ -27,6 +27,7 @@ from rtp_llm.models_py.modules.factory.fused_moe.utils.config_resolver import (
 from rtp_llm.models_py.new_models.qwen3_moe.language import Qwen3MoeForCausalLM
 from rtp_llm.models_py.quant_methods import QuantizationConfig
 from rtp_llm.ops import EplbMode
+from rtp_llm.utils.model_weight import W
 
 _MODEL_QUANT_UNSET = object()
 
@@ -150,6 +151,28 @@ def _expert_weights(num_experts, hidden_size, intermediate_size):
 
 
 class MoEWeightDispatchTest(unittest.TestCase):
+    def test_runtime_moe_shuffle_replaces_registered_source_storage(self):
+        layer = _make_experts(num_experts=1)
+        source_w13 = layer.w13.detach().clone()
+        source_w2 = layer.w2.detach().clone()
+        source_w13_ptr = layer.w13.data_ptr()
+        source_w2_ptr = layer.w2.data_ptr()
+
+        class _ShuffleDevice:
+            def shuffle_moe_weight(self, tensor, data_type, name):
+                del data_type, name
+                return tensor.clone().add_(1)
+
+        layer._model_config.exported_device = _ShuffleDevice()
+        weights = layer._build_weights_dict()
+
+        self.assertNotEqual(layer.w13.data_ptr(), source_w13_ptr)
+        self.assertNotEqual(layer.w2.data_ptr(), source_w2_ptr)
+        self.assertEqual(weights[W.moe_w1].data_ptr(), layer.w13.data_ptr())
+        self.assertEqual(weights[W.moe_w2].data_ptr(), layer.w2.data_ptr())
+        torch.testing.assert_close(layer.w13, source_w13 + 1)
+        torch.testing.assert_close(layer.w2, source_w2 + 1)
+
     def test_ep_filter_selects_local_experts_before_tensor_loading(self):
         rank_one = _ExpertRangeFilter(4, 2, 1)
 

@@ -907,10 +907,36 @@ class BaseMoEExperts(RtpModule):
                 # Per-tensor FP8 scales are 1D and do not encode gate/up rows.
                 if tensor.dim() == 1:
                     continue
-                weights_dict[name] = runtime_device.shuffle_moe_weight(
+                shuffled = runtime_device.shuffle_moe_weight(
                     tensor, self._model_config.data_type, name
                 )
+                # ROCm layout conversion returns a new allocation.  Keeping the
+                # registered pre-shuffle tensor alive would retain nearly two
+                # copies of every expert weight for the lifetime of the model.
+                # Make the runtime layout the module-owned storage, matching the
+                # old loader's replace-on-postprocess behavior.
+                self._replace_moe_runtime_storage(name, shuffled)
+                weights_dict[name] = shuffled
         return weights_dict
+
+    def _replace_moe_runtime_storage(
+        self, name: str, tensor: torch.Tensor
+    ) -> None:
+        attribute = {
+            W.moe_w1: "w13",
+            W.moe_w2: "w2",
+            W.moe_s1: "w13_scale",
+            W.moe_s2: "w2_scale",
+        }.get(name)
+        if attribute is None or not hasattr(self, attribute):
+            return
+        parameter = self._parameters.get(attribute)
+        if parameter is not None:
+            parameter.data = tensor
+        else:
+            # Registered buffers remain registered when assigned through
+            # Module.__setattr__.
+            setattr(self, attribute, tensor)
 
     def _maybe_build_fused_moe(self):
         if self.fused_moe is not None:
