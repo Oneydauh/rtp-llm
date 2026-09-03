@@ -57,6 +57,31 @@ register_model("foundation_gpu_alias_model")(_GpuAliasModel)
 
 
 class FoundationGpuTest(unittest.TestCase):
+    def test_fastsafetensors_preparation_preserves_buffers_and_aliases(self):
+        class PreparedModel(RtpModule):
+            def __init__(self):
+                super().__init__()
+                self.left = RtpModule()
+                self.right = RtpModule()
+                shared = nn.Parameter(torch.full((1024,), 11.0))
+                self.left.weight = shared
+                self.right.weight = shared
+                self.register_buffer(
+                    "derived_buffer",
+                    torch.arange(8, dtype=torch.float32),
+                    persistent=False,
+                )
+
+        model = PreparedModel()
+        expected_buffer = model.derived_buffer.clone()
+        NewModelLoader._prepare_model_for_fastsafetensors(model, "cuda:0")
+
+        self.assertEqual(model.left.weight.device.type, "cuda")
+        self.assertEqual(model.derived_buffer.device.type, "cuda")
+        self.assertTrue(torch.equal(model.derived_buffer.cpu(), expected_buffer))
+        self.assertIs(model.left.weight, model.right.weight)
+        self.assertIsInstance(model.left.weight, nn.Parameter)
+
     def test_persistent_buffer_marker_survives_device_migration(self):
         with tempfile.TemporaryDirectory() as model_path:
             save_file(

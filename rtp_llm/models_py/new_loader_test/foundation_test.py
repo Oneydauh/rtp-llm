@@ -873,6 +873,36 @@ class FoundationLoaderTest(unittest.TestCase):
         self.assertIsInstance(model.embed.weight, nn.Parameter)
         self.assertEqual(model.embed.weight.dtype, torch.float64)
 
+    def test_fastsafetensors_preparation_allocates_parameters_without_copy(self):
+        class PreparedModel(RtpModule):
+            def __init__(self):
+                super().__init__()
+                self.left = RtpModule()
+                self.right = RtpModule()
+                shared = nn.Parameter(torch.full((4,), 11.0))
+                self.left.weight = shared
+                self.right.weight = shared
+                self.register_buffer(
+                    "derived_buffer", torch.full((2,), 7.0), persistent=False
+                )
+
+        model = PreparedModel()
+        original_parameter_id = id(model.left.weight)
+        real_empty_like = torch.empty_like
+        allocated_parameter_ids = []
+
+        def record_empty_like(tensor, *args, **kwargs):
+            allocated_parameter_ids.append(id(tensor))
+            return real_empty_like(tensor, *args, **kwargs)
+
+        with mock.patch("torch.empty_like", side_effect=record_empty_like):
+            NewModelLoader._prepare_model_for_fastsafetensors(model, "cpu")
+
+        self.assertEqual(allocated_parameter_ids, [original_parameter_id])
+        self.assertIs(model.left.weight, model.right.weight)
+        self.assertIsInstance(model.left.weight, nn.Parameter)
+        self.assertTrue(torch.equal(model.derived_buffer, torch.full((2,), 7.0)))
+
     def test_shared_parameter_crosses_custom_loader_boundary_both_directions(self):
         class CustomLeaf(RtpModule):
             def load_weights(self, weights):

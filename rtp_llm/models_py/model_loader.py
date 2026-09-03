@@ -633,6 +633,36 @@ class NewModelLoader:
                 hook()
 
     @staticmethod
+    def _prepare_model_for_fastsafetensors(
+        model: nn.Module, target_device: str
+    ) -> None:
+        """Allocate checkpoint-backed parameters without copying placeholders.
+
+        NewLoader constructs the model on CPU so capability checks and AUTO
+        selection do not consume accelerator memory.  A normal ``model.to``
+        would then copy every uninitialized parameter to the accelerator just
+        before fastsafetensors overwrites it.  Allocate fresh parameter storage
+        on the target instead, while retaining the values of buffers that may
+        be derived by the constructor rather than supplied by the checkpoint.
+
+        ``RtpModule._apply`` memoizes shared tensors and restores aliases, so
+        tied parameters and parameter/buffer aliases remain intact.
+        """
+        device = torch.device(target_device)
+        parameter_ids = {
+            id(parameter)
+            for parameter in model.parameters(recurse=True)
+            if parameter is not None
+        }
+
+        def allocate_parameter_or_move_buffer(tensor: torch.Tensor) -> torch.Tensor:
+            if id(tensor) in parameter_ids:
+                return torch.empty_like(tensor, device=device)
+            return tensor.to(device=device)
+
+        model._apply(allocate_parameter_or_move_buffer)
+
+    @staticmethod
     def _requires_staged_device_postprocess(model: nn.Module) -> bool:
         return any(
             isinstance(module, RtpModule)
@@ -1235,7 +1265,7 @@ class NewModelLoader:
         )
         started = time.time()
         if method == NewLoaderLoadMethod.FASTSAFETENSORS:
-            model.to(self.load_config.device)
+            self._prepare_model_for_fastsafetensors(model, self.load_config.device)
         if method == NewLoaderLoadMethod.FASTSAFETENSORS:
             weights = self._fastsafetensors_weights_iterator(
                 selected_files,
