@@ -835,6 +835,24 @@ class NewModelLoader:
         return False
 
     @staticmethod
+    def _fastsafetensors_backend_options(
+        device: torch.device,
+    ) -> Tuple[bool, bool]:
+        """Return ``(nogds, use_shm)`` for the active accelerator backend.
+
+        ``SafeTensorsFileLoader`` checks ``use_shm`` before ``nogds`` and GDS.
+        Therefore CUDA GDS must set both flags to false; enabling ``use_shm``
+        would silently select the shared-memory reader instead of GDS.
+        """
+        use_nogds = NewModelLoader._fastsafetensors_use_nogds(device)
+        use_shm = (
+            device.type == "cuda"
+            and torch.version.hip is not None
+            and not use_nogds
+        )
+        return use_nogds, use_shm
+
+    @staticmethod
     def _model_storage_bytes(model: nn.Module) -> int:
         seen = set()
         total = 0
@@ -1089,7 +1107,9 @@ class NewModelLoader:
         loader_device = str(target_device)
         if target_device.type == "cuda" and target_device.index is None:
             loader_device = f"cuda:{torch.cuda.current_device()}"
-        use_nogds = NewModelLoader._fastsafetensors_use_nogds(target_device)
+        use_nogds, use_shm = NewModelLoader._fastsafetensors_backend_options(
+            target_device
+        )
         bbuf_size_kb = NewModelLoader._fastsafetensors_bbuf_size_kb(checkpoint_files)
         loader_kwargs = dict(
             pg=process_group,
@@ -1097,7 +1117,7 @@ class NewModelLoader:
             use_tqdm_on_load=True,
             device=loader_device,
             bbuf_size_kb=bbuf_size_kb,
-            use_shm=not use_nogds,
+            use_shm=use_shm,
             nogds=use_nogds,
         )
         loader_handles_read_specs = False

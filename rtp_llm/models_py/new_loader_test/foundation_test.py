@@ -1389,15 +1389,42 @@ class FoundationLoaderTest(unittest.TestCase):
         self.assertFalse(loader_kwargs["use_shm"])
 
     def test_fastsafetensors_uses_gds_when_cufile_is_available(self):
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
-            torch.version, "hip", None
-        ), mock.patch.object(
-            NewModelLoader, "_cuda_cufile_available", return_value=True
-        ):
-            use_nogds = NewModelLoader._fastsafetensors_use_nogds(
-                torch.device("cuda:0")
-            )
-        self.assertFalse(use_nogds)
+        loader_kwargs = {}
+
+        class FakeSingleGroup:
+            def rank(self):
+                return 0
+
+        class FakeParallelLoader:
+            def __init__(self, **kwargs):
+                loader_kwargs.update(kwargs)
+                self.loader = types.SimpleNamespace(close=mock.Mock())
+
+            def iterate_weights(self):
+                return iter(())
+
+        fake_fastsafetensors = types.ModuleType("fastsafetensors")
+        fake_fastsafetensors.ParallelLoader = FakeParallelLoader
+        fake_fastsafetensors.SingleGroup = FakeSingleGroup
+
+        with tempfile.TemporaryDirectory() as model_path:
+            checkpoint = os.path.join(model_path, "model.safetensors")
+            save_file({"value": torch.ones(1)}, checkpoint)
+            with mock.patch.dict(
+                sys.modules, {"fastsafetensors": fake_fastsafetensors}
+            ), mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                torch.version, "hip", None
+            ), mock.patch.object(
+                NewModelLoader, "_cuda_cufile_available", return_value=True
+            ):
+                list(
+                    NewModelLoader._fastsafetensors_weights_iterator(
+                        [checkpoint], "cuda:0", None, None
+                    )
+                )
+
+        self.assertFalse(loader_kwargs["nogds"])
+        self.assertFalse(loader_kwargs["use_shm"])
 
     def test_cuda_cufile_probe_uses_fastsafetensors_backend(self):
         fake_fastsafetensors = types.ModuleType("fastsafetensors")
