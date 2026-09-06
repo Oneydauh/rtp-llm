@@ -6,7 +6,7 @@ import re
 import time
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, Callable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import rtp_llm.models_py.weight_mapper as weight_mapper
 import torch
@@ -134,6 +134,68 @@ class _ExpertRangeFilter:
             (f"{prefix}.{expert_id}.{projection}{suffix}", expert_id)
             for expert_id in range(self.start_expert, self.end_expert)
         ]
+
+
+class _StagedFSTLoadCoordinator:
+    """Quantize staged leaves as soon as their checkpoint inputs are complete."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        staged_modules: List[RtpModule],
+        target_device: str,
+    ):
+        names = {module: name or "<root>" for name, module in model.named_modules()}
+        self._module_names: Dict[nn.Module, str] = {
+            module: names[module] for module in staged_modules
+        }
+        self._target_device = target_device
+        self._prepared: Set[nn.Module] = set()
+        self._finalized: Set[nn.Module] = set()
+        self._peak_active = 0
+
+    def handles(self, child: nn.Module) -> bool:
+        return child in self._module_names
+
+    def load_child(self, child: nn.Module, weights: Any) -> None:
+        if child not in self._module_names:
+            child.load_weights(weights)
+            return
+        if child in self._finalized:
+            raise RuntimeError(
+                "Checkpoint tensor arrived after staged postprocessing completed "
+                f"for {self._module_names[child]} ({type(child).__name__})"
+            )
+        if child not in self._prepared:
+            NewModelLoader._prepare_model_for_fastsafetensors(
+                child, self._target_device
+            )
+            self._prepared.add(child)
+            self._peak_active = max(
+                self._peak_active, len(self._prepared - self._finalized)
+            )
+        child.load_weights(weights)
+        if child.checkpoint_load_complete():
+            child.process_weights_after_loading()
+            self._finalized.add(child)
+
+    def finish(self) -> None:
+        unfinished = [
+            f"{self._module_names[module]} ({type(module).__name__})"
+            for module in self._module_names
+            if module not in self._finalized
+        ]
+        if unfinished:
+            raise RuntimeError(
+                "FST staged postprocessing did not receive a complete checkpoint "
+                f"for {unfinished[:10]}"
+            )
+        logger.info(
+            "FST online quantization finalized %d leaves; peak concurrently "
+            "staged leaves=%d",
+            len(self._finalized),
+            self._peak_active,
+        )
 
 
 def _validate_runtime_device(device: str, label: str) -> None:
@@ -634,7 +696,9 @@ class NewModelLoader:
 
     @staticmethod
     def _prepare_model_for_fastsafetensors(
-        model: nn.Module, target_device: str
+        model: nn.Module,
+        target_device: str,
+        deferred_modules: Optional[List[RtpModule]] = None,
     ) -> None:
         """Allocate checkpoint-backed parameters without copying placeholders.
 
@@ -649,6 +713,14 @@ class NewModelLoader:
         tied parameters and parameter/buffer aliases remain intact.
         """
         device = torch.device(target_device)
+        deferred_tensor_ids = set()
+        for module in deferred_modules or ():
+            deferred_tensor_ids.update(
+                id(tensor)
+                for tensor in list(module.parameters(recurse=True))
+                + list(module.buffers(recurse=True))
+                if tensor is not None
+            )
         parameter_ids = {
             id(parameter)
             for parameter in model.parameters(recurse=True)
@@ -656,6 +728,8 @@ class NewModelLoader:
         }
 
         def allocate_parameter_or_move_buffer(tensor: torch.Tensor) -> torch.Tensor:
+            if id(tensor) in deferred_tensor_ids:
+                return tensor
             if id(tensor) in parameter_ids:
                 return torch.empty_like(tensor, device=device)
             return tensor.to(device=device)
@@ -669,6 +743,62 @@ class NewModelLoader:
             and module.requires_staged_device_postprocess()
             for module in model.modules()
         )
+
+    @staticmethod
+    def _staged_device_modules(model: nn.Module) -> List[RtpModule]:
+        return [
+            module
+            for module in model.modules()
+            if isinstance(module, RtpModule)
+            and module.requires_staged_device_postprocess()
+        ]
+
+    @staticmethod
+    def _validate_staged_device_modules(
+        model: nn.Module,
+        staged_modules: List[RtpModule],
+        *,
+        require_load_complete: bool = False,
+    ) -> None:
+        if not staged_modules:
+            return
+        staged_set = set(staged_modules)
+        tensor_registrations = {}
+        for module in model.modules():
+            tensors = list(
+                module.named_parameters(recurse=False, remove_duplicate=False)
+            ) + list(module.named_buffers(recurse=False, remove_duplicate=False))
+            for name, tensor in tensors:
+                if tensor is not None:
+                    tensor_registrations.setdefault(id(tensor), []).append(
+                        (module, name)
+                    )
+        for registrations in tensor_registrations.values():
+            if (
+                any(module in staged_set for module, _ in registrations)
+                and len(registrations) > 1
+            ):
+                aliases = sorted(
+                    f"{type(module).__name__}.{name}" for module, name in registrations
+                )
+                raise RuntimeError(
+                    "Online-quantized staging does not support shared tensor "
+                    f"aliases: {aliases}"
+                )
+        for module in staged_modules:
+            if any(True for _ in module.children()):
+                raise RuntimeError(
+                    "Staged device postprocess is supported only for leaf modules, "
+                    f"got {type(module).__name__}"
+                )
+            if require_load_complete and (
+                type(module).checkpoint_load_complete
+                is RtpModule.checkpoint_load_complete
+            ):
+                raise RuntimeError(
+                    f"Staged leaf {type(module).__name__} does not implement "
+                    "checkpoint_load_complete()"
+                )
 
     @staticmethod
     def _fastsafetensors_api():
@@ -747,12 +877,31 @@ class NewModelLoader:
                         stacked.append(name)
         return sorted(duplicates), sorted(stacked)
 
-    def _fastsafetensors_distributed_reason(self) -> Optional[str]:
-        """Validate that WORLD is exactly the loader's TP/EP participant set."""
-        expected_world_size = max(
-            self.load_config.tp_size,
-            self.load_config.ep_size,
+    def _fastsafetensors_distributed_reason(
+        self, expert_filter: Optional[_ExpertRangeFilter] = None
+    ) -> Optional[str]:
+        """Validate WORLD and rank fields before choosing an FST subgroup."""
+        parallelism = self.load_config.parallelism_config
+        expected_world_size = getattr(
+            parallelism,
+            "world_size",
+            max(self.load_config.tp_size, self.load_config.ep_size),
         )
+        if (
+            isinstance(expected_world_size, bool)
+            or not isinstance(expected_world_size, int)
+            or expected_world_size <= 0
+        ):
+            return f"invalid configured world_size={expected_world_size!r}"
+        if (
+            expert_filter is not None
+            and self.load_config.ep_size != expected_world_size
+        ):
+            return (
+                "EP fastsafetensors loading requires ep_size to span WORLD: "
+                f"ep_size={self.load_config.ep_size}, "
+                f"world_size={expected_world_size}"
+            )
         if not torch.distributed.is_initialized():
             if expected_world_size > 1:
                 return (
@@ -764,7 +913,7 @@ class NewModelLoader:
         world_size = torch.distributed.get_world_size()
         if world_size != expected_world_size:
             return (
-                "distributed WORLD group does not match the NewLoader TP/EP "
+                "distributed WORLD group does not match the configured "
                 f"topology: world_size={world_size}, expected={expected_world_size}"
             )
         world_rank = torch.distributed.get_rank()
@@ -782,6 +931,51 @@ class NewModelLoader:
                 f"expected_ep_rank={expected_ep_rank}"
             )
         return None
+
+    def _fastsafetensors_process_group(
+        self,
+        SingleGroup,
+        checkpoint_files: List[str],
+        expert_filter: Optional[_ExpertRangeFilter],
+    ):
+        """Return the smallest group containing every checkpoint consumer."""
+        if weight_mapper.is_rank_local_checkpoint(checkpoint_files):
+            logger.info("NewLoader fastsafetensors process group: rank-local")
+            return SingleGroup()
+        if not torch.distributed.is_initialized():
+            logger.info("NewLoader fastsafetensors process group: single-rank")
+            return SingleGroup()
+        if expert_filter is not None:
+            logger.info("NewLoader fastsafetensors process group: EP WORLD")
+            return torch.distributed.group.WORLD
+        if self.load_config.tp_size <= 1:
+            logger.info("NewLoader fastsafetensors process group: DP-local rank")
+            return SingleGroup()
+        world_size = torch.distributed.get_world_size()
+        if world_size == self.load_config.tp_size:
+            logger.info("NewLoader fastsafetensors process group: TP WORLD")
+            return torch.distributed.group.WORLD
+        from rtp_llm.models_py.distributed.collective_torch import Group, _get_group
+
+        process_group = _get_group(Group.TP)
+        group_size = torch.distributed.get_world_size(process_group)
+        group_rank = torch.distributed.get_rank(process_group)
+        if group_size != self.load_config.tp_size:
+            raise RuntimeError(
+                "FST TP process group size does not match NewLoader: "
+                f"group_size={group_size}, tp_size={self.load_config.tp_size}"
+            )
+        if group_rank != self.load_config.tp_rank:
+            raise RuntimeError(
+                "FST TP process group rank does not match NewLoader: "
+                f"group_rank={group_rank}, tp_rank={self.load_config.tp_rank}"
+            )
+        logger.info(
+            "NewLoader fastsafetensors process group: TP subgroup rank=%d size=%d",
+            group_rank,
+            group_size,
+        )
+        return process_group
 
     @staticmethod
     def _fastsafetensors_bbuf_size_kb(checkpoint_files: List[str]) -> int:
@@ -846,9 +1040,7 @@ class NewModelLoader:
         """
         use_nogds = NewModelLoader._fastsafetensors_use_nogds(device)
         use_shm = (
-            device.type == "cuda"
-            and torch.version.hip is not None
-            and not use_nogds
+            device.type == "cuda" and torch.version.hip is not None and not use_nogds
         )
         return use_nogds, use_shm
 
@@ -888,18 +1080,21 @@ class NewModelLoader:
         ]
         if non_safetensors:
             return f"checkpoint contains non-safetensors files {non_safetensors}"
-        if weight_mapper.is_rank_local_checkpoint(checkpoint_files):
+        rank_local_checkpoint = weight_mapper.is_rank_local_checkpoint(checkpoint_files)
+        if rank_local_checkpoint and not bool(
+            getattr(model, "supports_rank_local_checkpoint", False)
+        ):
             return (
-                "rank-local consolidated checkpoints cannot use the collective "
-                "WORLD fastsafetensors loader; use scratch until a rank-local "
-                "SingleGroup path is validated"
+                f"{type(model).__name__} does not support rank-local consolidated "
+                "checkpoints"
             )
-        if self._requires_staged_device_postprocess(model):
-            return (
-                "the model requires staged device postprocessing (for example "
-                "online quantization), which is currently memory-bounded only by "
-                "the scratch path"
+        staged_modules = self._staged_device_modules(model)
+        try:
+            self._validate_staged_device_modules(
+                model, staged_modules, require_load_complete=True
             )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return f"staged device postprocessing is incompatible with FST: {exc}"
 
         target_device = torch.device(self.load_config.device)
         if target_device.type not in ("cpu", "cuda"):
@@ -946,7 +1141,7 @@ class NewModelLoader:
                     f"CUDA device range [0, {device_count})"
                 )
 
-        distributed_reason = self._fastsafetensors_distributed_reason()
+        distributed_reason = self._fastsafetensors_distributed_reason(expert_filter)
         if distributed_reason is not None:
             return distributed_reason
 
@@ -1082,8 +1277,8 @@ class NewModelLoader:
             return NewLoaderLoadMethod.SCRATCH
         raise RuntimeError(f"NewLoader fastsafetensors prerequisite failed: {reason}")
 
-    @staticmethod
     def _fastsafetensors_weights_iterator(
+        self,
         checkpoint_files: List[str],
         device: str,
         name_filter: Optional[Callable[[str], bool]],
@@ -1093,15 +1288,14 @@ class NewModelLoader:
         """Stream safetensors directly to the model's runtime device.
 
         The yielded tensor is consumed synchronously by ``RtpModule.load_weights``
-        before the iterator advances. Stacked EP tensors must have been rejected
-        by metadata preflight before this iterator constructs ``ParallelLoader``.
+        before the iterator advances. Compatible FST versions execute ReadSpecs
+        in their consumer so TP shards and EP expert ranges are materialized
+        before recursive model dispatch.
         """
-        ParallelLoader, SingleGroup = NewModelLoader._fastsafetensors_api()
-
-        if torch.distributed.is_initialized():
-            process_group = torch.distributed.group.WORLD
-        else:
-            process_group = SingleGroup()
+        ParallelLoader, SingleGroup = self._fastsafetensors_api()
+        process_group = self._fastsafetensors_process_group(
+            SingleGroup, checkpoint_files, safetensor_slice_expander
+        )
 
         target_device = torch.device(device)
         loader_device = str(target_device)
@@ -1203,42 +1397,9 @@ class NewModelLoader:
         immediately bounds the extra accelerator memory to one staging layer.
         """
         target_device = torch.device(device)
-        staged_modules = [
-            module
-            for module in model.modules()
-            if isinstance(module, RtpModule)
-            and module.requires_staged_device_postprocess()
-        ]
-        staged_set = set(staged_modules)
-        tensor_registrations = {}
-        for module in model.modules():
-            tensors = list(
-                module.named_parameters(recurse=False, remove_duplicate=False)
-            ) + list(module.named_buffers(recurse=False, remove_duplicate=False))
-            for name, tensor in tensors:
-                if tensor is not None:
-                    tensor_registrations.setdefault(id(tensor), []).append(
-                        (module, name)
-                    )
-        for registrations in tensor_registrations.values():
-            if (
-                any(module in staged_set for module, _ in registrations)
-                and len(registrations) > 1
-            ):
-                aliases = sorted(
-                    f"{type(module).__name__}.{name}" for module, name in registrations
-                )
-                raise RuntimeError(
-                    "Online-quantized staging does not support shared tensor "
-                    f"aliases: {aliases}"
-                )
-
+        staged_modules = NewModelLoader._staged_device_modules(model)
+        NewModelLoader._validate_staged_device_modules(model, staged_modules)
         for module in staged_modules:
-            if any(True for _ in module.children()):
-                raise RuntimeError(
-                    "Staged device postprocess is supported only for leaf modules, "
-                    f"got {type(module).__name__}"
-                )
             module.to(target_device)
             module.process_weights_after_loading()
 
@@ -1284,8 +1445,29 @@ class NewModelLoader:
             method.value,
         )
         started = time.time()
+        staged_coordinator = None
+        coordinator_modules: List[RtpModule] = []
         if method == NewLoaderLoadMethod.FASTSAFETENSORS:
-            self._prepare_model_for_fastsafetensors(model, self.load_config.device)
+            staged_modules = self._staged_device_modules(model)
+            self._validate_staged_device_modules(
+                model, staged_modules, require_load_complete=True
+            )
+            self._prepare_model_for_fastsafetensors(
+                model,
+                self.load_config.device,
+                deferred_modules=staged_modules,
+            )
+            if staged_modules:
+                staged_coordinator = _StagedFSTLoadCoordinator(
+                    model, staged_modules, self.load_config.device
+                )
+                coordinator_modules = [
+                    module
+                    for module in model.modules()
+                    if isinstance(module, RtpModule)
+                ]
+                for module in coordinator_modules:
+                    module._rtp_staged_load_coordinator = staged_coordinator
         if method == NewLoaderLoadMethod.FASTSAFETENSORS:
             weights = self._fastsafetensors_weights_iterator(
                 selected_files,
@@ -1304,7 +1486,12 @@ class NewModelLoader:
             )
         try:
             model.load_weights(weights)
+            if staged_coordinator is not None:
+                staged_coordinator.finish()
         finally:
+            if staged_coordinator is not None:
+                for module in coordinator_modules:
+                    delattr(module, "_rtp_staged_load_coordinator")
             close_weights = getattr(weights, "close", None)
             if callable(close_weights):
                 close_weights()

@@ -54,24 +54,46 @@ class _Float8SafeProcessGroup:
     def rank(self):
         return self._process_group.rank()
 
+    def _global_rank(self, group_rank):
+        """Translate FST's group-local peer rank for PyTorch collectives.
+
+        fastsafetensors addresses peers relative to its process group.  Its
+        PyTorch adapter forwards those values through the legacy ``src`` and
+        ``dst`` arguments, which are global ranks even when ``group`` is a
+        subgroup.  WORLD ranks are unchanged; fake and single-rank groups do
+        not expose ``real_pg`` and therefore retain their existing behavior.
+        """
+
+        real_pg = getattr(self._process_group, "real_pg", None)
+        if real_pg is None:
+            return group_rank
+        get_global_rank = getattr(torch.distributed, "get_global_rank", None)
+        if get_global_rank is None:
+            raise RuntimeError(
+                "FST subgroup loading requires " "torch.distributed.get_global_rank()"
+            )
+        return get_global_rank(real_pg, group_rank)
+
     def broadcast(self, dst, rank):
-        return self._process_group.broadcast(_transport_tensor(dst), rank)
+        return self._process_group.broadcast(
+            _transport_tensor(dst), self._global_rank(rank)
+        )
 
     def scatter(self, dst, scatter_list, src):
         return self._process_group.scatter(
             _transport_tensor(dst),
             [_transport_tensor(tensor) for tensor in scatter_list],
-            src,
+            self._global_rank(src),
         )
 
     def send(self, tensor, dst_rank, tag):
         return self._process_group.send(
-            _transport_tensor(tensor), dst_rank, tag
+            _transport_tensor(tensor), self._global_rank(dst_rank), tag
         )
 
     def recv(self, tensor, src_rank, tag):
         return self._process_group.recv(
-            _transport_tensor(tensor), src_rank, tag
+            _transport_tensor(tensor), self._global_rank(src_rank), tag
         )
 
 

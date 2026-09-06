@@ -867,6 +867,25 @@ class BaseMoEExperts(RtpModule):
         self._maybe_build_fused_moe()
         self._post_load_done = True
 
+    def checkpoint_load_complete(self) -> bool:
+        expected = {
+            (expert_id, proj)
+            for expert_id in range(self.num_local_experts)
+            for proj in self.PROJ_NAMES
+        }
+        if not expected.issubset(self._loaded_keys):
+            return False
+        aux_names = self._required_aux_param_names()
+        if not aux_names:
+            return True
+        expected_aux = {
+            (expert_id, proj, aux_name)
+            for expert_id in range(self.num_local_experts)
+            for proj in self.PROJ_NAMES
+            for aux_name in aux_names
+        }
+        return expected_aux.issubset(self._loaded_aux_keys)
+
     def validate_weights_loaded(self, loaded_tensor_ids=None) -> None:
         self._check_load_complete()
 
@@ -919,9 +938,7 @@ class BaseMoEExperts(RtpModule):
                 weights_dict[name] = shuffled
         return weights_dict
 
-    def _replace_moe_runtime_storage(
-        self, name: str, tensor: torch.Tensor
-    ) -> None:
+    def _replace_moe_runtime_storage(self, name: str, tensor: torch.Tensor) -> None:
         attribute = {
             W.moe_w1: "w13",
             W.moe_w2: "w2",

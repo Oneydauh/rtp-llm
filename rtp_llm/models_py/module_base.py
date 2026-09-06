@@ -222,6 +222,15 @@ class RtpModule(nn.Module):
         """Whether this leaf must postprocess immediately after device migration."""
         return False
 
+    def checkpoint_load_complete(self) -> bool:
+        """Whether this leaf has all tensors needed for staged postprocessing."""
+        if self.requires_staged_device_postprocess():
+            raise NotImplementedError(
+                f"{type(self).__name__} must implement checkpoint_load_complete() "
+                "for staged streaming"
+            )
+        return False
+
     def _apply(self, fn, recurse=True):
         alias_groups = _collect_tensor_alias_groups(self, recurse=recurse)
         apply_once = _memoize_tensor_apply(fn)
@@ -309,11 +318,23 @@ class RtpModule(nn.Module):
         if index < 0 or index >= len(module_list):
             return False
         child = module_list[index]
+        coordinator = getattr(self, "_rtp_staged_load_coordinator", None)
+        if coordinator is not None and coordinator.handles(child):
+            self._load_child_weights(child, {rest: tensor})
+            return True
         child_loader = getattr(type(child), "load_weights", None)
         if child_loader is not None and child_loader is not RtpModule.load_weights:
-            child.load_weights({rest: tensor})
+            self._load_child_weights(child, {rest: tensor})
             return True
         return self._dispatch(child, rest, tensor)
+
+    def _load_child_weights(self, child: nn.Module, weights: Any) -> None:
+        """Load one custom child through the active streaming coordinator."""
+        coordinator = getattr(self, "_rtp_staged_load_coordinator", None)
+        if coordinator is None:
+            child.load_weights(weights)
+            return
+        coordinator.load_child(child, weights)
 
     def _dispatch(self, module: nn.Module, name: str, tensor: torch.Tensor) -> bool:
         if "." not in name:
@@ -323,15 +344,19 @@ class RtpModule(nn.Module):
         if child is None:
             child = self._fused_shard_target(module, prefix)
             if child is not None:
-                child.load_weights({name: tensor})
+                self._load_child_weights(child, {name: tensor})
                 return True
         if isinstance(child, nn.ModuleList):
             return self._dispatch_to_module_list(child, rest, tensor)
         if not isinstance(child, nn.Module):
             return False
+        coordinator = getattr(self, "_rtp_staged_load_coordinator", None)
+        if coordinator is not None and coordinator.handles(child):
+            self._load_child_weights(child, {rest: tensor})
+            return True
         child_loader = getattr(type(child), "load_weights", None)
         if child_loader is not None and child_loader is not RtpModule.load_weights:
-            child.load_weights({rest: tensor})
+            self._load_child_weights(child, {rest: tensor})
             return True
         return self._dispatch(child, rest, tensor)
 

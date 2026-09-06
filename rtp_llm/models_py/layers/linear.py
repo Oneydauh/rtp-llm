@@ -114,6 +114,18 @@ class LinearBase(RtpModule):
         self.quant_method.process_weights_after_loading(self)
         self._post_load_done = True
 
+    def checkpoint_load_complete(self) -> bool:
+        required = set(
+            getattr(
+                self.quant_method,
+                "required_checkpoint_parameters",
+                ("weight",),
+            )
+        )
+        if self.bias is not None:
+            required.add("bias")
+        return required.issubset(self._loaded_parameter_names)
+
     def validate_weights_loaded(self, loaded_tensor_ids=None) -> None:
         required = set(
             getattr(

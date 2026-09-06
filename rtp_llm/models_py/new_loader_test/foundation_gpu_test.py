@@ -2,15 +2,18 @@ import os
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 import torch
 import torch.nn as nn
+from rtp_llm.models_py.layers.linear import ColumnParallelLinear
 from rtp_llm.models_py.model_loader import (
     NewLoaderConfig,
     NewLoaderLoadMethod,
     NewModelLoader,
 )
 from rtp_llm.models_py.module_base import RtpModule
+from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 from rtp_llm.models_py.registry import register_model
 from safetensors.torch import save_file
 
@@ -54,6 +57,59 @@ class _GpuAliasModel(RtpModule):
 
 
 register_model("foundation_gpu_alias_model")(_GpuAliasModel)
+
+
+class _GpuStagedLeaf(RtpModule):
+    def __init__(self, index, events):
+        super().__init__()
+        self.index = index
+        self.events = events
+        self.weight = nn.Parameter(
+            torch.empty(1024, 1024, dtype=torch.bfloat16), requires_grad=False
+        )
+        self._post_load_done = False
+
+    def requires_staged_device_postprocess(self):
+        return True
+
+    def checkpoint_load_complete(self):
+        return "weight" in getattr(self, "_rtp_loaded_weight_names", set())
+
+    def process_weights_after_loading(self):
+        if self._post_load_done:
+            return
+        self.events.append((self.index, self.weight.device.type))
+        compressed = self.weight.detach().to(torch.uint8)
+        del self.weight
+        self.register_parameter("weight", nn.Parameter(compressed, requires_grad=False))
+        self._post_load_done = True
+
+
+class _GpuFSTStagedModel(RtpModule):
+    def __init__(self, model_config, load_config):
+        super().__init__()
+        self.events = []
+        self.layers = nn.ModuleList(
+            [_GpuStagedLeaf(index, self.events) for index in range(2)]
+        )
+
+
+register_model("foundation_gpu_fst_staged_model")(_GpuFSTStagedModel)
+
+
+class _GpuFSTOnlineQuantModel(RtpModule):
+    def __init__(self, model_config, load_config):
+        super().__init__()
+        self.linear = ColumnParallelLinear(
+            input_size=1024,
+            output_size=1024,
+            quant_config=QuantizationConfig("fp8_online"),
+            prefix="linear",
+            params_dtype=torch.bfloat16,
+        )
+
+
+register_model("foundation_gpu_fst_online_quant_model")(_GpuFSTOnlineQuantModel)
 
 
 class FoundationGpuTest(unittest.TestCase):
@@ -229,6 +285,78 @@ class FoundationGpuTest(unittest.TestCase):
         self.assertTrue(
             all(layer.weight.dtype == torch.uint8 for layer in model.layers)
         )
+
+    def test_real_fastsafetensors_stream_postprocesses_staged_leaves(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            checkpoint_weights = {
+                "layers.0.weight": torch.full((1024, 1024), 1, dtype=torch.bfloat16),
+                "layers.1.weight": torch.full((1024, 1024), 2, dtype=torch.bfloat16),
+            }
+            save_file(
+                checkpoint_weights,
+                os.path.join(model_path, "model.safetensors"),
+            )
+            with mock.patch.dict(os.environ, {"FASTSAFETENSORS_NOGDS": "1"}):
+                model = NewModelLoader(
+                    types.SimpleNamespace(model_type="foundation_gpu_fst_staged_model"),
+                    NewLoaderConfig(
+                        device="cuda:0",
+                        compute_dtype=torch.bfloat16,
+                        load_method=NewLoaderLoadMethod.FASTSAFETENSORS,
+                    ),
+                    model_path=model_path,
+                ).load()
+
+        self.assertEqual(model.events, [(0, "cuda"), (1, "cuda")])
+        for index, layer in enumerate(model.layers, start=1):
+            self.assertEqual(layer.weight.device.type, "cuda")
+            self.assertEqual(layer.weight.dtype, torch.uint8)
+            self.assertTrue(torch.all(layer.weight == index))
+            self.assertFalse(hasattr(layer, "_rtp_staged_load_coordinator"))
+
+    def test_real_fastsafetensors_runs_online_fp8_quantization(self):
+        source_weight = (
+            torch.linspace(
+                -3.0,
+                3.0,
+                1024 * 1024,
+                dtype=torch.float32,
+            )
+            .reshape(1024, 1024)
+            .to(torch.bfloat16)
+        )
+        with tempfile.TemporaryDirectory() as model_path:
+            save_file(
+                {"linear.weight": source_weight},
+                os.path.join(model_path, "model.safetensors"),
+            )
+            with mock.patch.dict(os.environ, {"FASTSAFETENSORS_NOGDS": "1"}):
+                model = NewModelLoader(
+                    types.SimpleNamespace(
+                        model_type="foundation_gpu_fst_online_quant_model"
+                    ),
+                    NewLoaderConfig(
+                        device="cuda:0",
+                        compute_dtype=torch.bfloat16,
+                        load_method=NewLoaderLoadMethod.FASTSAFETENSORS,
+                    ),
+                    model_path=model_path,
+                ).load()
+
+        linear = model.linear
+        self.assertEqual(linear.weight.device.type, "cuda")
+        self.assertEqual(linear.weight.dtype, torch.float8_e4m3fn)
+        self.assertEqual(linear.weight_scale.device.type, "cuda")
+        self.assertEqual(linear.weight_scale.dtype, torch.float32)
+        self.assertTrue(linear._post_load_done)
+        restored = linear.weight.float().cpu() * linear.weight_scale.item()
+        torch.testing.assert_close(
+            restored,
+            source_weight.float(),
+            rtol=0.07,
+            atol=0.01,
+        )
+        self.assertFalse(hasattr(linear, "_rtp_staged_load_coordinator"))
 
 
 if __name__ == "__main__":
