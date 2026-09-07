@@ -274,6 +274,54 @@ class FoundationLoaderTest(unittest.TestCase):
         self.assertTrue(local_expert.load)
         self.assertEqual(local_expert.target_ranks, (1,))
 
+    def test_read_spec_resolver_builds_reusable_dispatch_plan(self):
+        loader = self._loader("unused")
+        model = _FoundationModel(None, loader.load_config)
+        load_plan = {}
+        resolver = loader._checkpoint_read_spec_resolver(model, None, None, load_plan)
+
+        resolver("layers.0.weight", (2, 2))
+        resolver("final", (2,))
+
+        layer_target = load_plan["layers.0.weight"]
+        self.assertIs(layer_target.module, model.layers[0])
+        self.assertEqual(layer_target.name, "weight")
+        self.assertFalse(layer_target.custom_loader)
+        self.assertIs(load_plan["final"].module, model)
+
+        model._rtp_checkpoint_load_plan = load_plan
+        expected = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+        try:
+            with mock.patch.object(
+                model,
+                "_dispatch_to_module_list",
+                side_effect=AssertionError("planned dispatch recursed"),
+            ):
+                model.load_weights({"layers.0.weight": expected})
+        finally:
+            delattr(model, "_rtp_checkpoint_load_plan")
+        self.assertTrue(torch.equal(model.layers[0].weight, expected))
+
+    def test_read_spec_resolver_plans_custom_leaf_with_tp_slice(self):
+        loader = self._tp_loader("unused")
+        model = _TPFoundationModel(None, loader.load_config)
+        load_plan = {}
+        resolver = loader._checkpoint_read_spec_resolver(model, None, None, load_plan)
+        source = self._tp_weights()["column.weight"]
+
+        read_spec = resolver("column.weight", tuple(source.shape))
+        target = load_plan["column.weight"]
+
+        self.assertIs(target.module, model.column)
+        self.assertEqual(target.name, "weight")
+        self.assertTrue(target.custom_loader)
+        model._rtp_checkpoint_load_plan = load_plan
+        try:
+            model.load_weights({"column.weight": read_spec.materialize(source)})
+        finally:
+            delattr(model, "_rtp_checkpoint_load_plan")
+        self.assertTrue(torch.equal(model.column.weight, source[3:]))
+
     def test_fst_read_spec_uses_get_sharded_before_yield(self):
         source = torch.arange(24, dtype=torch.float32).reshape(4, 6)
 

@@ -11,7 +11,11 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 import rtp_llm.models_py.weight_mapper as weight_mapper
 import torch
 import torch.nn as nn
-from rtp_llm.models_py.module_base import RtpModule, collect_loaded_tensor_ids
+from rtp_llm.models_py.module_base import (
+    CheckpointLoadTarget,
+    RtpModule,
+    collect_loaded_tensor_ids,
+)
 from rtp_llm.models_py.read_spec import LoadedCheckpointTensor, ReadSpec
 from rtp_llm.models_py.registry import get_model_class, list_models
 
@@ -38,6 +42,7 @@ _FASTSAFETENSORS_REQUIRED_ARGUMENTS = frozenset(
 _FASTSAFETENSORS_MIN_BBUF_SIZE_KB = 16 * 1024
 _FASTSAFETENSORS_MAX_BBUF_SIZE_KB = 2 * 1024 * 1024
 _CHECKPOINT_CATALOG_UNSET = object()
+_CHECKPOINT_LOAD_PLAN_UNSET = object()
 
 
 def _require_callable_name_filter(
@@ -584,6 +589,7 @@ class NewModelLoader:
         model: RtpModule,
         model_filter: Optional[Callable[[str], bool]],
         expert_filter: Optional[_ExpertRangeFilter],
+        checkpoint_load_plan: Optional[Dict[str, CheckpointLoadTarget]] = None,
     ) -> Callable[[str, Tuple[int, ...]], ReadSpec]:
         model_filter = _require_callable_name_filter(model_filter, "model_filter")
         if torch.distributed.is_initialized():
@@ -595,11 +601,15 @@ class NewModelLoader:
             shape = tuple(shape)
             if model_filter is not None and not model_filter(name):
                 return ReadSpec.skip(name, shape)
-            if not model.allow_checkpoint_read_spec(name):
-                return ReadSpec.full(name, shape)
 
             mapped_name = self._mapped_checkpoint_name(model, name)
-            read_spec = model.resolve_checkpoint_read_spec(mapped_name, shape)
+            load_target, read_spec = model.resolve_checkpoint_load_plan(
+                mapped_name, shape
+            )
+            if checkpoint_load_plan is not None and load_target is not None:
+                checkpoint_load_plan[mapped_name] = load_target
+            if not model.allow_checkpoint_read_spec(name):
+                read_spec = None
             if read_spec is None:
                 read_spec = ReadSpec.full(name, shape)
             else:
@@ -1440,8 +1450,9 @@ class NewModelLoader:
         self._validate_runtime_backends(model, self.load_config.device)
         model_filter = self._model_checkpoint_name_filter(model)
         name_filter = self._checkpoint_name_filter(model_filter, expert_filter)
+        checkpoint_load_plan: Dict[str, CheckpointLoadTarget] = {}
         read_spec_resolver = self._checkpoint_read_spec_resolver(
-            model, model_filter, expert_filter
+            model, model_filter, expert_filter, checkpoint_load_plan
         )
         selected_files = weight_mapper.select_safetensor_files(
             self._resolved_model_path(),
@@ -1506,11 +1517,19 @@ class NewModelLoader:
                 safetensor_slice_expander=expert_filter,
                 read_spec_resolver=read_spec_resolver,
             )
+        previous_load_plan = getattr(
+            model, "_rtp_checkpoint_load_plan", _CHECKPOINT_LOAD_PLAN_UNSET
+        )
+        model._rtp_checkpoint_load_plan = checkpoint_load_plan
         try:
             model.load_weights(weights)
             if staged_coordinator is not None:
                 staged_coordinator.finish()
         finally:
+            if previous_load_plan is _CHECKPOINT_LOAD_PLAN_UNSET:
+                delattr(model, "_rtp_checkpoint_load_plan")
+            else:
+                model._rtp_checkpoint_load_plan = previous_load_plan
             if staged_coordinator is not None:
                 for module in coordinator_modules:
                     delattr(module, "_rtp_staged_load_coordinator")

@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -28,6 +28,14 @@ def _is_allowed_dropped_weight(name: str) -> bool:
 
 def _is_float8_dtype(dtype: torch.dtype) -> bool:
     return str(dtype).startswith("torch.float8_")
+
+
+class CheckpointLoadTarget(NamedTuple):
+    """Resolved destination for one mapped checkpoint tensor."""
+
+    module: nn.Module
+    name: str
+    custom_loader: bool
 
 
 def copy_weight_(target: torch.Tensor, source: torch.Tensor, label: str) -> None:
@@ -172,43 +180,99 @@ class RtpModule(nn.Module):
     def _resolve_checkpoint_read_spec(
         self, module: nn.Module, name: str, shape: tuple[int, ...]
     ) -> Optional[ReadSpec]:
+        _, read_spec = self._resolve_checkpoint_load_plan(module, name, shape)
+        return read_spec
+
+    @staticmethod
+    def _direct_checkpoint_target(
+        module: nn.Module, name: str
+    ) -> Optional[CheckpointLoadTarget]:
+        parameter = module._parameters.get(name)
+        buffer = module._buffers.get(name)
+        if isinstance(parameter, nn.Parameter):
+            return CheckpointLoadTarget(module, name, False)
+        if (
+            isinstance(buffer, torch.Tensor)
+            and name not in module._non_persistent_buffers_set
+        ):
+            return CheckpointLoadTarget(module, name, False)
+        return None
+
+    def _resolve_checkpoint_load_plan(
+        self, module: nn.Module, name: str, shape: tuple[int, ...]
+    ) -> Tuple[Optional[CheckpointLoadTarget], Optional[ReadSpec]]:
+        """Resolve dispatch destination and ReadSpec in one tree traversal."""
+        local_spec = None
         if isinstance(module, RtpModule):
             local_spec = module.checkpoint_read_spec(name, shape)
-            if local_spec is not None:
-                return local_spec
         if "." not in name:
-            return None
+            return self._direct_checkpoint_target(module, name), local_spec
+
         prefix, rest = name.split(".", 1)
         child = module._modules.get(prefix)
         if child is None:
             child = self._fused_shard_target(module, prefix)
-            if child is not None and isinstance(child, RtpModule):
-                return child.checkpoint_read_spec(name, shape)
+            if child is not None:
+                child_spec = (
+                    child.checkpoint_read_spec(name, shape)
+                    if isinstance(child, RtpModule)
+                    else None
+                )
+                return (
+                    CheckpointLoadTarget(child, name, True),
+                    local_spec if local_spec is not None else child_spec,
+                )
+
         if isinstance(child, nn.ModuleList):
             if "." not in rest:
-                return None
+                return None, local_spec
             index_text, child_name = rest.split(".", 1)
             try:
                 index = int(index_text)
             except ValueError:
-                return None
+                return None, local_spec
             if not 0 <= index < len(child):
-                return None
+                return None, local_spec
             target = child[index]
             child_loader = getattr(type(target), "load_weights", None)
             if child_loader is not None and child_loader is not RtpModule.load_weights:
-                if isinstance(target, RtpModule):
-                    return target.checkpoint_read_spec(child_name, shape)
-                return None
-            return self._resolve_checkpoint_read_spec(target, child_name, shape)
+                child_spec = (
+                    target.checkpoint_read_spec(child_name, shape)
+                    if isinstance(target, RtpModule)
+                    else None
+                )
+                return (
+                    CheckpointLoadTarget(target, child_name, True),
+                    local_spec if local_spec is not None else child_spec,
+                )
+            target_plan, child_spec = self._resolve_checkpoint_load_plan(
+                target, child_name, shape
+            )
+            return target_plan, local_spec if local_spec is not None else child_spec
+
         if not isinstance(child, nn.Module):
-            return None
+            return None, local_spec
         child_loader = getattr(type(child), "load_weights", None)
         if child_loader is not None and child_loader is not RtpModule.load_weights:
-            if isinstance(child, RtpModule):
-                return child.checkpoint_read_spec(rest, shape)
-            return None
-        return self._resolve_checkpoint_read_spec(child, rest, shape)
+            child_spec = (
+                child.checkpoint_read_spec(rest, shape)
+                if isinstance(child, RtpModule)
+                else None
+            )
+            return (
+                CheckpointLoadTarget(child, rest, True),
+                local_spec if local_spec is not None else child_spec,
+            )
+        target_plan, child_spec = self._resolve_checkpoint_load_plan(child, rest, shape)
+        return target_plan, local_spec if local_spec is not None else child_spec
+
+    def resolve_checkpoint_load_plan(
+        self, name: str, shape: tuple[int, ...]
+    ) -> Tuple[Optional[CheckpointLoadTarget], Optional[ReadSpec]]:
+        """Resolve a mapped name once for backend slicing and later dispatch."""
+        if not isinstance(name, str) or not name:
+            raise ValueError("checkpoint name must be a non-empty string")
+        return self._resolve_checkpoint_load_plan(self, name, tuple(shape))
 
     def resolve_checkpoint_read_spec(
         self, name: str, shape: tuple[int, ...]
@@ -337,6 +401,15 @@ class RtpModule(nn.Module):
         coordinator.load_child(child, weights)
 
     def _dispatch(self, module: nn.Module, name: str, tensor: torch.Tensor) -> bool:
+        if module is self:
+            load_plan = getattr(self, "_rtp_checkpoint_load_plan", None)
+            if load_plan is not None:
+                target = load_plan.get(name)
+                if target is not None:
+                    if target.custom_loader:
+                        self._load_child_weights(target.module, {target.name: tensor})
+                        return True
+                    return self._assign_weight(target.module, target.name, tensor)
         if "." not in name:
             return self._assign_weight(module, name, tensor)
         prefix, rest = name.split(".", 1)
