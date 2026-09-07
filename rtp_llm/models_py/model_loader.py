@@ -37,6 +37,7 @@ _FASTSAFETENSORS_REQUIRED_ARGUMENTS = frozenset(
 )
 _FASTSAFETENSORS_MIN_BBUF_SIZE_KB = 16 * 1024
 _FASTSAFETENSORS_MAX_BBUF_SIZE_KB = 2 * 1024 * 1024
+_CHECKPOINT_CATALOG_UNSET = object()
 
 
 def _require_callable_name_filter(
@@ -414,6 +415,7 @@ class NewModelLoader:
         self.load_config = effective_config
         self.model_path = model_path
         self._ckpt_files = None
+        self._safetensor_catalog_cache = _CHECKPOINT_CATALOG_UNSET
 
     def _resolve_load_method(self) -> NewLoaderLoadMethod:
         configured = self.load_config.load_method
@@ -452,16 +454,27 @@ class NewModelLoader:
 
     def _checkpoint_files(self):
         if self._ckpt_files is None:
-            self._ckpt_files = weight_mapper.discover_ckpt_files(
-                self._resolved_model_path(),
-                tp_rank=self.load_config.tp_rank,
-                tp_size=self.load_config.tp_size,
-            )
+            catalog = self._safetensor_catalog()
+            if catalog is not None:
+                self._ckpt_files = list(catalog.shard_files)
+            else:
+                self._ckpt_files = weight_mapper.discover_ckpt_files(
+                    self._resolved_model_path(),
+                    tp_rank=self.load_config.tp_rank,
+                    tp_size=self.load_config.tp_size,
+                )
             if not self._ckpt_files:
                 raise FileNotFoundError(
                     f"No supported checkpoint files in {self._resolved_model_path()}"
                 )
         return self._ckpt_files
+
+    def _safetensor_catalog(self) -> Optional[weight_mapper.CheckpointCatalog]:
+        if self._safetensor_catalog_cache is _CHECKPOINT_CATALOG_UNSET:
+            self._safetensor_catalog_cache = weight_mapper.safetensor_catalog(
+                self._resolved_model_path()
+            )
+        return self._safetensor_catalog_cache
 
     def _expert_filter(self):
         if self.load_config.ep_size == 1:
@@ -836,7 +849,9 @@ class NewModelLoader:
 
     @staticmethod
     def _safetensor_metadata_summary(
-        model_path: str, checkpoint_files: List[str]
+        model_path: str,
+        checkpoint_files: List[str],
+        catalog: Optional[weight_mapper.CheckpointCatalog] = None,
     ) -> Tuple[List[str], List[str]]:
         """Return duplicate names and stacked expert names without reading data.
 
@@ -848,16 +863,18 @@ class NewModelLoader:
         selected_identities = {
             os.path.realpath(os.fspath(path)) for path in checkpoint_files
         }
-        index_entries = weight_mapper.safetensor_index_entries(model_path)
+        index_entries = weight_mapper.safetensor_index_entries(model_path, catalog)
         if index_entries is not None:
-            indexed_identities = {
-                os.path.realpath(shard_path) for _, shard_path in index_entries
+            identity_by_shard = {
+                shard_path: os.path.realpath(shard_path)
+                for shard_path in dict.fromkeys(path for _, path in index_entries)
             }
+            indexed_identities = set(identity_by_shard.values())
             if selected_identities.issubset(indexed_identities):
                 stacked = [
                     name
                     for name, shard_path in index_entries
-                    if os.path.realpath(shard_path) in selected_identities
+                    if identity_by_shard[shard_path] in selected_identities
                     and _STACKED_EXPERT_RE.fullmatch(name)
                 ]
                 return [], stacked
@@ -1151,7 +1168,9 @@ class NewModelLoader:
             return str(exc)
         try:
             duplicates, stacked_experts = self._safetensor_metadata_summary(
-                self._resolved_model_path(), checkpoint_files
+                self._resolved_model_path(),
+                checkpoint_files,
+                self._safetensor_catalog(),
             )
         except (OSError, RuntimeError, ValueError) as exc:
             return f"failed to inspect safetensors metadata: {exc}"
@@ -1425,7 +1444,10 @@ class NewModelLoader:
             model, model_filter, expert_filter
         )
         selected_files = weight_mapper.select_safetensor_files(
-            self._resolved_model_path(), checkpoint_files, model_filter
+            self._resolved_model_path(),
+            checkpoint_files,
+            model_filter,
+            self._safetensor_catalog(),
         )
         if len(selected_files) != len(checkpoint_files):
             logger.info(

@@ -3,6 +3,7 @@ import json
 import ntpath
 import os
 import re
+from dataclasses import dataclass
 from typing import (
     Callable,
     Dict,
@@ -29,6 +30,22 @@ _EXCLUDED_WEIGHT_FILES = {
     "model.safetensors.index.json",
     "training_args.bin",
 }
+
+
+@dataclass(frozen=True)
+class CheckpointCatalog:
+    """Validated tensor-to-shard metadata from one checkpoint index.
+
+    The catalog is intentionally data-only: it does not open tensor payloads or
+    choose a loading strategy.  NewLoader can share one instance across shard
+    discovery, preflight checks, filtering, and its future load planner instead
+    of parsing and resolving the same index repeatedly.
+    """
+
+    index_path: str
+    format: str
+    entries: Tuple[Tuple[str, str], ...]
+    shard_files: Tuple[str, ...]
 
 
 class WeightsMapper:
@@ -274,22 +291,19 @@ def _resolve_index_shard_path(
     return shard_path
 
 
-def safetensor_index_entries(
-    model_path: str,
-) -> Optional[List[Tuple[str, str]]]:
-    """Return validated ``(tensor_name, shard_path)`` index entries.
-
-    Callers that only need checkpoint metadata can use the Hugging Face index
-    without opening every safetensors shard header again.  ``None`` means the
-    checkpoint has no safetensors index and the caller must inspect the files.
-    """
-    index = _read_checkpoint_index(model_path, _SAFETENSORS_INDEX)
+def _checkpoint_catalog_from_index(
+    model_path: str, index_name: str
+) -> Optional[CheckpointCatalog]:
+    index = _read_checkpoint_index(model_path, index_name)
     if index is None:
         return None
     index_path, weight_map = index
+    expected_suffix = ".safetensors" if index_name == _SAFETENSORS_INDEX else ".bin"
     model_root = os.path.realpath(model_path)
     entries = []
     shard_paths = {}
+    shard_files = []
+    shard_identities = set()
     for name, shard_name in weight_map.items():
         if not isinstance(name, str):
             raise ValueError(
@@ -301,20 +315,57 @@ def safetensor_index_entries(
                 f"{shard_name!r}"
             )
         if shard_name not in shard_paths:
-            shard_paths[shard_name] = _resolve_index_shard_path(
+            shard_path = _resolve_index_shard_path(
                 model_root,
                 index_path,
                 shard_name,
-                ".safetensors",
+                expected_suffix,
             )
+            shard_paths[shard_name] = shard_path
+            shard_identity = os.path.realpath(shard_path)
+            if shard_identity not in shard_identities:
+                shard_identities.add(shard_identity)
+                shard_files.append(shard_path)
         entries.append((name, shard_paths[shard_name]))
-    return entries
+    return CheckpointCatalog(
+        index_path=index_path,
+        format="safetensors" if index_name == _SAFETENSORS_INDEX else "pytorch",
+        entries=tuple(entries),
+        shard_files=tuple(shard_files),
+    )
+
+
+def safetensor_catalog(model_path: str) -> Optional[CheckpointCatalog]:
+    """Build the validated safetensors index catalog, if one exists."""
+    return _checkpoint_catalog_from_index(model_path, _SAFETENSORS_INDEX)
+
+
+def safetensor_index_entries(
+    model_path: str,
+    catalog: Optional[CheckpointCatalog] = None,
+) -> Optional[List[Tuple[str, str]]]:
+    """Return validated ``(tensor_name, shard_path)`` index entries.
+
+    Callers that only need checkpoint metadata can use the Hugging Face index
+    without opening every safetensors shard header again.  ``None`` means the
+    checkpoint has no safetensors index and the caller must inspect the files.
+    """
+    if catalog is None:
+        catalog = safetensor_catalog(model_path)
+    if catalog is None:
+        return None
+    if catalog.format != "safetensors":
+        raise ValueError(
+            f"Expected a safetensors catalog, got format={catalog.format!r}"
+        )
+    return list(catalog.entries)
 
 
 def select_safetensor_files(
     model_path: str,
     checkpoint_files: Sequence[str],
     name_filter: Optional[Callable[[str], bool]],
+    catalog: Optional[CheckpointCatalog] = None,
 ) -> List[str]:
     """Select shards containing at least one accepted checkpoint tensor.
 
@@ -332,10 +383,12 @@ def select_safetensor_files(
 
     discovered = {os.path.realpath(path): path for path in files}
     selected_identities = set()
-    index_entries = safetensor_index_entries(model_path)
+    index_entries = safetensor_index_entries(model_path, catalog)
     if index_entries is not None:
+        catalog_shards = tuple(dict.fromkeys(path for _, path in index_entries))
+        identity_by_shard = {path: os.path.realpath(path) for path in catalog_shards}
         for name, shard_path in index_entries:
-            identity = os.path.realpath(shard_path)
+            identity = identity_by_shard[shard_path]
             if name_filter(name):
                 if identity not in discovered:
                     raise ValueError(
@@ -358,27 +411,8 @@ def select_safetensor_files(
 
 
 def _files_from_index(model_path: str, index_name: str) -> Optional[List[str]]:
-    index = _read_checkpoint_index(model_path, index_name)
-    if index is None:
-        return None
-    index_path, weight_map = index
-
-    expected_suffix = ".safetensors" if index_name == _SAFETENSORS_INDEX else ".bin"
-    model_root = os.path.realpath(model_path)
-    files = []
-    seen = set()
-    for shard_name in weight_map.values():
-        shard_path = _resolve_index_shard_path(
-            model_root,
-            index_path,
-            shard_name,
-            expected_suffix,
-        )
-        shard_identity = os.path.realpath(shard_path)
-        if shard_identity not in seen:
-            seen.add(shard_identity)
-            files.append(shard_path)
-    return files
+    catalog = _checkpoint_catalog_from_index(model_path, index_name)
+    return None if catalog is None else list(catalog.shard_files)
 
 
 def _is_consolidated_weight_file(path: str) -> bool:

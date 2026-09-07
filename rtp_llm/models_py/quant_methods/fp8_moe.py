@@ -201,8 +201,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 f"MoE FP8 block scale shape must be {expected}, got "
                 f"{tuple(scale.shape)}"
             )
-        if not bool(torch.isfinite(scale).all()) or bool((scale <= 0).any()):
-            raise ValueError("MoE FP8 block scales must be finite and positive")
         if (
             weight.dtype == torch.float8_e4m3fn
             and runtime_dtype == torch.float8_e4m3fnuz
@@ -381,10 +379,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     f"FP8 MoE {param_name} must be floating point, got "
                     f"{tensor.dtype}"
                 )
-            if not bool(torch.isfinite(tensor).all()) or bool((tensor <= 0).any()):
-                raise ValueError(
-                    f"FP8 MoE {param_name} values must be finite and positive"
-                )
 
         if param_name == "weight_scale" and qf == "fp8_per_tensor":
             if tensor.numel() != 1:
@@ -392,13 +386,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     f"FP8 MoE per-tensor scale must contain one value, got "
                     f"shape {tuple(tensor.shape)}"
                 )
-            scale_val = tensor.float().reshape(()).item()
+            scale = tensor.float().reshape(())
             if proj == "gate_proj":
-                layer._gate_scales[local_id] = scale_val
+                layer._gate_scales.data[local_id].copy_(scale)
             elif proj == "up_proj":
-                layer._up_scales[local_id] = scale_val
+                layer._up_scales.data[local_id].copy_(scale)
             elif proj == "down_proj":
-                layer._down_scales[local_id] = scale_val
+                layer._down_scales.data[local_id].copy_(scale)
             else:
                 return False
             return True
@@ -507,11 +501,39 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     # ------------------------------------------------------------------ #
     # Post-load scale fusion and online quantization.
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _validate_positive_finite_scales(scales, description: str) -> None:
+        """Validate a completed scale set with one host synchronization.
+
+        Streamed FST tensors already reside on the accelerator. Converting the
+        result of a reduction to ``bool`` for every expert scale serializes the
+        loading stream thousands of times on large MoE checkpoints. Keep the
+        cheap dtype/shape checks in ``dispatch_scale`` and aggregate value
+        validation once after the layer's scale buffers are complete.
+        """
+        checks = [torch.isfinite(scale).all() & (scale > 0).all() for scale in scales]
+        if checks and not bool(torch.stack(checks).all()):
+            raise ValueError(
+                f"MoE FP8 {description} scales must be finite and positive"
+            )
+
     def process_weights_after_loading(self, layer):
         qf = layer._quant_family
         if qf == "fp8_per_tensor":
+            self._validate_positive_finite_scales(
+                (layer._up_scales, layer._gate_scales, layer._down_scales),
+                "per-tensor",
+            )
             self._fuse_per_tensor(layer)
         elif qf == "fp8_per_channel":
+            self._validate_positive_finite_scales(
+                (
+                    layer._up_ch_scales,
+                    layer._gate_ch_scales,
+                    layer._down_ch_scales,
+                ),
+                "per-channel",
+            )
             self._fuse_per_channel(layer)
         elif qf == "fp8_per_tensor_online":
             self._online_per_tensor(layer)
@@ -519,8 +541,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._online_per_channel(layer)
         elif qf == "fp8_per_block_online":
             self._online_per_block(layer)
+            self._validate_positive_finite_scales(
+                (layer.w13_scale, layer.w2_scale), "per-block"
+            )
             self._requant_per_block_if_needed(layer)
         elif qf == "fp8_per_block":
+            self._validate_positive_finite_scales(
+                (layer.w13_scale, layer.w2_scale), "per-block"
+            )
             self._requant_per_block_if_needed(layer)
 
     def _fuse_per_tensor(self, layer):
@@ -528,11 +556,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         up_scales = layer._up_scales
         gate_scales = layer._gate_scales
         down_scales = layer._down_scales
-        all_scales = torch.stack((up_scales, gate_scales, down_scales))
-        scales_valid = torch.isfinite(all_scales).all() & (all_scales > 0).all()
-        if not bool(scales_valid):
-            raise ValueError("MoE FP8 per-tensor scales must be finite and positive")
-
         fused_scales = torch.maximum(up_scales, gate_scales)
 
         for e in range(layer.num_local_experts):

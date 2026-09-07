@@ -9,6 +9,7 @@ from unittest import mock
 
 import torch
 import torch.nn as nn
+import rtp_llm.models_py.weight_mapper as weight_mapper
 from rtp_llm.models_py.fastsafetensors_read_spec import (
     _Float8SafeProcessGroup,
     iter_read_spec_tensors,
@@ -1847,6 +1848,78 @@ class FoundationLoaderTest(unittest.TestCase):
                 discover_ckpt_files(model_path),
                 [os.path.realpath(shard1), os.path.realpath(shard2)],
             )
+
+    def test_checkpoint_catalog_resolves_each_unique_shard_once(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            shard_names = [
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+            ]
+            for shard_name in shard_names:
+                save_file(
+                    {"placeholder": torch.ones(1)}, os.path.join(model_path, shard_name)
+                )
+            weight_map = {
+                f"layers.{index}.weight": shard_names[index % len(shard_names)]
+                for index in range(100)
+            }
+            with open(
+                os.path.join(model_path, "model.safetensors.index.json"), "w"
+            ) as handle:
+                json.dump({"weight_map": weight_map}, handle)
+
+            original = weight_mapper._resolve_index_shard_path
+            with mock.patch.object(
+                weight_mapper, "_resolve_index_shard_path", wraps=original
+            ) as resolve:
+                catalog = weight_mapper.safetensor_catalog(model_path)
+
+            self.assertIsNotNone(catalog)
+            self.assertEqual(resolve.call_count, len(shard_names))
+            self.assertEqual(len(catalog.entries), len(weight_map))
+            self.assertEqual(
+                list(catalog.shard_files),
+                [os.path.join(model_path, name) for name in shard_names],
+            )
+
+    def test_newloader_reuses_checkpoint_catalog_across_metadata_consumers(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            shard = os.path.join(model_path, "model.safetensors")
+            save_file({"layers.0.weight": torch.ones(1)}, shard)
+            with open(
+                os.path.join(model_path, "model.safetensors.index.json"), "w"
+            ) as handle:
+                json.dump(
+                    {"weight_map": {"layers.0.weight": os.path.basename(shard)}},
+                    handle,
+                )
+
+            original = weight_mapper._read_checkpoint_index
+            with mock.patch.object(
+                weight_mapper, "_read_checkpoint_index", wraps=original
+            ) as read_index:
+                loader = NewModelLoader(
+                    types.SimpleNamespace(model_type="foundation_test_model"),
+                    NewLoaderConfig(),
+                    model_path=model_path,
+                )
+                files = loader._checkpoint_files()
+                catalog = loader._safetensor_catalog()
+                self.assertEqual(
+                    loader._safetensor_metadata_summary(model_path, files, catalog),
+                    ([], []),
+                )
+                self.assertEqual(
+                    select_safetensor_files(
+                        model_path,
+                        files,
+                        lambda name: name.startswith("layers."),
+                        catalog,
+                    ),
+                    files,
+                )
+
+            self.assertEqual(read_index.call_count, 1)
 
     def test_model_filter_preselects_only_matching_index_shards(self):
         with tempfile.TemporaryDirectory() as model_path:

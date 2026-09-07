@@ -536,18 +536,64 @@ class MoEQuantizedDispatchTest(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "requires FP8 storage"):
             layer.load_weights({"0.gate_proj.weight": torch.zeros(8, 8)})
 
-    def test_fp8_scale_dtype_and_values_are_validated(self):
+    def test_fp8_scale_dtype_is_validated_during_dispatch(self):
+        layer = _make_experts(
+            num_experts=1,
+            quant_config=QuantizationConfig("fp8"),
+        )
+        with self.assertRaisesRegex(TypeError, "must be floating point"):
+            layer.load_weights(
+                {"0.gate_proj.weight_scale": torch.tensor(1, dtype=torch.int32)}
+            )
+
+    def test_fp8_scale_value_validation_is_batched_after_dispatch(self):
+        layer = _make_experts(
+            num_experts=1,
+            quant_config=QuantizationConfig("fp8"),
+        )
+        with mock.patch.object(
+            torch,
+            "isfinite",
+            side_effect=AssertionError("dispatch synchronized scale validation"),
+        ):
+            layer.load_weights({"0.gate_proj.weight_scale": torch.tensor(1.0)})
+
         for scale in (
-            torch.tensor(1, dtype=torch.int32),
             torch.tensor(0.0),
+            torch.tensor(-1.0),
+            torch.tensor(float("nan")),
             torch.tensor(float("inf")),
         ):
-            with self.subTest(scale=scale), self.assertRaises((TypeError, ValueError)):
-                layer = _make_experts(
-                    num_experts=1,
-                    quant_config=QuantizationConfig("fp8"),
+            with self.subTest(scale=scale), self.assertRaisesRegex(
+                ValueError, "finite and positive"
+            ):
+                layer.quant_method._validate_positive_finite_scales(
+                    (torch.ones(2), scale), "per-tensor"
                 )
-                layer.load_weights({"0.gate_proj.weight_scale": scale})
+
+    def test_fp8_scale_batch_validation_accepts_positive_finite_values(self):
+        layer = _make_experts(
+            num_experts=1,
+            quant_config=QuantizationConfig("fp8_per_channel"),
+        )
+        layer.quant_method._validate_positive_finite_scales(
+            (torch.ones(2, 3), torch.full((4,), 0.5)), "per-channel"
+        )
+
+    def test_fp8_per_channel_postprocess_rejects_invalid_loaded_scale(self):
+        layer = _make_experts(
+            num_experts=1,
+            quant_config=QuantizationConfig("fp8_per_channel"),
+        )
+        layer._up_ch_scales.fill_(1)
+        layer._gate_ch_scales.fill_(1)
+        layer._down_ch_scales.fill_(1)
+        layer._gate_ch_scales[0, 0] = float("nan")
+
+        with mock.patch.object(layer.quant_method, "_fuse_per_channel") as fuse:
+            with self.assertRaisesRegex(ValueError, "finite and positive"):
+                layer.quant_method.process_weights_after_loading(layer)
+        fuse.assert_not_called()
 
     def test_single_channel_fp8_scale_keeps_vector_shape(self):
         layer = _make_experts(
@@ -722,9 +768,7 @@ class MoEQuantizedDispatchTest(unittest.TestCase):
         with mock.patch.dict(
             "sys.modules", {"rtp_kernel.w4a8_group_gemm": fake_kernel}
         ):
-            _, repacked_scale = repack_compressed_int4_to_cutlass(
-                packed, scale, 128
-            )
+            _, repacked_scale = repack_compressed_int4_to_cutlass(packed, scale, 128)
 
         self.assertEqual(repacked_scale.dtype, torch.float8_e4m3fn)
         self.assertEqual(repacked_scale.item(), 0.0)
