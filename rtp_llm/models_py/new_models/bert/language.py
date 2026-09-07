@@ -66,6 +66,19 @@ def _is_missing_tensor(tensor: Any) -> bool:
     return tensor is None or (isinstance(tensor, torch.Tensor) and tensor.numel() == 0)
 
 
+def _empty_checkpoint_embedding(
+    num_embeddings: int,
+    embedding_dim: int,
+    params_dtype: torch.dtype,
+) -> nn.Embedding:
+    """Create an inference embedding without initializing throwaway values."""
+    weight = torch.empty(
+        (num_embeddings, embedding_dim),
+        dtype=params_dtype,
+    )
+    return nn.Embedding.from_pretrained(weight, freeze=True)
+
+
 _ALLOWED_DROPPED_SUFFIXES = (
     "position_ids",
     "token_type_ids",
@@ -136,14 +149,16 @@ class BertEmbeddings(RtpModule):
         params_dtype: torch.dtype,
     ) -> None:
         super().__init__()
-        self.word_embeddings = nn.Embedding(vocab_size, hidden_size, dtype=params_dtype)
-        self.position_embeddings = nn.Embedding(
-            max_position_embeddings, hidden_size, dtype=params_dtype
+        self.word_embeddings = _empty_checkpoint_embedding(
+            vocab_size, hidden_size, params_dtype
+        )
+        self.position_embeddings = _empty_checkpoint_embedding(
+            max_position_embeddings, hidden_size, params_dtype
         )
         self.token_type_embeddings: Optional[nn.Embedding]
         if type_vocab_size > 0:
-            self.token_type_embeddings = nn.Embedding(
-                type_vocab_size, hidden_size, dtype=params_dtype
+            self.token_type_embeddings = _empty_checkpoint_embedding(
+                type_vocab_size, hidden_size, params_dtype
             )
         else:
             self.token_type_embeddings = None

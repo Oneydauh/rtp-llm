@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 from rtp_llm.config.model_config import ModelConfig
@@ -121,6 +122,31 @@ class BertNewloaderTest(unittest.TestCase):
     def test_registry_resolves_bert_and_roberta(self):
         self.assertIs(get_model_class("bert"), BertForEmbedding)
         self.assertIs(get_model_class("roberta"), RobertaForEmbedding)
+
+    def test_checkpoint_embeddings_skip_random_initialization(self):
+        with mock.patch.object(
+            torch.nn.Embedding,
+            "reset_parameters",
+            side_effect=AssertionError(
+                "checkpoint-backed embeddings must not be randomly initialized"
+            ),
+        ) as reset_parameters:
+            model = BertForEmbedding(
+                _config(),
+                NewLoaderConfig(device="cpu", compute_dtype=torch.float16),
+            )
+
+        reset_parameters.assert_not_called()
+        self.assertEqual(tuple(model.embeddings.word_embeddings.weight.shape), (7, 4))
+        self.assertEqual(
+            tuple(model.embeddings.position_embeddings.weight.shape), (6, 4)
+        )
+        self.assertEqual(
+            tuple(model.embeddings.token_type_embeddings.weight.shape), (2, 4)
+        )
+        self.assertFalse(model.embeddings.word_embeddings.weight.requires_grad)
+        self.assertFalse(model.embeddings.position_embeddings.weight.requires_grad)
+        self.assertFalse(model.embeddings.token_type_embeddings.weight.requires_grad)
 
     def test_real_bert_load_owns_checkpoint_parameters_in_model_tree(self):
         model = self._load(_config(), _weights())

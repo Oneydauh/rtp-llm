@@ -40,6 +40,7 @@ py_test(
     },
     args = [
         "BertNewloaderTest.test_attention_config_invariants_fail_fast",
+        "BertNewloaderTest.test_checkpoint_embeddings_skip_random_initialization",
         "BertNewloaderTest.test_custom_weights_use_exact_declared_contract",
         "BertNewloaderTest.test_duplicate_layernorm_alias_fails",
         "BertNewloaderTest.test_invalid_runtime_config_values_fail_fast",
