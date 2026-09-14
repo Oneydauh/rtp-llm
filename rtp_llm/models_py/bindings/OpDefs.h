@@ -244,6 +244,8 @@ private:
 
 struct PyModelInitResources {
     std::optional<KVCache> kv_cache;
+    torch::Tensor          eplb_log_stats;
+    torch::Tensor          eplb_gpu_loads;
     bool                   is_speculative         = false;
     bool                   is_decode_role         = false;
     int64_t                max_context_batch_size = 1;

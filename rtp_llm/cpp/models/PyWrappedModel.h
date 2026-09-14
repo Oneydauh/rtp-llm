@@ -73,6 +73,14 @@ public:
     torch::Tensor   getMtpTargetHiddenStates(int64_t num_tokens) override;
     torch::Tensor   getMtpLastHiddenStates(int64_t num_tokens) override;
     bool            hasMtpTargetHiddenBuffer() const override;
+    bool            applyEplbPlan(int                  layer_id,
+                                  const torch::Tensor& phy2log,
+                                  const torch::Tensor& logic_expert_cnt,
+                                  const torch::Tensor& log2phy,
+                                  const torch::Tensor& moe_weight_1,
+                                  const torch::Tensor& moe_weight_2,
+                                  const torch::Tensor& moe_scale_1,
+                                  const torch::Tensor& moe_scale_2) override;
     void            prepareAttentionInputs(const GptModelInputs& inputs) override;
     void            prepareAttentionInputs(const GptModelInputs& inputs, bool skip_forward_event_sync);
     void            updateKVCacheKernelBlockId(const GptModelInputs& inputs) override;
@@ -210,6 +218,8 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
 
     py::gil_scoped_acquire          gil;
     torch_ext::PyModelInitResources init_resources;
+    init_resources.eplb_log_stats = overall_expert_stats_.stats_buf.log_stats_buf;
+    init_resources.eplb_gpu_loads = overall_expert_stats_.stats_buf.gpu_loads_buf;
 
     if (params.kv_cache_layer_layout.has_value()) {
         // Block geometry travels on GptModelInitParams (filled from

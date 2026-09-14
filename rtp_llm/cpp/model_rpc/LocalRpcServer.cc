@@ -709,6 +709,12 @@ LocalRpcServer::UpdateWeights(grpc::ServerContext* context, const UpdateWeightsR
         if (request->name().empty() || request->desc().empty() || request->method().empty()) {
             return {grpc::StatusCode::INVALID_ARGUMENT, "Missing required field(s) in request"};
         }
+        if (py::hasattr(weight_manager_, "requires_paused_engine")
+            && weight_manager_.attr("requires_paused_engine").cast<bool>()
+            && (!engine_ || !engine_->isPaused())) {
+            return {grpc::StatusCode::FAILED_PRECONDITION,
+                    "NewLoader UpdateWeights requires every engine rank to be paused before updating"};
+        }
         py::dict req;
         req["name"]   = request->name();
         req["desc"]   = request->desc();

@@ -687,16 +687,27 @@ class BaseModel(object):
         self._load_custom_module()
         self.model_weights_loader = loader
         self.weight_manager = None
-        self.py_eplb = None
-        self._report_update_weights_capability(available=False)
-        if self.parallelism_config.world_rank == 0:
+        if self.model_config.require_weight_update:
+            from rtp_llm.model_loader.new_weight_manager import NewLoaderWeightManager
+
+            self.weight_manager = NewLoaderWeightManager(self.py_model, loader)
+        if self.model_config.eplb_config.enable_eplb():
+            from rtp_llm.models_py.eplb_controller import NewLoaderExpertBalancer
+
+            self.py_eplb = NewLoaderExpertBalancer(
+                loader, self.py_model, self.model_config
+            )
+        else:
+            self.py_eplb = None
+        self._report_update_weights_capability(available=self.weight_manager is not None)
+        if self.weight_manager is None and self.parallelism_config.world_rank == 0:
             route_source = (
                 "automatic route"
                 if self.model_config.use_new_loader is None
                 else "explicit override"
             )
             logging.warning(
-                "CAPABILITY_DISABLED: NewLoader does not support the online "
+                "CAPABILITY_DISABLED: this NewLoader deployment has not enabled the online "
                 "UpdateWeights RPC (model_type=%s, source=%s). Deployments that "
                 "require online updates must set --require_weight_update true; "
                 "use --use_new_loader false to force the legacy loader.",
@@ -725,6 +736,17 @@ class BaseModel(object):
             if not isinstance(tensor, torch.Tensor):
                 raise TypeError(f"Runtime weight {name!r} must be a torch.Tensor")
             weights.set_global_weight(name, tensor)
+        from rtp_llm.models_py.layers.moe_experts import BaseMoEExperts
+
+        for child in module.modules():
+            if not isinstance(child, BaseMoEExperts):
+                continue
+            for name, tensor in child.eplb_runtime_weight_view().items():
+                if not isinstance(tensor, torch.Tensor):
+                    raise TypeError(
+                        f"MoE runtime weight {name!r} must be a torch.Tensor"
+                    )
+                weights.set_layer_weight(child.layer_idx, name, tensor)
         return weights
 
     def create_model_loader(self) -> ModelLoader:

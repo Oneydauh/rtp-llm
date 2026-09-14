@@ -1,3 +1,15 @@
+py_library(
+    name = "qwen3_dense_load_test_lib",
+    srcs = ["test_qwen3_dense_load.py"],
+    visibility = ["//rtp_llm/models_py/new_loader_test:__pkg__"],
+    deps = [
+        "//rtp_llm:numpy",
+        "//rtp_llm:safetensors",
+        "//rtp_llm:torch",
+        "//rtp_llm/models_py:new_weight_loader",
+    ],
+)
+
 py_test(
     name = "test_qwen3_dense_load",
     exec_properties = {"gpu": "H20"},

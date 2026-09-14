@@ -19,7 +19,12 @@ import torch
 import torch.nn as nn
 
 from rtp_llm.device import get_current_device
+from rtp_llm.models_py.expert_placement import (
+    ExpertPlacement,
+    expert_placement_for_layer,
+)
 from rtp_llm.models_py.module_base import RtpModule, copy_weight_
+from rtp_llm.models_py.runtime_weight_update import RuntimeWeightTransaction, TensorUpdate
 from rtp_llm.models_py.modules import FusedMoeFactory
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
     MoEConfigAdapter,
@@ -49,6 +54,7 @@ class BaseMoEExperts(RtpModule):
 
     # Subclasses should list the HF projection names they expect.
     PROJ_NAMES: Tuple[str, ...] = ("gate_proj", "up_proj", "down_proj")
+    _supports_newloader_eplb = True
 
     # Quant type string -> family. Registered MoE quant methods own the actual
     # quantized buffer allocation/dispatch/postprocess; this map is used for
@@ -203,15 +209,42 @@ class BaseMoEExperts(RtpModule):
         self.tp_size = tp_size
         self.tp_rank = tp_rank
         self.moe_inter_tp = moe_intermediate_size // self.moe_expert_tp_size
+        self._params_dtype = params_dtype
 
-        # EP: compute local expert range
-        if ep_size > 1:
-            experts_per_rank = num_experts // ep_size
-            self._ep_start_expert = ep_rank * experts_per_rank
-            self.num_local_experts = experts_per_rank
-        else:
-            self._ep_start_expert = 0
-            self.num_local_experts = num_experts
+        # EP buffers are indexed by physical expert slots. Checkpoint ids and
+        # gate outputs remain logical ids until the load/forward boundaries.
+        self._expert_placement = expert_placement_for_layer(
+            model_config,
+            layer_index=layer_idx,
+            logical_expert_count=num_experts,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            parallelism_config=parallelism_config,
+        )
+        self.physical_num_experts = self._expert_placement.physical_expert_count
+        self._ep_start_expert = self._expert_placement.local_physical_start
+        self.num_local_experts = self._expert_placement.physical_experts_per_rank
+
+        eplb_config = getattr(model_config, "eplb_config", None)
+        enable_eplb = getattr(eplb_config, "enable_eplb", False)
+        if callable(enable_eplb):
+            enable_eplb = enable_eplb()
+        if not isinstance(enable_eplb, bool):
+            raise TypeError("eplb_config.enable_eplb must be a bool")
+        self._dynamic_eplb_enabled = enable_eplb
+        # The legacy runtime keeps the initial redundant placement on its
+        # canonical logical slots.  Replica routing starts only after a fully
+        # loaded EPLB plan has been installed atomically.
+        self._eplb_plan_installed = False
+        self._eplb_install_transaction = None
+        self._eplb_previous_runtime_state = None
+        logic_expert_cnt, log2phy = self._routing_tensors(self._expert_placement)
+        self.register_buffer(
+            "_eplb_logic_expert_cnt", logic_expert_cnt, persistent=False
+        )
+        self.register_buffer("_eplb_log2phy", log2phy, persistent=False)
+        self._eplb_log_stats: Optional[torch.Tensor] = None
+        self._eplb_gpu_loads: Optional[torch.Tensor] = None
 
         self._model_config = model_config
         self._parallelism_config = parallelism_config
@@ -245,6 +278,54 @@ class BaseMoEExperts(RtpModule):
         self._loaded_aux_keys = set()
         self._seen_checkpoint_names = set()
         self._post_load_done = False
+        self._runtime_weights_dict: Optional[Dict[str, torch.Tensor]] = None
+
+    @staticmethod
+    def _routing_tensors(
+        placement: ExpertPlacement,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        max_replicas = (
+            placement.physical_expert_count - placement.logical_expert_count + 1
+        )
+        counts = torch.zeros(placement.logical_expert_count, dtype=torch.int32)
+        log2phy = torch.full(
+            (placement.logical_expert_count, max_replicas),
+            -1,
+            dtype=torch.int32,
+        )
+        for physical_id, logical_id in enumerate(placement.physical_to_logical):
+            replica_id = int(counts[logical_id].item())
+            log2phy[logical_id, replica_id] = physical_id
+            counts[logical_id] += 1
+        return counts.contiguous(), log2phy.contiguous()
+
+    def clone_empty_for_placement(self, placement: ExpertPlacement) -> "BaseMoEExperts":
+        """Create an unloaded one-layer expert module for an EPLB checkpoint reload."""
+        if placement.logical_expert_count != self.num_experts:
+            raise ValueError("EPLB placement logical expert count changed")
+        if placement.ep_size != self.ep_size or placement.ep_rank != self.ep_rank:
+            raise ValueError("EPLB placement EP partition changed")
+        if placement.physical_expert_count != self.physical_num_experts:
+            raise ValueError("EPLB placement physical expert count changed")
+        clone = type(self)(
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            hidden_size=self.hidden_size,
+            moe_intermediate_size=self.moe_inter,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
+            params_dtype=self._params_dtype,
+            model_config=self._model_config,
+            parallelism_config=self._parallelism_config,
+            moe_config=self._moe_config,
+            quant_config=self._quant_config,
+            layer_idx=self.layer_idx,
+            prefix=self.prefix,
+        )
+        clone._expert_placement = placement
+        return clone
 
     def _validate_quant_config_contract(self, runtime_method: str) -> None:
         """Keep loading layout and fused-MoE executor selection consistent."""
@@ -303,12 +384,19 @@ class BaseMoEExperts(RtpModule):
     #  EP: expert id remapping
     # ------------------------------------------------------------------ #
 
+    def _remap_expert_ids(self, global_expert_id: int) -> Tuple[int, ...]:
+        """Map one logical checkpoint id to every matching local physical slot."""
+        return self._expert_placement.local_indices(global_expert_id)
+
     def _remap_expert_id(self, global_expert_id: int) -> Optional[int]:
-        """Map global expert id to local buffer index.  Returns None if out of range."""
-        local_id = global_expert_id - self._ep_start_expert
-        if 0 <= local_id < self.num_local_experts:
-            return local_id
-        return None
+        """Map a logical id to its sole local slot for stacked legacy paths."""
+        local_ids = self._remap_expert_ids(global_expert_id)
+        if len(local_ids) > 1:
+            raise RuntimeError(
+                f"Logical expert {global_expert_id} maps to multiple local physical "
+                "slots; use per-expert checkpoint loading"
+            )
+        return local_ids[0] if local_ids else None
 
     def _ensure_projection_not_loaded(self, local_id: int, projection: str) -> None:
         key = (local_id, projection)
@@ -347,6 +435,11 @@ class BaseMoEExperts(RtpModule):
             parts = name.split(".")
             base = parts[0]
             if base in ("gate_up_proj", "down_proj"):
+                if self._expert_placement.has_redundancy:
+                    raise ValueError(
+                        "Stacked all-expert checkpoints do not support redundant "
+                        "physical expert placement; use per-expert checkpoint keys"
+                    )
                 if self.ep_size > 1:
                     raise ValueError(
                         "Stacked all-expert checkpoints are not supported with "
@@ -404,82 +497,91 @@ class BaseMoEExperts(RtpModule):
                     f"{self.num_experts}) in {self.prefix}.{name}"
                 )
 
-            local_expert_id = self._remap_expert_id(global_expert_id)
-            if local_expert_id is None:
+            local_expert_ids = self._remap_expert_ids(global_expert_id)
+            if not local_expert_ids:
                 continue
 
-            if param_name in ("weight", "weight_packed"):
-                projections = (
-                    ("gate_proj", "up_proj") if proj == "gate_up_proj" else (proj,)
+            for local_expert_id in local_expert_ids:
+                self._load_per_expert_tensor(
+                    name, tensor, local_expert_id, proj, param_name
                 )
-                for projection in projections:
-                    self._ensure_projection_not_loaded(local_expert_id, projection)
 
-            if self.quant_method.dispatch_weight(
-                self, local_expert_id, proj, param_name, tensor
-            ):
-                if proj == "gate_up_proj":
-                    self._record_projection_loaded(local_expert_id, "gate_proj")
-                    self._record_projection_loaded(local_expert_id, "up_proj")
-                elif proj in self.PROJ_NAMES:
-                    self._record_projection_loaded(local_expert_id, proj)
-                continue
+    def _load_per_expert_tensor(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        local_expert_id: int,
+        proj: str,
+        param_name: str,
+    ) -> None:
+        """Copy one logical tensor into one local physical expert slot."""
 
-            if param_name == "weight":
-                if proj == "gate_up_proj":
-                    self._dispatch_gate_up_weight(local_expert_id, tensor)
-                    continue
-                # Log first weight tensor we see, for diagnostics.
-                if self.layer_idx == 0 and not getattr(
-                    self, "_logged_first_weight", False
-                ):
-                    logger.info(
-                        "[BaseMoEExperts] layer_idx=0 first weight: "
-                        "name=%r proj=%r dtype=%s shape=%s buf_dtype=%s "
-                        "buf_shape=%s _quant_family=%r",
-                        name,
-                        proj,
-                        tensor.dtype,
-                        tuple(tensor.shape),
-                        self.w13.dtype if proj != "down_proj" else self.w2.dtype,
-                        tuple(self.w13.shape if proj != "down_proj" else self.w2.shape),
-                        self._quant_family,
-                    )
-                    self._logged_first_weight = True
-                self._dispatch_weight(local_expert_id, proj, tensor)
+        if param_name in ("weight", "weight_packed"):
+            projections = (
+                ("gate_proj", "up_proj") if proj == "gate_up_proj" else (proj,)
+            )
+            for projection in projections:
+                self._ensure_projection_not_loaded(local_expert_id, projection)
+
+        if self.quant_method.dispatch_weight(
+            self, local_expert_id, proj, param_name, tensor
+        ):
+            if proj == "gate_up_proj":
+                self._record_projection_loaded(local_expert_id, "gate_proj")
+                self._record_projection_loaded(local_expert_id, "up_proj")
+            elif proj in self.PROJ_NAMES:
+                self._record_projection_loaded(local_expert_id, proj)
+            return
+
+        if param_name == "weight":
+            if proj == "gate_up_proj":
+                self._dispatch_gate_up_weight(local_expert_id, tensor)
+                return
+            # Log first weight tensor we see, for diagnostics.
+            if self.layer_idx == 0 and not getattr(self, "_logged_first_weight", False):
+                logger.info(
+                    "[BaseMoEExperts] layer_idx=0 first weight: "
+                    "name=%r proj=%r dtype=%s shape=%s buf_dtype=%s "
+                    "buf_shape=%s _quant_family=%r",
+                    name,
+                    proj,
+                    tensor.dtype,
+                    tuple(tensor.shape),
+                    self.w13.dtype if proj != "down_proj" else self.w2.dtype,
+                    tuple(self.w13.shape if proj != "down_proj" else self.w2.shape),
+                    self._quant_family,
+                )
+                self._logged_first_weight = True
+            self._dispatch_weight(local_expert_id, proj, tensor)
+            return
+
+        if proj == "gate_up_proj":
+            if param_name == "weight_packed":
+                self._dispatch_gate_up_quant_weight(local_expert_id, param_name, tensor)
+            elif param_name in ("weight_scale", "weight_scale_inv"):
+                self._dispatch_gate_up_scale(local_expert_id, param_name, tensor)
             else:
-                if proj == "gate_up_proj":
-                    if param_name == "weight_packed":
-                        self._dispatch_gate_up_quant_weight(
-                            local_expert_id, param_name, tensor
-                        )
-                    elif param_name in ("weight_scale", "weight_scale_inv"):
-                        self._dispatch_gate_up_scale(
-                            local_expert_id, param_name, tensor
-                        )
-                    else:
-                        raise RuntimeError(
-                            f"Unexpected gate_up_proj auxiliary tensor: "
-                            f"expert={local_expert_id} param={param_name!r}"
-                        )
-                    continue
-                # Log first scale tensor we see, for diagnostics.
-                if self.layer_idx == 0 and not getattr(
-                    self, "_logged_first_scale", False
-                ):
-                    logger.info(
-                        "[BaseMoEExperts] layer_idx=0 first non-weight tensor: "
-                        "name=%r proj=%r param=%r dtype=%s shape=%s "
-                        "_quant_family=%r",
-                        name,
-                        proj,
-                        param_name,
-                        tensor.dtype,
-                        tuple(tensor.shape),
-                        self._quant_family,
-                    )
-                    self._logged_first_scale = True
-                self._dispatch_scale(local_expert_id, proj, param_name, tensor)
+                raise RuntimeError(
+                    f"Unexpected gate_up_proj auxiliary tensor: "
+                    f"expert={local_expert_id} param={param_name!r}"
+                )
+            return
+
+        # Log first scale tensor we see, for diagnostics.
+        if self.layer_idx == 0 and not getattr(self, "_logged_first_scale", False):
+            logger.info(
+                "[BaseMoEExperts] layer_idx=0 first non-weight tensor: "
+                "name=%r proj=%r param=%r dtype=%s shape=%s "
+                "_quant_family=%r",
+                name,
+                proj,
+                param_name,
+                tensor.dtype,
+                tuple(tensor.shape),
+                self._quant_family,
+            )
+            self._logged_first_scale = True
+        self._dispatch_scale(local_expert_id, proj, param_name, tensor)
 
     def _load_stacked_expert_aux(
         self, base: str, param_name: str, tensor: torch.Tensor
@@ -867,6 +969,17 @@ class BaseMoEExperts(RtpModule):
         self._maybe_build_fused_moe()
         self._post_load_done = True
 
+    def prepare_eplb_reload_weights(self) -> Dict[str, torch.Tensor]:
+        """Finalize a temporary reload module without constructing an executor."""
+        if self._post_load_done:
+            raise RuntimeError("EPLB reload weights were already finalized")
+        self._check_load_complete()
+        self.quant_method.process_weights_after_loading(self)
+        weights = self._build_weights_dict()
+        self._runtime_weights_dict = dict(weights)
+        self._post_load_done = True
+        return dict(weights)
+
     def checkpoint_load_complete(self) -> bool:
         expected = {
             (expert_id, proj)
@@ -971,9 +1084,183 @@ class BaseMoEExperts(RtpModule):
             moe_config=self._moe_config,
             quant_config=self._effective_model_quant_config,
             enable_cuda_graph=self._enable_cuda_graph(),
+            expert_num_override=self.physical_num_experts,
         )
         weights_dict = self._build_weights_dict()
+        self._runtime_weights_dict = dict(weights_dict)
         self.fused_moe = FusedMoeFactory().create_fused_moe(adapter, weights_dict)
+
+    def eplb_runtime_weight_view(self) -> Dict[str, torch.Tensor]:
+        if self._runtime_weights_dict is None:
+            raise RuntimeError(
+                f"MoE layer {self.layer_idx} runtime weights are not initialized"
+            )
+        result = dict(self._runtime_weights_dict)
+        if self._dynamic_eplb_enabled:
+            result[W.logic_expert_cnt] = self._eplb_logic_expert_cnt
+            result[W.log2phy] = self._eplb_log2phy
+        return result
+
+    def validate_eplb_reload_weights(self, weights: Dict[str, torch.Tensor]) -> None:
+        """Validate a reloaded layer completely before any rank installs it."""
+        runtime = self.eplb_runtime_weight_view()
+        for name in (W.moe_w1, W.moe_w2, W.moe_s1, W.moe_s2):
+            target = runtime.get(name)
+            source = weights.get(name)
+            if target is None:
+                if source is not None and source.numel() != 0:
+                    raise ValueError(f"Unexpected EPLB runtime tensor {name!r}")
+                continue
+            if source is None:
+                raise ValueError(f"Missing EPLB runtime tensor {name!r}")
+            if target.shape != source.shape or target.dtype != source.dtype:
+                raise ValueError(
+                    f"EPLB tensor {name!r} mismatch: expected "
+                    f"{tuple(target.shape)} {target.dtype}, got "
+                    f"{tuple(source.shape)} {source.dtype}"
+                )
+
+    def bind_eplb_stats(self, log_stats: torch.Tensor, gpu_loads: torch.Tensor) -> None:
+        expected_log = (self.num_experts,)
+        expected_gpu = (self.ep_size,)
+        if tuple(log_stats.shape) != expected_log or log_stats.dtype != torch.int32:
+            raise ValueError(
+                f"EPLB logical stats must be int32 {expected_log}, got "
+                f"{tuple(log_stats.shape)} {log_stats.dtype}"
+            )
+        if tuple(gpu_loads.shape) != expected_gpu or gpu_loads.dtype != torch.int32:
+            raise ValueError(
+                f"EPLB GPU loads must be int32 {expected_gpu}, got "
+                f"{tuple(gpu_loads.shape)} {gpu_loads.dtype}"
+            )
+        if log_stats.device != self.w13.device or gpu_loads.device != self.w13.device:
+            raise ValueError("EPLB stats and MoE weights must be on the same device")
+        self._eplb_log_stats = log_stats
+        self._eplb_gpu_loads = gpu_loads
+
+    def _record_eplb_stats(
+        self, logical_ids: torch.Tensor, physical_ids: torch.Tensor
+    ) -> None:
+        if self._eplb_log_stats is None or self._eplb_gpu_loads is None:
+            return
+        flat_logical = logical_ids.reshape(-1).to(torch.int64)
+        flat_physical = physical_ids.reshape(-1).to(torch.int64)
+        valid = (flat_logical >= 0) & (flat_logical < self.num_experts)
+        safe_logical = flat_logical.clamp(0, self.num_experts - 1)
+        self._eplb_log_stats.scatter_add_(0, safe_logical, valid.to(dtype=torch.int32))
+        physical_per_rank = self.physical_num_experts // self.ep_size
+        safe_physical = flat_physical.clamp(0, self.physical_num_experts - 1)
+        owners = torch.div(safe_physical, physical_per_rank, rounding_mode="floor")
+        self._eplb_gpu_loads.scatter_add_(0, owners, valid.to(dtype=torch.int32))
+
+    def apply_eplb_plan(
+        self,
+        phy2log: torch.Tensor,
+        logic_expert_cnt: torch.Tensor,
+        log2phy: torch.Tensor,
+        weights: Dict[str, torch.Tensor],
+        *,
+        defer_commit: bool = False,
+    ) -> None:
+        """Install a completely loaded plan while preserving captured addresses."""
+        if not self._dynamic_eplb_enabled:
+            raise RuntimeError(
+                f"MoE layer {self.layer_idx} was not initialized for EPLB"
+            )
+        if self._eplb_install_transaction is not None:
+            raise RuntimeError("Previous EPLB install still awaits all-rank acknowledgement")
+        if phy2log.dtype != torch.int32:
+            raise TypeError("EPLB phy2log must use torch.int32")
+        expected_phy2log = (self.physical_num_experts,)
+        if tuple(phy2log.shape) != expected_phy2log:
+            raise ValueError(
+                f"EPLB phy2log must have shape {expected_phy2log}, got "
+                f"{tuple(phy2log.shape)}"
+            )
+        placement = ExpertPlacement(
+            logical_expert_count=self.num_experts,
+            ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
+            physical_to_logical=tuple(int(value) for value in phy2log.cpu().tolist()),
+        )
+        expected_logic = tuple(self._eplb_logic_expert_cnt.shape)
+        expected_log2phy = tuple(self._eplb_log2phy.shape)
+        if tuple(logic_expert_cnt.shape) != expected_logic:
+            raise ValueError(
+                f"EPLB logic_expert_cnt must have shape {expected_logic}, got "
+                f"{tuple(logic_expert_cnt.shape)}"
+            )
+        if tuple(log2phy.shape) != expected_log2phy:
+            raise ValueError(
+                f"EPLB log2phy must have shape {expected_log2phy}, got "
+                f"{tuple(log2phy.shape)}"
+            )
+        if logic_expert_cnt.dtype != torch.int32 or log2phy.dtype != torch.int32:
+            raise TypeError("EPLB routing tensors must use torch.int32")
+        expected_counts, expected_log2phy = self._routing_tensors(placement)
+        if not torch.equal(logic_expert_cnt.cpu(), expected_counts) or not torch.equal(
+            log2phy.cpu(), expected_log2phy
+        ):
+            raise ValueError("EPLB routing tensors do not match phy2log")
+        self.validate_eplb_reload_weights(weights)
+        runtime = self.eplb_runtime_weight_view()
+        fused_experts = getattr(self.fused_moe, "fused_experts", None)
+        router = getattr(self.fused_moe, "router", None)
+        deterministic = hasattr(fused_experts, "use_deterministic_eplb_gather")
+        if deterministic:
+            if not hasattr(router, "use_deterministic_eplb_gather"):
+                raise RuntimeError(
+                    "The selected EPLB executor requires a deterministic "
+                    "aggregation-capable router"
+                )
+        updates = [
+            TensorUpdate(name, runtime[name], weights[name])
+            for name in (W.moe_w1, W.moe_w2, W.moe_s1, W.moe_s2)
+            if name in runtime
+        ]
+        updates.extend([
+            TensorUpdate(W.logic_expert_cnt, self._eplb_logic_expert_cnt, logic_expert_cnt),
+            TensorUpdate(W.log2phy, self._eplb_log2phy, log2phy),
+        ])
+        transaction = RuntimeWeightTransaction(updates)
+        self._eplb_install_transaction = transaction
+        self._eplb_previous_runtime_state = (
+            self._expert_placement,
+            self._eplb_plan_installed,
+            (fused_experts, fused_experts.use_deterministic_eplb_gather) if deterministic else None,
+            (router, router.use_deterministic_eplb_gather) if deterministic else None,
+        )
+        try:
+            transaction.install()
+            if deterministic:
+                fused_experts.use_deterministic_eplb_gather = True
+                router.use_deterministic_eplb_gather = True
+            self._expert_placement = placement
+            self._eplb_plan_installed = True
+            if not defer_commit:
+                self.finalize_eplb_install(commit=True)
+        except BaseException:
+            self.finalize_eplb_install(commit=False)
+            raise
+
+    def finalize_eplb_install(self, *, commit: bool) -> None:
+        """Acknowledge all ranks, or restore weights and routing on every rank."""
+        transaction = self._eplb_install_transaction
+        if transaction is None:
+            return
+        if commit:
+            transaction.commit()
+        else:
+            transaction.rollback()
+            placement, installed, executor_flag, router_flag = self._eplb_previous_runtime_state
+            self._expert_placement = placement
+            self._eplb_plan_installed = installed
+            for flag in (executor_flag, router_flag):
+                if flag is not None:
+                    owner, previous = flag
+                    owner.use_deterministic_eplb_gather = previous
+        self._eplb_install_transaction = None
+        self._eplb_previous_runtime_state = None
 
     def _enable_cuda_graph(self) -> bool:
         hw_kernel_config = getattr(self._quant_config, "hw_kernel_config", None)
@@ -981,6 +1268,53 @@ class BaseMoEExperts(RtpModule):
         if not isinstance(enabled, bool):
             raise TypeError("hw_kernel_config.enable_cuda_graph must be a bool")
         return enabled
+
+    def _map_logical_to_physical(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        """Map logical ids to the legacy initial physical execution slots.
+
+        The legacy Python MoE path keeps routing over the logical expert count.
+        Each EP rank therefore executes its first ``logical / ep_size`` local
+        slots; statically allocated redundant slots are loaded but stay idle
+        until an EPLB plan explicitly selects them.  Preserve that initial
+        routing while expressing the ids in the physical expert namespace used
+        by NewLoader's fused MoE.
+        """
+        if not self._dynamic_eplb_enabled and self._expert_placement.is_identity:
+            return topk_ids
+        logical_ids = topk_ids.to(dtype=torch.int64)
+        valid = (logical_ids >= 0) & (logical_ids < self.num_experts)
+        safe_logical_ids = logical_ids.clamp(0, self.num_experts - 1)
+        if self._dynamic_eplb_enabled and self._eplb_plan_installed:
+            flat_logical = safe_logical_ids.reshape(-1)
+            replica_counts = self._eplb_logic_expert_cnt.index_select(
+                0, flat_logical
+            ).to(torch.int64)
+            occurrence = torch.arange(
+                flat_logical.numel(), device=flat_logical.device, dtype=torch.int64
+            )
+            # Every EP rank must resolve the same logical decision to the same
+            # global physical expert.  The pure-TP router then masks that id to
+            # its owning rank before the cross-rank reduction.  A rank-dependent
+            # offset here makes different ranks execute different replicas for
+            # one token, changing the summed MoE result after a plan install.
+            replica_ids = torch.remainder(occurrence, replica_counts)
+            physical_ids = self._eplb_log2phy[flat_logical, replica_ids].reshape_as(
+                logical_ids
+            )
+            mapped = torch.where(valid, physical_ids, logical_ids)
+            self._record_eplb_stats(logical_ids, mapped)
+            return mapped.to(dtype=topk_ids.dtype)
+        logical_per_rank = self.num_experts // self.ep_size
+        physical_per_rank = self.physical_num_experts // self.ep_size
+        owner_rank = torch.div(
+            safe_logical_ids, logical_per_rank, rounding_mode="floor"
+        )
+        local_logical_id = torch.remainder(safe_logical_ids, logical_per_rank)
+        physical_ids = owner_rank * physical_per_rank + local_logical_id
+        mapped = torch.where(valid, physical_ids, logical_ids)
+        if self._dynamic_eplb_enabled:
+            self._record_eplb_stats(logical_ids, mapped)
+        return mapped.to(dtype=topk_ids.dtype)
 
     # ------------------------------------------------------------------ #
     #  Forward
@@ -1031,9 +1365,17 @@ class BaseMoEExperts(RtpModule):
             raise ValueError(
                 "MoE hidden states, topk weights, and topk ids must share a device"
             )
+        physical_topk_ids = self._map_logical_to_physical(topk_ids)
+        extra_finalize_args = None
+        if self._dynamic_eplb_enabled and self._eplb_plan_installed:
+            extra_finalize_args = {
+                "eplb_logical_topk_ids": topk_ids,
+                "eplb_logical_experts_per_rank": self.num_experts // self.ep_size,
+            }
         return self.fused_moe(
             hidden_states=hidden_states,
             topk_weights=topk_weights,
-            topk_ids=topk_ids,
+            topk_ids=physical_topk_ids,
             activation=self.activation_type,
+            extra_finalize_args=extra_finalize_args,
         )

@@ -181,6 +181,20 @@ public:
         return torch::Tensor();
     }
 
+    // Python models own their MoE tensors. Returning true means the plan was
+    // copied into those stable tensor addresses and the legacy pointer-swap
+    // path must be skipped.
+    virtual bool applyEplbPlan(int,
+                               const torch::Tensor&,
+                               const torch::Tensor&,
+                               const torch::Tensor&,
+                               const torch::Tensor&,
+                               const torch::Tensor&,
+                               const torch::Tensor&,
+                               const torch::Tensor&) {
+        return false;
+    }
+
     rtp_llm::Weights            weights_;
     rtp_llm::OverallExpertStats overall_expert_stats_;
     size_t                      model_id_ = 0;

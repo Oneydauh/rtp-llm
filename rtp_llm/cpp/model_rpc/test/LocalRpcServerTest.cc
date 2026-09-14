@@ -35,6 +35,14 @@ public:
         weight_manager_ = py::none();
     }
 
+    void setWeightManager(py::object weight_manager) {
+        weight_manager_ = std::move(weight_manager);
+    }
+
+    void setEngine(std::shared_ptr<EngineBase> engine) {
+        engine_ = std::move(engine);
+    }
+
     grpc::Status poll(std::shared_ptr<GenerateStream>& stream) {
         return pollStreamOutput(nullptr, "request", nullptr, stream);
     }
@@ -63,6 +71,25 @@ protected:
 private:
     mutable std::once_flag     cancellation_check_once_;
     mutable std::promise<void> cancellation_checked_;
+};
+
+class UpdateWeightsTestEngine final: public EngineBase {
+public:
+    UpdateWeightsTestEngine(): EngineBase(EngineInitParams()) {}
+
+    std::shared_ptr<GenerateStream> enqueue(const std::shared_ptr<GenerateInput>&) override {
+        return nullptr;
+    }
+    void enqueue(std::shared_ptr<GenerateStream>&) override {}
+    absl::Status stop() override {
+        return absl::OkStatus();
+    }
+    absl::StatusOr<GenerateStreamPtr> preRun(const std::shared_ptr<GenerateInput>&, preRunMode) override {
+        return absl::UnimplementedError("not used by LocalRpcServerTest");
+    }
+    KVCacheInfo getCacheStatusInfo(int64_t, bool) override {
+        return {};
+    }
 };
 
 class RecordingWriter: public LocalRpcServer::WriterInterface {
@@ -301,6 +328,37 @@ TEST(LocalRpcServerTest, UpdateWeightsRejectsPythonNoneManagerAsUnimplemented) {
 
     EXPECT_EQ(status.error_code(), grpc::StatusCode::UNIMPLEMENTED);
     EXPECT_THAT(status.error_message(), HasSubstr("--use_new_loader false"));
+}
+
+TEST(LocalRpcServerTest, NewLoaderUpdateWeightsRequiresPausedEngine) {
+    if (!Py_IsInitialized()) {
+        Py_Initialize();
+    }
+    TestLocalRpcServer server;
+    auto               engine = std::make_shared<UpdateWeightsTestEngine>();
+    {
+        py::gil_scoped_acquire acquire;
+        auto manager = py::module_::import("types").attr("SimpleNamespace")();
+        manager.attr("requires_paused_engine") = true;
+        manager.attr("update") = py::cpp_function([](py::dict) {});
+        server.setWeightManager(manager);
+    }
+    server.setEngine(engine);
+
+    grpc::ServerContext    context;
+    UpdateWeightsRequestPB request;
+    request.set_name("model.norm.weight");
+    request.set_desc("descriptor");
+    request.set_method("shm");
+    EmptyPB response;
+
+    auto status = server.UpdateWeights(&context, &request, &response);
+    EXPECT_EQ(status.error_code(), grpc::StatusCode::FAILED_PRECONDITION);
+    EXPECT_THAT(status.error_message(), HasSubstr("every engine rank to be paused"));
+
+    engine->pause();
+    status = server.UpdateWeights(&context, &request, &response);
+    EXPECT_TRUE(status.ok()) << status.error_message();
 }
 
 }  // namespace rtp_llm

@@ -11,6 +11,14 @@ void EplbPlanTensors::init(int log_exp_num, int phy_exp_num) {
 
 ExpertBalancerPythonWrapper::ExpertBalancerPythonWrapper(py::object py_eplb): py_eplb_(std::move(py_eplb)) {}
 
+bool ExpertBalancerPythonWrapper::supportsPythonWeightInstall() {
+    py::gil_scoped_acquire acquire;
+    if (!py_eplb_ || !py::hasattr(py_eplb_, "supports_python_weight_install")) {
+        return false;
+    }
+    return py_eplb_.attr("supports_python_weight_install")().cast<bool>();
+}
+
 void ExpertBalancerPythonWrapper::createBalancePlan(torch::Tensor&   log_stats,
                                                     torch::Tensor&   gpu_loads,
                                                     EplbPlanTensors& eplb_plan) {
@@ -46,6 +54,16 @@ void ExpertBalancerPythonWrapper::loadBalanceWeight(int ep_rank, int ep_size, Ep
     eplb_plan.moe_weight_2 = result_tuple[2].cast<torch::Tensor>();
     eplb_plan.moe_scale_1  = result_tuple[3].cast<torch::Tensor>();
     eplb_plan.moe_scale_2  = result_tuple[4].cast<torch::Tensor>();
+}
+
+void ExpertBalancerPythonWrapper::rollbackBalancePlan(int layer_id) {
+    py::gil_scoped_acquire acquire;
+    py_eplb_.attr("rollback_balance_plan")(layer_id);
+}
+
+void ExpertBalancerPythonWrapper::commitBalancePlan(int layer_id) {
+    py::gil_scoped_acquire acquire;
+    py_eplb_.attr("commit_balance_plan")(layer_id);
 }
 
 }  // namespace rtp_llm

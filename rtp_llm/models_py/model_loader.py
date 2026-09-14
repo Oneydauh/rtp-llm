@@ -11,6 +11,10 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 import rtp_llm.models_py.weight_mapper as weight_mapper
 import torch
 import torch.nn as nn
+from rtp_llm.models_py.expert_placement import (
+    ExpertPlacement,
+    expert_placement_for_layer,
+)
 from rtp_llm.models_py.module_base import (
     CheckpointLoadTarget,
     RtpModule,
@@ -23,6 +27,7 @@ logger = logging.getLogger(__name__)
 _CUSTOM_WEIGHT_PREFIX = "__custom__."
 
 _EXPERT_ID_RE = re.compile(r"(?:^|\.)experts\.(\d+)(?:\.|$)")
+_EXPERT_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 _STACKED_EXPERT_RE = re.compile(
     r"^(?P<prefix>(?:.*\.)?experts)\."
     r"(?P<projection>gate_up_proj|down_proj)"
@@ -56,9 +61,17 @@ def _require_callable_name_filter(
 
 
 class _ExpertRangeFilter:
-    """Select only this EP rank's per-expert checkpoint tensors."""
+    """Select logical expert tensors needed by this EP rank's physical slots."""
 
-    def __init__(self, num_experts: int, ep_size: int, ep_rank: int):
+    def __init__(
+        self,
+        num_experts: int,
+        ep_size: int,
+        ep_rank: int,
+        model_config: Any = None,
+        parallelism_config: Any = None,
+        placement_overrides: Optional[Dict[int, ExpertPlacement]] = None,
+    ):
         for name, value in (
             ("num_experts", num_experts),
             ("ep_size", ep_size),
@@ -77,7 +90,37 @@ class _ExpertRangeFilter:
         self.start_expert = ep_rank * experts_per_rank
         self.end_expert = self.start_expert + experts_per_rank
         self.ep_size = ep_size
+        self.ep_rank = ep_rank
         self.num_experts = num_experts
+        self._model_config = model_config
+        self._parallelism_config = parallelism_config
+        self._placement_overrides = dict(placement_overrides or {})
+        self._placement_cache: Dict[int, ExpertPlacement] = {}
+
+    @staticmethod
+    def _layer_index(name: str) -> int:
+        match = _EXPERT_LAYER_RE.search(name)
+        return int(match.group(1)) if match is not None else 0
+
+    def _placement(self, name: str) -> Optional[ExpertPlacement]:
+        if self._model_config is None:
+            return None
+        layer_index = self._layer_index(name)
+        override = self._placement_overrides.get(layer_index)
+        if override is not None:
+            return override
+        placement = self._placement_cache.get(layer_index)
+        if placement is None:
+            placement = expert_placement_for_layer(
+                self._model_config,
+                layer_index=layer_index,
+                logical_expert_count=self.num_experts,
+                ep_size=self.ep_size,
+                ep_rank=self.ep_rank,
+                parallelism_config=self._parallelism_config,
+            )
+            self._placement_cache[layer_index] = placement
+        return placement
 
     def expert_id(self, name: str) -> Optional[int]:
         match = _EXPERT_ID_RE.search(name)
@@ -91,26 +134,32 @@ class _ExpertRangeFilter:
             )
         return expert_id
 
-    def target_ep_rank(self, name: str) -> Optional[int]:
+    def target_ep_ranks(self, name: str) -> Optional[Tuple[int, ...]]:
         expert_id = self.expert_id(name)
         if expert_id is None:
             return None
+        placement = self._placement(name)
+        if placement is not None:
+            return placement.target_ep_ranks(expert_id)
         experts_per_rank = self.num_experts // self.ep_size
-        return expert_id // experts_per_rank
+        return (expert_id // experts_per_rank,)
 
     def target_world_ranks(
         self, name: str, world_size: int
     ) -> Optional[Tuple[int, ...]]:
-        target_ep_rank = self.target_ep_rank(name)
-        if target_ep_rank is None:
+        target_ep_ranks = self.target_ep_ranks(name)
+        if target_ep_ranks is None:
             return None
         return tuple(
-            rank for rank in range(world_size) if rank % self.ep_size == target_ep_rank
+            rank for rank in range(world_size) if rank % self.ep_size in target_ep_ranks
         )
 
     def should_load(self, name: str) -> bool:
         expert_id = self.expert_id(name)
         if expert_id is not None:
+            placement = self._placement(name)
+            if placement is not None:
+                return bool(placement.local_indices(expert_id))
             return self.start_expert <= expert_id < self.end_expert
         if self.ep_size > 1 and _STACKED_EXPERT_RE.fullmatch(name):
             raise ValueError(
@@ -125,6 +174,23 @@ class _ExpertRangeFilter:
     def expand_safetensor(
         self, name: str, shape: Tuple[int, ...]
     ) -> List[Tuple[str, int]]:
+        return [
+            (read_spec.output_name, read_spec.slices[0])
+            for read_spec in self.stacked_read_specs(name, shape)
+            if read_spec.load
+        ]
+
+    def stacked_read_specs(
+        self, name: str, shape: Tuple[int, ...]
+    ) -> Tuple[ReadSpec, ...]:
+        """Plan one stacked tensor as independently routed logical experts.
+
+        FST first scatters the canonical contiguous expert ranges described by
+        ``shard_rank``. It then sends only rows whose physical placement adds
+        another target rank. Scratch applies the same specs as direct
+        safetensors slices, so neither backend materializes the full all-expert
+        tensor on every rank.
+        """
         match = _STACKED_EXPERT_RE.fullmatch(name)
         if match is None:
             raise ValueError(f"Tensor {name!r} is not a stacked expert tensor")
@@ -133,13 +199,33 @@ class _ExpertRangeFilter:
                 f"Stacked expert tensor {name!r} must contain "
                 f"{self.num_experts} experts, got shape {shape}"
             )
+        placement = self._placement(name)
         suffix = match.group("suffix") or ".weight"
         prefix = match.group("prefix")
         projection = match.group("projection")
-        return [
-            (f"{prefix}.{expert_id}.{projection}{suffix}", expert_id)
-            for expert_id in range(self.start_expert, self.end_expert)
-        ]
+        experts_per_rank = self.num_experts // self.ep_size
+        specs = []
+        for expert_id in range(self.num_experts):
+            target_ranks = (
+                placement.target_ep_ranks(expert_id)
+                if placement is not None
+                else (expert_id // experts_per_rank,)
+            )
+            specs.append(
+                ReadSpec(
+                    source_name=name,
+                    output_name=f"{prefix}.{expert_id}.{projection}{suffix}",
+                    source_shape=tuple(shape),
+                    load=self.ep_rank in target_ranks,
+                    slices=(expert_id,) + (slice(None),) * (len(shape) - 1),
+                    partition="ep_stacked_expert",
+                    shard_dim=0,
+                    shard_count=self.ep_size,
+                    shard_rank=expert_id // experts_per_rank,
+                    target_ranks=target_ranks,
+                )
+            )
+        return tuple(specs)
 
 
 class _StagedFSTLoadCoordinator:
@@ -421,6 +507,171 @@ class NewModelLoader:
         self.model_path = model_path
         self._ckpt_files = None
         self._safetensor_catalog_cache = _CHECKPOINT_CATALOG_UNSET
+        self._selected_load_method: Optional[NewLoaderLoadMethod] = None
+
+    @staticmethod
+    def _moe_expert_for_layer(model: nn.Module, layer_id: int) -> RtpModule:
+        matches = [
+            module
+            for module in model.modules()
+            if bool(getattr(module, "_supports_newloader_eplb", False))
+            and getattr(module, "layer_idx", None) == layer_id
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Expected one NewLoader MoE expert module for layer {layer_id}, "
+                f"found {len(matches)}"
+            )
+        return matches[0]
+
+    @torch.inference_mode()
+    def load_moe_layer_weights(
+        self,
+        model: nn.Module,
+        *,
+        layer_id: int,
+        physical_to_logical: List[int],
+        ep_rank: int,
+        ep_size: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Reload one physical MoE layer for a dynamic EPLB placement."""
+        if (ep_rank, ep_size) != (self.load_config.ep_rank, self.load_config.ep_size):
+            raise ValueError(
+                "C++ EPLB EP partition does not match NewLoader: "
+                f"callback=({ep_rank}, {ep_size}) loader="
+                f"({self.load_config.ep_rank}, {self.load_config.ep_size})"
+            )
+        live_experts = self._moe_expert_for_layer(model, layer_id)
+        placement = ExpertPlacement(
+            logical_expert_count=live_experts.num_experts,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            physical_to_logical=tuple(physical_to_logical),
+        )
+        if placement.physical_expert_count != live_experts.physical_num_experts:
+            raise ValueError("Dynamic EPLB cannot change the physical expert count")
+
+        # The callback is entered from a C++ std::thread.  CUDA's current
+        # device is thread-local, so a newly-created loading thread otherwise
+        # defaults to cuda:0 even when this process owns another local rank.
+        # Pin the worker to the device of the live layer and use that explicit
+        # device for every allocation/load below.  Using the rank-generic
+        # ``load_config.device`` (usually just ``"cuda"``) can make two EP
+        # ranks issue FST/NCCL operations from the same GPU and deadlock.
+        live_device = live_experts.w13.device
+        if live_device.type == "cuda":
+            if live_device.index is None:
+                raise RuntimeError(
+                    "Dynamic EPLB live MoE weight must have an explicit CUDA device"
+                )
+            torch.cuda.set_device(live_device)
+        reload_device = str(live_device)
+
+        with torch.device("cpu"):
+            reload_experts = live_experts.clone_empty_for_placement(placement)
+        self._validate_runtime_backends(reload_experts, reload_device)
+
+        model_filter = self._model_checkpoint_name_filter(model)
+        prefix = live_experts.prefix + "."
+
+        def target_layer_filter(name: str) -> bool:
+            if model_filter is not None and not model_filter(name):
+                return False
+            mapped = self._mapped_checkpoint_name(model, name)
+            return mapped.startswith(prefix)
+
+        expert_filter = _ExpertRangeFilter(
+            live_experts.num_experts,
+            ep_size,
+            ep_rank,
+            self.model_config,
+            self.load_config.parallelism_config,
+            placement_overrides={layer_id: placement},
+        )
+        checkpoint_files = self._checkpoint_files()
+        selected_files = weight_mapper.select_safetensor_files(
+            self._resolved_model_path(),
+            checkpoint_files,
+            target_layer_filter,
+            self._safetensor_catalog(),
+        )
+        if not selected_files:
+            raise FileNotFoundError(
+                f"No checkpoint shards contain MoE weights for layer {layer_id}"
+            )
+        name_filter = self._checkpoint_name_filter(target_layer_filter, expert_filter)
+        read_spec_resolver = self._checkpoint_read_spec_resolver(
+            model, target_layer_filter, expert_filter
+        )
+        method = self._selected_load_method
+        if method is None:
+            method = self._select_load_method(
+                self._resolve_load_method(), model, selected_files, expert_filter
+            )
+
+        if method == NewLoaderLoadMethod.FASTSAFETENSORS:
+            # Online EPLB cannot reuse the engine's WORLD communicator without
+            # racing inference collectives.  A rank-local FST group avoids that
+            # race, but still stages an entire checkpoint shard on each GPU
+            # (8 GiB for the DeepSeek-V2-Lite checkpoint).  Dynamic EPLB only
+            # needs one layer, so execute its ReadSpecs through direct bounded
+            # safetensors slices instead.  Initial model loading remains FST.
+            logger.info(
+                "NewLoader dynamic EPLB reload is using memory-bounded "
+                "ReadSpec scratch slices instead of online FST staging"
+            )
+            method = NewLoaderLoadMethod.SCRATCH
+
+        if method == NewLoaderLoadMethod.FASTSAFETENSORS:
+            self._prepare_model_for_fastsafetensors(reload_experts, reload_device)
+            weights = self._fastsafetensors_weights_iterator(
+                selected_files,
+                reload_device,
+                name_filter,
+                expert_filter,
+                read_spec_resolver,
+            )
+        else:
+            weights = weight_mapper.get_all_weights(
+                selected_files,
+                device="cpu",
+                name_filter=name_filter,
+                safetensor_slice_expander=expert_filter,
+                read_spec_resolver=read_spec_resolver,
+            )
+
+        try:
+            for name, tensor in weights:
+                mapped_name = self._mapped_checkpoint_name(model, name)
+                if not mapped_name.startswith(prefix):
+                    raise RuntimeError(
+                        f"Dynamic EPLB received non-layer tensor {name!r} "
+                        f"mapped to {mapped_name!r}"
+                    )
+                reload_experts.load_weights({mapped_name[len(prefix) :]: tensor})
+        finally:
+            close_weights = getattr(weights, "close", None)
+            if callable(close_weights):
+                close_weights()
+
+        reload_experts.validate_weights_loaded()
+        if method == NewLoaderLoadMethod.SCRATCH:
+            reload_experts.to(reload_device)
+        result = reload_experts.prepare_eplb_reload_weights()
+        logger.info(
+            "NewLoader reloaded EPLB layer %d on EP rank %d with %s",
+            layer_id,
+            ep_rank,
+            method.value,
+        )
+        # Return detached CPU tensors so background-thread CUDA postprocessing
+        # is complete before the all-rank ready flag is published.  The C++
+        # request boundary then installs this exact runtime layout into the
+        # Python model's stable device tensor addresses.
+        return {
+            name: tensor.detach().to(device="cpu").contiguous()
+            for name, tensor in result.items()
+        }
 
     def _resolve_load_method(self) -> NewLoaderLoadMethod:
         configured = self.load_config.load_method
@@ -547,6 +798,8 @@ class NewModelLoader:
             num_experts,
             self.load_config.ep_size,
             self.load_config.ep_rank,
+            self.model_config,
+            self.load_config.parallelism_config,
         )
 
     @staticmethod
@@ -1472,6 +1725,7 @@ class NewModelLoader:
             selected_files,
             expert_filter,
         )
+        self._selected_load_method = method
         logger.info(
             "NewLoader load method: requested=%s, selected=%s",
             requested_method.value,

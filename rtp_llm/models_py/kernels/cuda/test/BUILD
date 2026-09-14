@@ -9,6 +9,12 @@ py_test(
     deps = py_test_deps,
 )
 
+py_test(
+    name = "per_block_fp8_quant_test",
+    srcs = ["per_block_fp8_quant_test.py"],
+    deps = py_test_deps,
+)
+
 py_test (
     name = "per_token_group_quant_8bit_test",
     srcs = ["per_token_group_quant_8bit_test.py"],

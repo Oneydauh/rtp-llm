@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
 from rtp_llm.models_py.module_base import RtpModule, copy_weight_
+from rtp_llm.models_py.runtime_weight_update import prepare_leaf_weight_updates
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 from rtp_llm.models_py.read_spec import (
     ReadSpec,
@@ -97,6 +98,19 @@ class LinearBase(RtpModule):
 
     def validate_runtime_device(self, device: torch.device) -> None:
         self.quant_method.validate_runtime_device(device)
+
+    def prepare_weight_updates(self, weights):
+        if self.quant_config.quant_type != "none":
+            raise NotImplementedError("Quantized checkpoint updates need an atomic weight/scale conversion contract")
+        updates = prepare_leaf_weight_updates(self, weights, reset_fields=(
+            "_loaded_parameter_names", "_loaded_weight_shards", "_loaded_parameter_shards",
+            "_fused_loaded_parameters", "_merged_per_tensor_scales",
+        ))
+        # A partial fused Q/K/V or gate/up update may not mark the complete
+        # parameter loaded. Its private backing still contains the other shards.
+        if not updates:
+            raise RuntimeError("Linear update did not populate a runtime parameter")
+        return updates
 
     def requires_staged_device_postprocess(self) -> bool:
         return bool(self.quant_method.requires_staged_device_postprocess)

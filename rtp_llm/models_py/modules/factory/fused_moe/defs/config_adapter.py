@@ -36,6 +36,7 @@ class MoEConfigAdapter:
             _UNSET_QUANT_CONFIG
         ),
         enable_cuda_graph: bool = False,
+        expert_num_override: Optional[int] = None,
     ):
         if not isinstance(enable_cuda_graph, bool):
             raise TypeError("enable_cuda_graph must be a bool")
@@ -64,7 +65,21 @@ class MoEConfigAdapter:
         # Calculate local_rank from world_rank and local_world_size
         self.local_rank = parallelism_config.local_rank
 
-        self.expert_num = model_config.expert_num
+        if expert_num_override is not None and (
+            isinstance(expert_num_override, bool)
+            or not isinstance(expert_num_override, int)
+            or expert_num_override <= 0
+        ):
+            raise ValueError(
+                "expert_num_override must be a positive integer or None, got "
+                f"{expert_num_override!r}"
+            )
+        self.logical_expert_num = model_config.expert_num
+        self.expert_num = (
+            self.logical_expert_num
+            if expert_num_override is None
+            else expert_num_override
+        )
         self.moe_k = model_config.moe_k
         self.moe_topk_group = model_config.moe_topk_group
         self.hidden_size = model_config.hidden_size

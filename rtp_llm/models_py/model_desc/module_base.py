@@ -2,6 +2,8 @@ import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Optional
 
+import torch
+
 from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.device.device_type import DeviceType, get_device_type
 from rtp_llm.models_py.model_desc.block_map import (
@@ -70,6 +72,19 @@ class GptModelBase(RtpModule):
 
     def initialize(self, init_resource: PyModelInitResources) -> bool:
         self.kv_cache = init_resource.kv_cache
+        log_stats = getattr(init_resource, "eplb_log_stats", None)
+        gpu_loads = getattr(init_resource, "eplb_gpu_loads", None)
+        if (
+            isinstance(log_stats, torch.Tensor)
+            and isinstance(gpu_loads, torch.Tensor)
+            and log_stats.numel() > 0
+            and gpu_loads.numel() > 0
+        ):
+            for module in self.modules():
+                bind = getattr(module, "bind_eplb_stats", None)
+                layer_idx = getattr(module, "layer_idx", None)
+                if callable(bind) and isinstance(layer_idx, int):
+                    bind(log_stats[layer_idx], gpu_loads[layer_idx])
         if self.kv_cache is not None:
             num_layers = self.kv_cache.layer_count
             layer0_caches = (
@@ -87,6 +102,51 @@ class GptModelBase(RtpModule):
                 f"layer0_scale_groups={layer0_scale_count}, "
             )
         return True
+
+    def apply_eplb_plan(
+        self,
+        layer_id: int,
+        phy2log,
+        logic_expert_cnt,
+        log2phy,
+        moe_weight_1,
+        moe_weight_2,
+        moe_scale_1,
+        moe_scale_2,
+    ) -> bool:
+        from rtp_llm.utils.model_weight import W
+
+        matches = [
+            module
+            for module in self.modules()
+            if getattr(module, "layer_idx", None) == layer_id
+            and callable(getattr(module, "apply_eplb_plan", None))
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"Expected one EPLB-capable MoE module for layer {layer_id}, "
+                f"found {len(matches)}"
+            )
+        matches[0].apply_eplb_plan(
+            phy2log,
+            logic_expert_cnt,
+            log2phy,
+            {
+                W.moe_w1: moe_weight_1,
+                W.moe_w2: moe_weight_2,
+                W.moe_s1: moe_scale_1,
+                W.moe_s2: moe_scale_2,
+            },
+            defer_commit=True,
+        )
+        return True
+
+    def supports_eplb_weight_install(self) -> bool:
+        return any(
+            bool(getattr(module, "_supports_newloader_eplb", False))
+            and bool(getattr(module, "_dynamic_eplb_enabled", False))
+            for module in self.modules()
+        )
 
     def prepare_fmha_impl(
         self, inputs: PyModelInputs, is_cuda_graph: bool = False

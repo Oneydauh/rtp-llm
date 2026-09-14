@@ -28,6 +28,31 @@ namespace rtp_llm {
 
 namespace {
 
+// The Python writer uses this same lock. Hold it through C++ post layers as
+// those also retain runtime tensor views. Writers drain outstanding GPU work
+// before copying and synchronize before releasing the lock.
+class RuntimeWeightReadGuard {
+public:
+    explicit RuntimeWeightReadGuard(const py::object& model) {
+        py::gil_scoped_acquire acquire;
+        if (py::hasattr(model, "_weight_update_lock")) {
+            lock_ = model.attr("_weight_update_lock");
+            lock_.attr("acquire")();
+        }
+    }
+
+    ~RuntimeWeightReadGuard() {
+        py::gil_scoped_acquire acquire;
+        if (lock_) {
+            lock_.attr("release")();
+            lock_ = py::object();
+        }
+    }
+
+private:
+    py::object lock_;
+};
+
 // Pairs init() with waitAllDone() so an exception between them still returns the
 // writer to IDLE. Without this a single failed forward leaves it RUNNING, and every
 // later init() trips its IDLE precondition -- the instance can never publish again.
@@ -134,6 +159,25 @@ torch::Tensor PyWrappedModel::getMtpLastHiddenStates(int64_t num_tokens) {
 
 bool PyWrappedModel::hasMtpTargetHiddenBuffer() const {
     return has_mtp_hidden_buffer_;
+}
+
+bool PyWrappedModel::applyEplbPlan(int                  layer_id,
+                                   const torch::Tensor& phy2log,
+                                   const torch::Tensor& logic_expert_cnt,
+                                   const torch::Tensor& log2phy,
+                                   const torch::Tensor& moe_weight_1,
+                                   const torch::Tensor& moe_weight_2,
+                                   const torch::Tensor& moe_scale_1,
+                                   const torch::Tensor& moe_scale_2) {
+    py::gil_scoped_acquire gil;
+    if (!py::hasattr(py_model_, "apply_eplb_plan") || !py::hasattr(py_model_, "supports_eplb_weight_install")
+        || !py_model_.attr("supports_eplb_weight_install")().cast<bool>()) {
+        return false;
+    }
+    return py_model_
+        .attr("apply_eplb_plan")(
+            layer_id, phy2log, logic_expert_cnt, log2phy, moe_weight_1, moe_weight_2, moe_scale_1, moe_scale_2)
+        .cast<bool>();
 }
 
 PyWrappedModel::~PyWrappedModel() {
@@ -747,7 +791,12 @@ void PyWrappedModel::updateKVCacheKernelBlockId(const GptModelInputs& inputs) {
 
 GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
     RTP_LLM_PROFILE_SCOPE("py_model.forward");
+    RuntimeWeightReadGuard weight_read_guard(py_model_);
     DevicePerfWrapper wrapper(enable_device_perf_, "py model forward");
+    if (overall_expert_stats_.stats_buf.log_stats_buf.defined()) {
+        overall_expert_stats_.stats_buf.log_stats_buf.zero_();
+        overall_expert_stats_.stats_buf.gpu_loads_buf.zero_();
+    }
     holdInputsHostBuffers(inputs);
 
     // RAII guard: ensure prepared_attention_inputs_ is always reset to false on scope exit,

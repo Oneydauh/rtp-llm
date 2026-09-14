@@ -10,6 +10,11 @@ import torch
 from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.config.quant_config import QuantizationConfig as SourceQuantizationConfig
 from rtp_llm.models_py import weight_mapper
+from rtp_llm.models_py.eplb_controller import NewLoaderExpertBalancer
+from rtp_llm.models_py.expert_placement import (
+    ExpertPlacement,
+    expert_placement_for_layer,
+)
 from rtp_llm.models_py.layers.moe_experts import BaseMoEExperts
 from rtp_llm.models_py.layers.norm import RMSResNorm
 from rtp_llm.models_py.model_loader import (
@@ -33,6 +38,7 @@ _MODEL_QUANT_UNSET = object()
 
 
 def _parallelism(tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, dp_size=1):
+    world_size = max(tp_size, ep_size, dp_size)
     return types.SimpleNamespace(
         tp_size=tp_size,
         tp_rank=tp_rank,
@@ -40,7 +46,8 @@ def _parallelism(tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, dp_size=1):
         ep_rank=ep_rank,
         dp_size=dp_size,
         dp_rank=0,
-        world_size=max(tp_size, ep_size, dp_size),
+        world_size=world_size,
+        local_world_size=world_size,
         local_rank=tp_rank,
         get_attn_tp_size=lambda: tp_size,
         get_attn_tp_rank=lambda: tp_rank,
@@ -67,7 +74,13 @@ def _moe_config():
 
 
 def _runtime_model_config(
-    num_experts=2, quant_config=None, hidden_size=8, activation_type="SiGLU"
+    num_experts=2,
+    quant_config=None,
+    hidden_size=8,
+    activation_type="SiGLU",
+    redundant_expert=0,
+    phy2log_path="",
+    enable_eplb=False,
 ):
     return types.SimpleNamespace(
         data_type="fp32",
@@ -79,6 +92,13 @@ def _runtime_model_config(
         hidden_size=hidden_size,
         activation_type=activation_type,
         attn_config=types.SimpleNamespace(head_num=2),
+        num_layers=1,
+        phy2log_path=phy2log_path,
+        eplb_config=types.SimpleNamespace(
+            redundant_expert=redundant_expert,
+            phy_exp_num=lambda logical: logical + redundant_expert,
+            enable_eplb=lambda: enable_eplb,
+        ),
     )
 
 
@@ -95,6 +115,9 @@ def _make_experts(
     quant_config=None,
     model_quant_config=_MODEL_QUANT_UNSET,
     activation_type="SiGLU",
+    redundant_expert=0,
+    phy2log_path="",
+    enable_eplb=False,
 ):
     quant_config = quant_config or QuantizationConfig("none")
     if model_quant_config is _MODEL_QUANT_UNSET:
@@ -118,7 +141,13 @@ def _make_experts(
         ep_rank=ep_rank,
         params_dtype=torch.float32,
         model_config=_runtime_model_config(
-            num_experts, model_quant_config, hidden_size, activation_type
+            num_experts,
+            model_quant_config,
+            hidden_size,
+            activation_type,
+            redundant_expert,
+            phy2log_path,
+            enable_eplb,
         ),
         parallelism_config=_parallelism(tp_size, tp_rank, ep_size, ep_rank, dp_size),
         moe_config=_moe_config(),
@@ -187,6 +216,40 @@ class MoEWeightDispatchTest(unittest.TestCase):
             rank_one.should_load("model.layers.0.mlp.experts.gate_up_proj.weight")
         with self.assertRaisesRegex(ValueError, "outside"):
             rank_one.should_load("model.layers.0.mlp.experts.4.gate_proj.weight")
+
+    def test_ep_filter_routes_redundant_logical_expert_to_every_owner(self):
+        model_config = _runtime_model_config(4, redundant_expert=2)
+        rank_one = _ExpertRangeFilter(
+            4, 2, 1, model_config, _parallelism(ep_size=2, ep_rank=1)
+        )
+
+        logical_zero = "model.layers.0.mlp.experts.0.gate_proj.weight"
+        logical_one = "model.layers.0.mlp.experts.1.gate_proj.weight"
+        logical_two = "model.layers.0.mlp.experts.2.gate_proj.weight"
+        self.assertEqual(rank_one.target_ep_ranks(logical_zero), (0, 1))
+        self.assertEqual(rank_one.target_ep_ranks(logical_one), (0,))
+        self.assertEqual(rank_one.target_ep_ranks(logical_two), (0, 1))
+        self.assertTrue(rank_one.should_load(logical_zero))
+        self.assertFalse(rank_one.should_load(logical_one))
+        self.assertTrue(rank_one.should_load(logical_two))
+
+    def test_identity_placement_ignores_irrelevant_node_partition(self):
+        model_config = _runtime_model_config(4)
+        parallelism = _parallelism(ep_size=2)
+        parallelism.world_size = 4
+        parallelism.local_world_size = 1
+
+        placement = expert_placement_for_layer(
+            model_config,
+            layer_index=0,
+            logical_expert_count=4,
+            ep_size=2,
+            ep_rank=0,
+            parallelism_config=parallelism,
+        )
+
+        self.assertTrue(placement.is_identity)
+        self.assertEqual(placement.local_physical_to_logical, (0, 1))
 
     def test_safetensors_ep_filter_runs_before_get_tensor(self):
         rank_one = _ExpertRangeFilter(4, 2, 1)
@@ -414,6 +477,86 @@ class MoEWeightDispatchTest(unittest.TestCase):
         torch.testing.assert_close(layer.w13[0, :8], weights["2.up_proj.weight"])
         torch.testing.assert_close(layer.w13[1, :8], weights["3.up_proj.weight"])
 
+    def test_static_redundant_expert_duplicates_weights_into_physical_slots(self):
+        weights = _expert_weights(4, 8, 8)
+        layer = _make_experts(num_experts=4, ep_size=2, ep_rank=1, redundant_expert=2)
+        layer.load_weights(weights)
+        layer._check_load_complete()
+
+        self.assertEqual(layer.physical_num_experts, 6)
+        self.assertEqual(layer.num_local_experts, 3)
+        self.assertEqual(layer._expert_placement.local_physical_to_logical, (2, 3, 0))
+        for local_id, logical_id in enumerate((2, 3, 0)):
+            torch.testing.assert_close(
+                layer.w13[local_id, :8], weights[f"{logical_id}.up_proj.weight"]
+            )
+            torch.testing.assert_close(
+                layer.w13[local_id, 8:], weights[f"{logical_id}.gate_proj.weight"]
+            )
+            torch.testing.assert_close(
+                layer.w2[local_id], weights[f"{logical_id}.down_proj.weight"]
+            )
+
+    def test_forward_maps_logical_topk_ids_to_legacy_initial_slots(self):
+        layer = _make_experts(num_experts=4, redundant_expert=2)
+        layer.fused_moe = mock.Mock(side_effect=lambda **kwargs: kwargs["topk_ids"])
+        logical_ids = torch.tensor([[0], [0], [1], [1]], dtype=torch.int32)
+
+        physical_ids = layer(torch.zeros(4, 8), torch.ones(4, 1), logical_ids)
+
+        self.assertEqual(physical_ids.dtype, logical_ids.dtype)
+        torch.testing.assert_close(
+            physical_ids, torch.tensor([[0], [0], [1], [1]], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            layer._map_logical_to_physical(
+                torch.tensor([[-1], [4]], dtype=torch.int32)
+            ),
+            torch.tensor([[-1], [4]], dtype=torch.int32),
+        )
+
+    def test_forward_static_initial_slot_selection_is_rank_consistent(self):
+        logical_ids = torch.tensor([[0], [0], [2], [2]], dtype=torch.int32)
+        expected = torch.tensor([[0], [0], [3], [3]], dtype=torch.int32)
+        for rank in (0, 1):
+            layer = _make_experts(
+                num_experts=4, ep_size=2, ep_rank=rank, redundant_expert=2
+            )
+            layer.fused_moe = mock.Mock(side_effect=lambda **kwargs: kwargs["topk_ids"])
+            physical_ids = layer(torch.zeros(4, 8), torch.ones(4, 1), logical_ids)
+            torch.testing.assert_close(physical_ids, expected)
+
+    def test_forward_dynamic_plan_preserves_logical_aggregation_metadata(self):
+        layer = _make_experts(
+            num_experts=4,
+            ep_size=2,
+            ep_rank=0,
+            redundant_expert=2,
+            enable_eplb=True,
+        )
+        placement = ExpertPlacement(
+            logical_expert_count=4,
+            ep_size=2,
+            ep_rank=0,
+            physical_to_logical=(0, 1, 0, 2, 3, 3),
+        )
+        counts, log2phy = layer._routing_tensors(placement)
+        layer._expert_placement = placement
+        layer._eplb_logic_expert_cnt.copy_(counts)
+        layer._eplb_log2phy.copy_(log2phy)
+        layer._eplb_plan_installed = True
+        layer.fused_moe = mock.Mock(
+            side_effect=lambda **kwargs: kwargs["extra_finalize_args"]
+        )
+        logical_ids = torch.tensor([[0], [3]], dtype=torch.int32)
+
+        aggregation = layer(
+            torch.zeros(2, 8), torch.ones(2, 1), logical_ids
+        )
+
+        self.assertIs(aggregation["eplb_logical_topk_ids"], logical_ids)
+        self.assertEqual(aggregation["eplb_logical_experts_per_rank"], 2)
+
     def test_invalid_ep_and_expert_count_fail_fast(self):
         with self.assertRaisesRegex(
             ValueError, "num_experts must be a positive integer"
@@ -524,6 +667,11 @@ class MoEWeightDispatchTest(unittest.TestCase):
     def test_ep_rejects_stacked_all_expert_checkpoint(self):
         layer = _make_experts(num_experts=2, ep_size=2, ep_rank=0)
         with self.assertRaisesRegex(ValueError, "per-expert checkpoint keys"):
+            layer.load_weights({"gate_up_proj.weight": torch.zeros(2, 16, 8)})
+
+    def test_redundant_experts_reject_stacked_all_expert_checkpoint(self):
+        layer = _make_experts(num_experts=2, redundant_expert=2)
+        with self.assertRaisesRegex(ValueError, "redundant physical"):
             layer.load_weights({"gate_up_proj.weight": torch.zeros(2, 16, 8)})
 
 
@@ -1058,6 +1206,62 @@ class MoEQuantizedDispatchTest(unittest.TestCase):
 
 
 class MoeRuntimeConfigTest(unittest.TestCase):
+    def test_eplb_router_preflight_never_writes_live_weights(self):
+        layer = _make_experts(num_experts=2, redundant_expert=2, enable_eplb=True)
+        layer.w13.fill_(7)
+        layer.w2.fill_(8)
+        layer._runtime_weights_dict = {W.moe_w1: layer.w13.data, W.moe_w2: layer.w2.data}
+        layer.fused_moe = types.SimpleNamespace(
+            fused_experts=types.SimpleNamespace(use_deterministic_eplb_gather=False),
+            router=types.SimpleNamespace(),
+        )
+        placement = ExpertPlacement(2, 1, 0, (0, 1, 0, 1))
+        counts, inverse = layer._routing_tensors(placement)
+        with self.assertRaisesRegex(RuntimeError, "aggregation-capable"):
+            layer.apply_eplb_plan(
+                torch.tensor(placement.physical_to_logical, dtype=torch.int32), counts, inverse,
+                {W.moe_w1: torch.zeros_like(layer.w13), W.moe_w2: torch.zeros_like(layer.w2)},
+            )
+        torch.testing.assert_close(layer.w13, torch.full_like(layer.w13, 7))
+        torch.testing.assert_close(layer.w2, torch.full_like(layer.w2, 8))
+        self.assertFalse(layer._eplb_plan_installed)
+
+    def test_eplb_peer_install_failure_restores_tensor_routing_and_executor_flags(self):
+        layer = _make_experts(num_experts=2, redundant_expert=2, enable_eplb=True)
+        layer.w13.fill_(7)
+        layer.w2.fill_(8)
+        layer._runtime_weights_dict = {W.moe_w1: layer.w13.data, W.moe_w2: layer.w2.data}
+        layer.fused_moe = types.SimpleNamespace(
+            fused_experts=types.SimpleNamespace(use_deterministic_eplb_gather=False),
+            router=types.SimpleNamespace(use_deterministic_eplb_gather=False),
+        )
+        original = layer._expert_placement
+        original_counts = layer._eplb_logic_expert_cnt.clone()
+        original_inverse = layer._eplb_log2phy.clone()
+        pointers = (layer.w13.data_ptr(), layer.w2.data_ptr(), layer._eplb_log2phy.data_ptr())
+        placement = ExpertPlacement(2, 1, 0, (1, 0, 1, 0))
+        counts, inverse = layer._routing_tensors(placement)
+        layer.apply_eplb_plan(
+            torch.tensor(placement.physical_to_logical, dtype=torch.int32), counts, inverse,
+            {W.moe_w1: torch.zeros_like(layer.w13), W.moe_w2: torch.zeros_like(layer.w2)},
+            defer_commit=True,
+        )
+        self.assertTrue(layer._eplb_plan_installed)
+        with self.assertRaisesRegex(RuntimeError, "acknowledgement"):
+            layer.apply_eplb_plan(
+                torch.tensor(placement.physical_to_logical, dtype=torch.int32), counts, inverse, {},
+            )
+        layer.finalize_eplb_install(commit=False)
+        self.assertEqual(layer._expert_placement, original)
+        self.assertFalse(layer._eplb_plan_installed)
+        self.assertFalse(layer.fused_moe.router.use_deterministic_eplb_gather)
+        self.assertFalse(layer.fused_moe.fused_experts.use_deterministic_eplb_gather)
+        self.assertEqual(pointers, (layer.w13.data_ptr(), layer.w2.data_ptr(), layer._eplb_log2phy.data_ptr()))
+        torch.testing.assert_close(layer.w13, torch.full_like(layer.w13, 7))
+        torch.testing.assert_close(layer.w2, torch.full_like(layer.w2, 8))
+        torch.testing.assert_close(layer._eplb_logic_expert_cnt, original_counts)
+        torch.testing.assert_close(layer._eplb_log2phy, original_inverse)
+
     def test_adapter_distinguishes_inherited_and_explicit_none_quant_config(self):
         source_quant = types.SimpleNamespace(get_method=lambda: "FP8")
         model_config = _runtime_model_config(2, source_quant)
@@ -1073,6 +1277,436 @@ class MoeRuntimeConfigTest(unittest.TestCase):
         self.assertTrue(MoeConfigResolver.has_quantization(inherited))
         self.assertIsNone(ignored.quant_config)
         self.assertFalse(MoeConfigResolver.has_quantization(ignored))
+
+    def test_adapter_uses_physical_expert_count_override(self):
+        adapter = MoEConfigAdapter(
+            _runtime_model_config(4),
+            _parallelism(ep_size=2),
+            _moe_config(),
+            expert_num_override=6,
+        )
+
+        self.assertEqual(adapter.logical_expert_num, 4)
+        self.assertEqual(adapter.expert_num, 6)
+
+    def test_dynamic_eplb_reload_pins_cpp_worker_to_live_cuda_device(self):
+        loader = NewModelLoader(
+            types.SimpleNamespace(model_type="qwen_3_moe"),
+            NewLoaderConfig(ep_size=2, ep_rank=1, device="cuda"),
+        )
+        live_experts = mock.Mock()
+        live_experts.num_experts = 4
+        live_experts.physical_num_experts = 6
+        live_experts.w13.device = torch.device("cuda:1")
+        reload_experts = mock.sentinel.reload_experts
+        live_experts.clone_empty_for_placement.return_value = reload_experts
+
+        with mock.patch.object(
+            loader, "_moe_expert_for_layer", return_value=live_experts
+        ), mock.patch.object(torch.cuda, "set_device") as set_device, mock.patch.object(
+            loader,
+            "_validate_runtime_backends",
+            side_effect=RuntimeError("stop after device pin"),
+        ) as validate_runtime:
+            with self.assertRaisesRegex(RuntimeError, "stop after device pin"):
+                loader.load_moe_layer_weights(
+                    mock.sentinel.model,
+                    layer_id=0,
+                    physical_to_logical=[0, 1, 0, 2, 3, 3],
+                    ep_rank=1,
+                    ep_size=2,
+                )
+
+        set_device.assert_called_once_with(torch.device("cuda:1"))
+        validate_runtime.assert_called_once_with(reload_experts, "cuda:1")
+
+    def test_dynamic_eplb_routes_replicas_records_stats_and_installs_in_place(self):
+        layer = _make_experts(
+            num_experts=4,
+            top_k=1,
+            hidden_size=4,
+            moe_intermediate_size=4,
+            ep_size=2,
+            ep_rank=0,
+            redundant_expert=2,
+            enable_eplb=True,
+        )
+        layer._runtime_weights_dict = {
+            W.moe_w1: layer.w13.data,
+            W.moe_w2: layer.w2.data,
+        }
+        w1_ptr = layer.w13.data_ptr()
+        w2_ptr = layer.w2.data_ptr()
+        placement = ExpertPlacement(
+            logical_expert_count=4,
+            ep_size=2,
+            ep_rank=0,
+            physical_to_logical=(0, 1, 0, 2, 3, 3),
+        )
+        counts, log2phy = layer._routing_tensors(placement)
+        new_w1 = torch.full_like(layer.w13, 11)
+        new_w2 = torch.full_like(layer.w2, 22)
+        fused_experts = types.SimpleNamespace(
+            use_deterministic_eplb_gather=False
+        )
+        router = types.SimpleNamespace(use_deterministic_eplb_gather=False)
+        layer.fused_moe = types.SimpleNamespace(
+            fused_experts=fused_experts, router=router
+        )
+
+        layer.apply_eplb_plan(
+            torch.tensor(placement.physical_to_logical, dtype=torch.int32),
+            counts,
+            log2phy,
+            {W.moe_w1: new_w1, W.moe_w2: new_w2},
+        )
+
+        self.assertEqual(layer.w13.data_ptr(), w1_ptr)
+        self.assertEqual(layer.w2.data_ptr(), w2_ptr)
+        torch.testing.assert_close(layer.w13, new_w1)
+        torch.testing.assert_close(layer.w2, new_w2)
+        self.assertTrue(fused_experts.use_deterministic_eplb_gather)
+        self.assertTrue(router.use_deterministic_eplb_gather)
+        logical_stats = torch.zeros(4, dtype=torch.int32)
+        gpu_loads = torch.zeros(2, dtype=torch.int32)
+        layer.bind_eplb_stats(logical_stats, gpu_loads)
+        logical_ids = torch.tensor([[0], [0], [3], [3]], dtype=torch.int32)
+
+        physical_ids = layer._map_logical_to_physical(logical_ids)
+
+        torch.testing.assert_close(
+            physical_ids, torch.tensor([[0], [2], [4], [5]], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            logical_stats, torch.tensor([2, 0, 0, 2], dtype=torch.int32)
+        )
+        torch.testing.assert_close(gpu_loads, torch.tensor([2, 2], dtype=torch.int32))
+
+    def test_dynamic_eplb_replica_selection_is_consistent_across_ep_ranks(self):
+        layer = _make_experts(
+            num_experts=4,
+            top_k=1,
+            hidden_size=4,
+            moe_intermediate_size=4,
+            ep_size=2,
+            ep_rank=1,
+            redundant_expert=2,
+            enable_eplb=True,
+        )
+        placement = ExpertPlacement(
+            logical_expert_count=4,
+            ep_size=2,
+            ep_rank=1,
+            physical_to_logical=(0, 1, 0, 2, 3, 3),
+        )
+        counts, log2phy = layer._routing_tensors(placement)
+        layer._expert_placement = placement
+        layer._eplb_logic_expert_cnt.copy_(counts)
+        layer._eplb_log2phy.copy_(log2phy)
+        layer._eplb_plan_installed = True
+
+        physical_ids = layer._map_logical_to_physical(
+            torch.tensor([[0], [0], [3], [3]], dtype=torch.int32)
+        )
+
+        # Both ranks see the same logical routing decisions.  They must also
+        # select the same global physical ids so exactly one owning rank
+        # executes each token/expert pair before the cross-rank reduction.
+        torch.testing.assert_close(
+            physical_ids, torch.tensor([[0], [2], [4], [5]], dtype=torch.int32)
+        )
+
+    def test_dynamic_eplb_initial_routing_is_canonical_and_records_stats(self):
+        layer = _make_experts(
+            num_experts=4,
+            top_k=1,
+            hidden_size=4,
+            moe_intermediate_size=4,
+            ep_size=2,
+            ep_rank=1,
+            redundant_expert=2,
+            enable_eplb=True,
+        )
+        logical_stats = torch.zeros(4, dtype=torch.int32)
+        gpu_loads = torch.zeros(2, dtype=torch.int32)
+        layer.bind_eplb_stats(logical_stats, gpu_loads)
+
+        physical_ids = layer._map_logical_to_physical(
+            torch.tensor([[0], [0], [3], [3]], dtype=torch.int32)
+        )
+
+        self.assertFalse(layer._eplb_plan_installed)
+        torch.testing.assert_close(
+            physical_ids, torch.tensor([[0], [0], [4], [4]], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            logical_stats, torch.tensor([2, 0, 0, 2], dtype=torch.int32)
+        )
+        torch.testing.assert_close(gpu_loads, torch.tensor([2, 2], dtype=torch.int32))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires a CUDA device")
+    def test_dynamic_eplb_installs_cpu_reload_into_stable_cuda_tensors(self):
+        device = torch.device("cuda:0")
+        layer = _make_experts(
+            num_experts=4,
+            top_k=1,
+            hidden_size=4,
+            moe_intermediate_size=4,
+            ep_size=2,
+            ep_rank=0,
+            redundant_expert=2,
+            enable_eplb=True,
+        ).to(device)
+        layer._runtime_weights_dict = {
+            W.moe_w1: layer.w13.data,
+            W.moe_w2: layer.w2.data,
+        }
+        placement = ExpertPlacement(
+            logical_expert_count=4,
+            ep_size=2,
+            ep_rank=0,
+            physical_to_logical=(0, 1, 0, 2, 3, 3),
+        )
+        counts, log2phy = layer._routing_tensors(placement)
+        w1_ptr = layer.w13.data_ptr()
+        w2_ptr = layer.w2.data_ptr()
+
+        with mock.patch.object(
+            torch.cuda, "synchronize", wraps=torch.cuda.synchronize
+        ) as synchronize:
+            layer.apply_eplb_plan(
+                torch.tensor(placement.physical_to_logical, dtype=torch.int32),
+                counts,
+                log2phy,
+                {
+                    W.moe_w1: torch.full(layer.w13.shape, 31, dtype=layer.w13.dtype),
+                    W.moe_w2: torch.full(layer.w2.shape, 32, dtype=layer.w2.dtype),
+                },
+            )
+
+        self.assertEqual(synchronize.call_args_list, [mock.call(device)] * 2)
+
+        self.assertEqual(layer.w13.data_ptr(), w1_ptr)
+        self.assertEqual(layer.w2.data_ptr(), w2_ptr)
+        self.assertEqual(layer.w13.device, device)
+        self.assertEqual(layer.w2.device, device)
+        torch.testing.assert_close(layer.w13, torch.full_like(layer.w13, 31))
+        torch.testing.assert_close(layer.w2, torch.full_like(layer.w2, 32))
+
+        logical_stats = torch.zeros(4, dtype=torch.int32, device=device)
+        gpu_loads = torch.zeros(2, dtype=torch.int32, device=device)
+        layer.bind_eplb_stats(logical_stats, gpu_loads)
+        physical_ids = layer._map_logical_to_physical(
+            torch.tensor([[0], [0], [3], [3]], dtype=torch.int32, device=device)
+        )
+        torch.testing.assert_close(
+            physical_ids.cpu(),
+            torch.tensor([[0], [2], [4], [5]], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            logical_stats.cpu(), torch.tensor([2, 0, 0, 2], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            gpu_loads.cpu(), torch.tensor([2, 2], dtype=torch.int32)
+        )
+
+    def test_dynamic_eplb_rejects_inconsistent_routing_tensors(self):
+        layer = _make_experts(
+            num_experts=2,
+            redundant_expert=2,
+            enable_eplb=True,
+        )
+        layer._runtime_weights_dict = {
+            W.moe_w1: layer.w13.data,
+            W.moe_w2: layer.w2.data,
+        }
+        layer.w13.fill_(7)
+        layer.w2.fill_(8)
+        placement = torch.tensor([0, 1, 0, 1], dtype=torch.int32)
+        counts = torch.tensor([1, 3], dtype=torch.int32)
+        log2phy = torch.full((2, 3), -1, dtype=torch.int32)
+        old_w1 = layer.w13.clone()
+        old_w2 = layer.w2.clone()
+        old_placement = layer._expert_placement
+
+        with self.assertRaisesRegex(ValueError, "do not match phy2log"):
+            layer.apply_eplb_plan(
+                placement,
+                counts,
+                log2phy,
+                {W.moe_w1: layer.w13, W.moe_w2: layer.w2},
+            )
+        torch.testing.assert_close(layer.w13, old_w1)
+        torch.testing.assert_close(layer.w2, old_w2)
+        self.assertEqual(layer._expert_placement, old_placement)
+
+    def test_newloader_eplb_controller_uses_loader_callback_contract(self):
+        layer = _make_experts(
+            num_experts=4,
+            ep_size=2,
+            ep_rank=0,
+            redundant_expert=2,
+            enable_eplb=True,
+        )
+        model = torch.nn.Module()
+        model.experts = layer
+        layer._runtime_weights_dict = {
+            W.moe_w1: layer.w13.data,
+            W.moe_w2: layer.w2.data,
+        }
+        parallelism = _parallelism(ep_size=2, ep_rank=0)
+        loader = types.SimpleNamespace(
+            load_config=types.SimpleNamespace(parallelism_config=parallelism),
+            load_moe_layer_weights=mock.Mock(
+                return_value={
+                    W.moe_w1: torch.ones_like(layer.w13),
+                    W.moe_w2: torch.ones_like(layer.w2),
+                }
+            ),
+        )
+        model_config = types.SimpleNamespace(
+            num_layers=1,
+            moe_n_group=1,
+            eplb_config=types.SimpleNamespace(
+                balance_method="round",
+                eplb_force_repack=0,
+                eplb_stats_window_size=2,
+            ),
+        )
+        controller = NewLoaderExpertBalancer(loader, model, model_config)
+
+        plan = controller.create_balance_plan(
+            torch.tensor([[9, 1, 2, 8]], dtype=torch.int32),
+            torch.tensor([[10, 10]], dtype=torch.int32),
+        )
+        loaded = controller.load_moe_weight(plan[0], 0, 2, plan[3])
+
+        self.assertEqual(plan[0].dtype, torch.int32)
+        self.assertEqual(tuple(plan[1].shape), (4,))
+        self.assertEqual(tuple(plan[2].shape), (4, 3))
+        self.assertEqual(tuple(plan[3].shape), (6,))
+        self.assertEqual(loaded[0], 0)
+        self.assertEqual(loaded[3].numel(), 0)
+        self.assertEqual(loaded[4].numel(), 0)
+        loader.load_moe_layer_weights.assert_called_once_with(
+            model,
+            layer_id=0,
+            physical_to_logical=plan[3].tolist(),
+            ep_rank=0,
+            ep_size=2,
+        )
+
+    def test_newloader_eplb_controller_supports_repeated_plan_install(self):
+        layer = _make_experts(
+            num_experts=4,
+            ep_size=2,
+            ep_rank=0,
+            redundant_expert=2,
+            enable_eplb=True,
+        )
+        layer._runtime_weights_dict = {
+            W.moe_w1: layer.w13.data,
+            W.moe_w2: layer.w2.data,
+        }
+        model = torch.nn.Module()
+        model.experts = layer
+        parallelism = _parallelism(ep_size=2, ep_rank=0)
+        loader = types.SimpleNamespace(
+            load_config=types.SimpleNamespace(parallelism_config=parallelism),
+            load_moe_layer_weights=mock.Mock(
+                side_effect=[
+                    {
+                        W.moe_w1: torch.full_like(layer.w13, 11),
+                        W.moe_w2: torch.full_like(layer.w2, 12),
+                    },
+                    {
+                        W.moe_w1: torch.full_like(layer.w13, 21),
+                        W.moe_w2: torch.full_like(layer.w2, 22),
+                    },
+                ]
+            ),
+        )
+        model_config = types.SimpleNamespace(
+            num_layers=1,
+            moe_n_group=1,
+            eplb_config=types.SimpleNamespace(
+                balance_method="round",
+                eplb_force_repack=0,
+                eplb_stats_window_size=2,
+            ),
+        )
+        controller = NewLoaderExpertBalancer(loader, model, model_config)
+        w1_ptr = layer.w13.data_ptr()
+        w2_ptr = layer.w2.data_ptr()
+
+        for update, hot_expert in enumerate((0, 3), start=1):
+            stats = torch.ones((1, 4), dtype=torch.int32)
+            stats[0, hot_expert] = 100
+            plan = controller.create_balance_plan(
+                stats, torch.tensor([[100, 1]], dtype=torch.int32)
+            )
+            loaded = controller.load_moe_weight(plan[0], 0, 2, plan[3])
+            layer.apply_eplb_plan(
+                plan[3],
+                plan[1],
+                plan[2],
+                {W.moe_w1: loaded[1], W.moe_w2: loaded[2]},
+            )
+            self.assertEqual(layer.w13.data_ptr(), w1_ptr)
+            self.assertEqual(layer.w2.data_ptr(), w2_ptr)
+            torch.testing.assert_close(
+                layer.w13, torch.full_like(layer.w13, update * 10 + 1)
+            )
+            torch.testing.assert_close(
+                layer.w2, torch.full_like(layer.w2, update * 10 + 2)
+            )
+            self.assertEqual(
+                controller.phy2log[0],
+                list(layer._expert_placement.physical_to_logical),
+            )
+
+        self.assertEqual(loader.load_moe_layer_weights.call_count, 2)
+
+    def test_newloader_eplb_controller_rolls_back_failed_load_state(self):
+        layer = _make_experts(
+            num_experts=4,
+            ep_size=2,
+            ep_rank=0,
+            redundant_expert=2,
+            enable_eplb=True,
+        )
+        model = torch.nn.Module()
+        model.experts = layer
+        parallelism = _parallelism(ep_size=2, ep_rank=0)
+        loader = types.SimpleNamespace(
+            load_config=types.SimpleNamespace(parallelism_config=parallelism),
+            load_moe_layer_weights=mock.Mock(
+                side_effect=RuntimeError("injected checkpoint read failure")
+            ),
+        )
+        model_config = types.SimpleNamespace(
+            num_layers=1,
+            moe_n_group=1,
+            eplb_config=types.SimpleNamespace(
+                balance_method="round",
+                eplb_force_repack=0,
+                eplb_stats_window_size=2,
+            ),
+        )
+        controller = NewLoaderExpertBalancer(loader, model, model_config)
+        installed = list(layer._expert_placement.physical_to_logical)
+        planned = torch.tensor([0, 1, 2, 3, 3, 2], dtype=torch.int32)
+
+        with self.assertRaisesRegex(RuntimeError, "injected checkpoint read failure"):
+            controller.load_moe_weight(
+                torch.tensor([0], dtype=torch.int32), 0, 2, planned
+            )
+        self.assertEqual(controller.phy2log[0], planned.tolist())
+
+        controller.rollback_balance_plan(0)
+
+        self.assertEqual(controller.phy2log[0], installed)
+        self.assertEqual(list(layer._expert_placement.physical_to_logical), installed)
 
 
 class Qwen3MoeModelTest(unittest.TestCase):
@@ -1185,12 +1819,13 @@ class Qwen3MoeModelTest(unittest.TestCase):
 
         self.assertEqual(model.layers[0].mlp.experts.moe_inter, 4)
 
-    def test_eplb_attribute_is_rejected_before_model_load(self):
+    def test_eplb_attribute_enables_dynamic_newloader_moe(self):
         config = self._config()
         config.eplb_config.eplb_mode = EplbMode.EPLB
 
-        with self.assertRaisesRegex(ValueError, "EPLB is not supported"):
-            Qwen3MoeForCausalLM(config, self._load_config())
+        model = Qwen3MoeForCausalLM(config, self._load_config())
+
+        self.assertTrue(model.layers[0].mlp.experts._dynamic_eplb_enabled)
 
     def test_invalid_adapter_cuda_graph_flag_is_rejected(self):
         with self.assertRaisesRegex(TypeError, "enable_cuda_graph must be a bool"):

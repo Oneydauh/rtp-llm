@@ -409,8 +409,6 @@ def validate_deepseek_newloader_eplb(
         enable_eplb = enable_eplb()
     if not isinstance(enable_eplb, bool):
         raise TypeError("eplb_config.enable_eplb must be a bool")
-    if enable_eplb:
-        raise ValueError(f"EPLB is not supported by the {model_name} newloader path")
 
 
 def validate_deepseek_mla_backend(
@@ -995,9 +993,7 @@ class DeepSeekV32ForCausalLM(MlaRuntimeLayoutMixin, GptModelBase):
         if fmha_impl is None:
             fmha_impl = self.prepare_fmha_impl(inputs)
         for i, layer in enumerate(self.layers):
-            layer_fmha_impl = select_fmha_impl_for_layer(
-                fmha_impl, self.kv_cache, i
-            )
+            layer_fmha_impl = select_fmha_impl_for_layer(fmha_impl, self.kv_cache, i)
             hidden_states, residual = layer(
                 hidden_states,
                 residual,

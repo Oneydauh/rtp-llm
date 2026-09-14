@@ -1,5 +1,5 @@
 import copy
-from typing import Any, Callable, Iterator, Optional, Tuple, Type
+from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple, Type
 
 import torch
 from rtp_llm.models_py.read_spec import ReadSpec
@@ -103,6 +103,176 @@ def _install_float8_safe_process_group(file_buffer):
     return file_buffer.pg
 
 
+class _TensorTransport:
+    """Minimal FST tensor wrapper for routing an already-materialized row."""
+
+    def __init__(self, tensor: torch.Tensor):
+        self.real_tensor = tensor
+
+
+def _stacked_expert_read_specs(
+    slice_expander: Any,
+    key: str,
+    shape: Tuple[int, ...],
+    pg_size: int,
+    pg_rank: int,
+) -> Tuple[ReadSpec, ...]:
+    resolver = getattr(slice_expander, "stacked_read_specs", None)
+    if not callable(resolver):
+        raise RuntimeError(
+            "FST stacked expert loading requires placement-aware ReadSpecs"
+        )
+    read_specs = tuple(resolver(key, shape))
+    if len(read_specs) != shape[0]:
+        raise RuntimeError(
+            f"Stacked expert plan for {key!r} has {len(read_specs)} entries, "
+            f"expected {shape[0]}"
+        )
+
+    experts_per_rank = shape[0] // pg_size
+    expert_ids = []
+    for read_spec in read_specs:
+        if not isinstance(read_spec, ReadSpec):
+            raise TypeError(
+                f"Stacked expert plan for {key!r} contains "
+                f"{type(read_spec).__name__}, expected ReadSpec"
+            )
+        if read_spec.source_name != key:
+            raise RuntimeError(
+                f"Stacked expert ReadSpec source {read_spec.source_name!r} "
+                f"does not match {key!r}"
+            )
+        if read_spec.slices is None or not isinstance(read_spec.slices[0], int):
+            raise RuntimeError(
+                f"Stacked expert ReadSpec for {key!r} must select one expert row"
+            )
+        expert_id = read_spec.slices[0]
+        if not 0 <= expert_id < shape[0]:
+            raise RuntimeError(
+                f"Stacked expert ReadSpec for {key!r} selects invalid expert "
+                f"{expert_id}"
+            )
+        expected_owner = expert_id // experts_per_rank
+        if (
+            read_spec.shard_dim != 0
+            or read_spec.shard_count != pg_size
+            or read_spec.shard_rank != expected_owner
+        ):
+            raise RuntimeError(
+                f"Stacked expert ReadSpec for {key!r} expert {expert_id} has "
+                "an inconsistent canonical shard owner"
+            )
+        targets = read_spec.target_ranks
+        if targets is None or not targets or any(rank >= pg_size for rank in targets):
+            raise RuntimeError(
+                f"Stacked expert ReadSpec for {key!r} expert {expert_id} has "
+                f"invalid target ranks {targets}"
+            )
+        if read_spec.load != (pg_rank in targets):
+            raise RuntimeError(
+                f"Stacked expert ReadSpec for {key!r} expert {expert_id} is "
+                f"inconsistent on rank {pg_rank}: load={read_spec.load}, "
+                f"target_ranks={targets}"
+            )
+        expert_ids.append(expert_id)
+    if tuple(sorted(expert_ids)) != tuple(range(shape[0])):
+        raise RuntimeError(
+            f"Stacked expert plan for {key!r} must describe every logical expert "
+            "exactly once"
+        )
+    return read_specs
+
+
+def _route_stacked_expert_rows(
+    pg: _Float8SafeProcessGroup,
+    key: str,
+    local_experts: torch.Tensor,
+    read_specs: Sequence[ReadSpec],
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    """Route only non-canonical expert replicas after the FST scatter."""
+
+    pg_rank = pg.rank()
+    pg_size = pg.size()
+    experts_per_rank = len(read_specs) // pg_size
+    expected_start = pg_rank * experts_per_rank
+    rows: Dict[int, torch.Tensor] = {}
+
+    def expert_id(read_spec: ReadSpec) -> int:
+        assert read_spec.slices is not None
+        value = read_spec.slices[0]
+        assert isinstance(value, int)
+        return value
+
+    def canonical_row(logical_id: int) -> torch.Tensor:
+        local_index = logical_id - expected_start
+        if not 0 <= local_index < local_experts.shape[0]:
+            raise RuntimeError(
+                f"Rank {pg_rank} does not own canonical expert {logical_id} "
+                f"from stacked tensor {key!r}"
+            )
+        return local_experts[local_index].contiguous()
+
+    for read_spec in read_specs:
+        logical_id = expert_id(read_spec)
+        if read_spec.load and read_spec.shard_rank == pg_rank:
+            rows[logical_id] = canonical_row(logical_id)
+
+    # Pairwise rank ordering avoids a blocking send/send deadlock.  Every rank
+    # derives the same send and receive lists from the immutable ReadSpecs.
+    for peer_rank in range(pg_size):
+        if peer_rank == pg_rank:
+            continue
+        sends = [
+            read_spec
+            for read_spec in read_specs
+            if read_spec.shard_rank == pg_rank
+            and read_spec.target_ranks is not None
+            and peer_rank in read_spec.target_ranks
+        ]
+        receives = [
+            read_spec
+            for read_spec in read_specs
+            if read_spec.shard_rank == peer_rank
+            and read_spec.target_ranks is not None
+            and pg_rank in read_spec.target_ranks
+        ]
+
+        def send_rows() -> None:
+            for read_spec in sends:
+                logical_id = expert_id(read_spec)
+                pg.send(
+                    _TensorTransport(canonical_row(logical_id)),
+                    peer_rank,
+                    logical_id,
+                )
+
+        def receive_rows() -> None:
+            for read_spec in receives:
+                logical_id = expert_id(read_spec)
+                row = torch.empty_like(local_experts[0])
+                pg.recv(_TensorTransport(row), peer_rank, logical_id)
+                rows[logical_id] = row
+
+        if pg_rank < peer_rank:
+            send_rows()
+            receive_rows()
+        else:
+            receive_rows()
+            send_rows()
+
+    for read_spec in read_specs:
+        if not read_spec.load:
+            continue
+        logical_id = expert_id(read_spec)
+        row = rows.get(logical_id)
+        if row is None:
+            raise RuntimeError(
+                f"Stacked expert {logical_id} from {key!r} was not routed to "
+                f"rank {pg_rank}"
+            )
+        yield read_spec.output_name, row
+
+
 def iter_read_spec_tensors(
     file_buffer,
     keys,
@@ -115,7 +285,8 @@ def iter_read_spec_tensors(
     not make FST's file copier range-aware, but it prevents every non-source
     rank from materializing the full tensor. ``push_tensor`` similarly routes
     a per-expert key directly when it has one owning EP rank. Stacked expert
-    tensors use ``get_sharded(dim=0)`` before expansion into per-expert keys.
+    tensors use ``get_sharded(dim=0)`` before expansion into per-expert keys;
+    placement-aware ReadSpecs then route only additional redundant rows.
     """
 
     pg = _install_float8_safe_process_group(file_buffer)
@@ -129,7 +300,6 @@ def iter_read_spec_tensors(
             safetensor_slice_expander is not None
             and safetensor_slice_expander.handles_safetensor(key)
         ):
-            expanded = safetensor_slice_expander.expand_safetensor(key, shape)
             experts_per_rank = (
                 safetensor_slice_expander.num_experts
                 // safetensor_slice_expander.ep_size
@@ -156,13 +326,10 @@ def iter_read_spec_tensors(
                     f"FST stacked expert shard {key!r} has "
                     f"{local_experts.shape[0]} experts, expected {experts_per_rank}"
                 )
-            for local_index, (output_name, expert_id) in enumerate(expanded):
-                if expert_id != expected_start + local_index:
-                    raise RuntimeError(
-                        f"Non-contiguous expert expansion for {key!r}: "
-                        f"expert {expert_id} at local index {local_index}"
-                    )
-                yield output_name, local_experts[local_index].contiguous()
+            read_specs = _stacked_expert_read_specs(
+                safetensor_slice_expander, key, shape, pg_size, pg_rank
+            )
+            yield from _route_stacked_expert_rows(pg, key, local_experts, read_specs)
             continue
 
         read_spec = read_spec_resolver(key, shape)

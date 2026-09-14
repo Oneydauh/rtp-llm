@@ -153,11 +153,13 @@ py_library(
     name = "new_loader_core",
     srcs = [
         "__init__.py",
+        "expert_placement.py",
         "fastsafetensors_read_spec.py",
         "model_loader.py",
         "module_base.py",
         "read_spec.py",
         "registry.py",
+        "runtime_weight_update.py",
         "weight_mapper.py",
     ],
     deps = [
@@ -185,7 +187,7 @@ py_library(
 
 py_library(
     name = "new_weight_loader",
-    srcs = glob([
+    srcs = ["eplb_controller.py"] + glob([
         "layers/*.py",
         "new_models/*.py",
         "new_models/bert/*.py",
@@ -218,6 +220,7 @@ py_library(
         "//rtp_llm:_ft_pickler",
         "//rtp_llm:config",
         "//rtp_llm:device",
+        "//rtp_llm:eplb",
         "//rtp_llm:ops",
         "//rtp_llm:safetensors",
         "//rtp_llm:torch",

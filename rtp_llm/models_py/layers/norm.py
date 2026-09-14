@@ -4,6 +4,7 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 from rtp_llm.models_py.module_base import RtpModule
+from rtp_llm.models_py.runtime_weight_update import prepare_leaf_weight_updates
 
 logger = logging.getLogger(__name__)
 _RMSNORM_FUSED_ENABLED = True
@@ -23,6 +24,9 @@ def _disable_fused_rmsnorm(exc: ImportError) -> None:
 
 
 class RMSNorm(RtpModule):
+    def prepare_weight_updates(self, weights):
+        return prepare_leaf_weight_updates(self, weights)
+
     def __init__(
         self,
         hidden_size: int,
@@ -94,6 +98,9 @@ class RMSNorm(RtpModule):
 
 class RMSResNorm(RtpModule):
     """RMSNorm with the residual-add contract used by decoder runtimes."""
+
+    def prepare_weight_updates(self, weights):
+        return prepare_leaf_weight_updates(self, weights)
 
     def __init__(
         self,

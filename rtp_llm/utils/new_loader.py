@@ -43,8 +43,8 @@ def new_loader_unsupported_reason(
         return "force_cpu_load_weights is not supported by this newloader slice"
     if model_config.enable_output_vocab_pruning:
         return "output vocabulary pruning is not supported by this newloader slice"
-    if model_config.eplb_config.enable_eplb():
-        return "EPLB is not supported by this newloader slice"
+    if model_config.eplb_config.enable_eplb() and model_config.expert_num <= 0:
+        return "EPLB requires a NewLoader MoE model with routed experts"
     if model_config.ptuning_path:
         return "p-tuning is not supported by this newloader slice"
     if model_config.lora_infos:
@@ -59,10 +59,10 @@ def new_loader_unsupported_reason(
             "routing, or true to retain the legacy loader"
         )
     if model_config.require_weight_update:
-        return (
-            "online UpdateWeights is required but is not supported by NewLoader; "
-            "use --use_new_loader false"
-        )
+        if getattr(model_config, "model_type", None) not in ("qwen_2", "qwen_3", "llama"):
+            return "online UpdateWeights requires a supported dense Qwen2/Qwen3/Llama NewLoader model"
+        if model_config.quant_config is not None:
+            return "quantized online UpdateWeights requires a weight/scale update contract; use --use_new_loader false"
     quant_config = model_config.quant_config
     if quant_config is not None:
         runtime_method = quant_config.get_runtime_method_key()

@@ -419,8 +419,6 @@ def _extract_config_values(
         enable_eplb = enable_eplb()
     if not isinstance(enable_eplb, bool):
         raise TypeError("eplb_config.enable_eplb must be a bool")
-    if enable_eplb:
-        raise ValueError("EPLB is not supported by the Qwen3-Next core slice")
 
     params_dtype = required_config_value(load_config, "compute_dtype")
     if not isinstance(params_dtype, torch.dtype):

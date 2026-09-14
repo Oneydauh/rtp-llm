@@ -6,7 +6,9 @@ py_library(
         "*.py",
     ]),
     deps = [
+        "//rtp_llm:lora",
         "//rtp_llm:utils",
+        "//rtp_llm/models_py:new_loader_core",
         "//rtp_llm/model_loader/tipc:tipc"
     ]
 )

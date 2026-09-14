@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from rtp_llm.models_py.distributed.collective_torch import Group, all_gather, all_reduce
 from rtp_llm.models_py.module_base import RtpModule
+from rtp_llm.models_py.runtime_weight_update import prepare_leaf_weight_updates
 from rtp_llm.models_py.read_spec import (
     ReadSpec,
     make_sharded_read_spec,
@@ -30,6 +31,9 @@ def _validate_vocab_partition(vocab_size: int, tp_size: int, tp_rank: int) -> No
 
 
 class VocabParallelEmbedding(RtpModule):
+    def prepare_weight_updates(self, weights):
+        return prepare_leaf_weight_updates(self, weights)
+
     def __init__(
         self,
         vocab_size: int,
@@ -114,6 +118,9 @@ class VocabParallelEmbedding(RtpModule):
 
 
 class ParallelLMHead(RtpModule):
+    def prepare_weight_updates(self, weights):
+        return prepare_leaf_weight_updates(self, weights)
+
     def __init__(
         self,
         vocab_size: int,

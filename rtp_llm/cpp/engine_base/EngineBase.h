@@ -1,6 +1,7 @@
 #pragma once
 
 #include <utility>
+#include <atomic>
 
 #include "absl/status/status.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
@@ -48,6 +49,10 @@ public:
 
     void restart() {
         pause_ = false;
+    }
+
+    bool isPaused() const {
+        return pause_.load();
     }
 
     virtual std::shared_ptr<GenerateStream> enqueue(const std::shared_ptr<GenerateInput>& input) = 0;
@@ -102,7 +107,7 @@ protected:
     MlaOpsType                     mla_ops_type_       = MlaOpsType::AUTO;
     int32_t                        kv_cache_group_num_ = 1;
     std::unique_ptr<SchedulerBase> scheduler_          = nullptr;
-    bool                           pause_              = false;
+    std::atomic<bool>              pause_{false};
 };
 
 }  // namespace rtp_llm

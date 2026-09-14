@@ -103,6 +103,22 @@ class FakeExpertBalancer:
         )
 
 
+class FakeNewLoaderExpertBalancer(FakeExpertBalancer):
+    def __init__(self, res: FakeResult):
+        super().__init__(res)
+        self.committed = []
+        self.rolled_back = []
+
+    def supports_python_weight_install(self):
+        return True
+
+    def commit_balance_plan(self, layer_id: int):
+        self.committed.append(layer_id)
+
+    def rollback_balance_plan(self, layer_id: int):
+        self.rolled_back.append(layer_id)
+
+
 class TestEplbPyWrapper(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -150,6 +166,38 @@ class TestEplbPyWrapper(unittest.TestCase):
         config = TestMoeConfig()
         config.use_fp8 = True
         self._single_test(config)
+
+    def test_python_weight_install_capability_defaults_to_false(self):
+        config = TestMoeConfig()
+        eplb_op = EplbPyWrapperOP()
+        eplb_op.init(FakeExpertBalancer(FakeResult(config)))
+
+        self.assertFalse(eplb_op.supports_python_weight_install())
+
+    def test_python_weight_install_capability_is_explicit(self):
+        config = TestMoeConfig()
+        eplb_op = EplbPyWrapperOP()
+        eplb_op.init(FakeNewLoaderExpertBalancer(FakeResult(config)))
+
+        self.assertTrue(eplb_op.supports_python_weight_install())
+
+    def test_newloader_commit_and_rollback_callbacks_cross_cpp_boundary(self):
+        config = TestMoeConfig()
+        eplb_op = EplbPyWrapperOP()
+        expert_balancer = FakeNewLoaderExpertBalancer(FakeResult(config))
+        eplb_op.init(expert_balancer)
+
+        eplb_op.commit_balance_plan(7)
+        eplb_op.rollback_balance_plan(9)
+
+        self.assertEqual(expert_balancer.committed, [7])
+        self.assertEqual(expert_balancer.rolled_back, [9])
+
+    def test_newloader_plan_buffers_keep_metadata_without_legacy_weights(self):
+        eplb_op = EplbPyWrapperOP()
+
+        self.assertEqual(eplb_op.plan_buffer_state(False), (True, False, False))
+        self.assertEqual(eplb_op.plan_buffer_state(True), (True, True, True))
 
 
 if __name__ == "__main__":

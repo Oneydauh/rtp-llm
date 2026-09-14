@@ -44,9 +44,15 @@ public:
     ExpertBalancerPythonWrapper() = default;
     ExpertBalancerPythonWrapper(py::object py_eplb);
 
+    bool supportsPythonWeightInstall();
+
     void createBalancePlan(torch::Tensor& log_stats, torch::Tensor& gpu_loads, EplbPlanTensors& eplb_plan);
 
     void loadBalanceWeight(int ep_rank, int ep_size, EplbPlanTensors& eplb_plan);
+
+    void rollbackBalancePlan(int layer_id);
+
+    void commitBalancePlan(int layer_id);
 
 private:
     py::object py_eplb_;

@@ -420,7 +420,12 @@ def per_block_cast_to_fp8(
     x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
     sf = x_amax / 448.0
     sf = ceil_to_ue8m0(sf) if use_ue8m0 else sf
-    x_scaled = (x_view * (1.0 / sf)).to(torch.float8_e4m3fn)
+    # Keep the non-UE8M0 operation order identical to the legacy loader's
+    # per-block quantizer. Although ``448 / amax`` and ``1 / (amax / 448)``
+    # are algebraically equivalent, their FP32 rounding can select adjacent
+    # FP8 codes and change deterministic greedy output after many layers.
+    quant_multiplier = 1.0 / sf if use_ue8m0 else 448.0 / x_amax
+    x_scaled = (x_view * quant_multiplier).to(torch.float8_e4m3fn)
     return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(
         x_view.size(0), x_view.size(2)
     )

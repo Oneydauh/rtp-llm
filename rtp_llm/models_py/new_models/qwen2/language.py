@@ -359,6 +359,8 @@ def _validate_supported_parallelism(parallelism_config: Any) -> None:
 
 class Qwen2ForCausalLM(GptModelBase):
 
+    supports_checkpoint_weight_updates = True
+
     QKV_BIAS = True
 
     WEIGHTS_MAPPER = WeightsMapper(

@@ -10,6 +10,7 @@ from unittest import mock
 import torch
 import torch.nn as nn
 import rtp_llm.models_py.weight_mapper as weight_mapper
+from rtp_llm.models_py.expert_placement import expert_placement_for_layer
 from rtp_llm.models_py.fastsafetensors_read_spec import (
     _Float8SafeProcessGroup,
     iter_read_spec_tensors,
@@ -273,6 +274,113 @@ class FoundationLoaderTest(unittest.TestCase):
         self.assertEqual(remote_expert.target_ranks, (0,))
         self.assertTrue(local_expert.load)
         self.assertEqual(local_expert.target_ranks, (1,))
+
+    def test_redundant_expert_filter_routes_to_every_physical_owner(self):
+        model_config = types.SimpleNamespace(
+            num_layers=1,
+            phy2log_path="",
+            eplb_config=types.SimpleNamespace(phy_exp_num=lambda logical: logical + 2),
+        )
+        parallelism = types.SimpleNamespace(world_size=2, local_world_size=2)
+        expert_filter = _ExpertRangeFilter(4, 2, 1, model_config, parallelism)
+        logical_zero = "layers.0.experts.0.gate_proj.weight"
+        logical_one = "layers.0.experts.1.gate_proj.weight"
+        logical_two = "layers.0.experts.2.gate_proj.weight"
+
+        self.assertEqual(expert_filter.target_ep_ranks(logical_zero), (0, 1))
+        self.assertEqual(expert_filter.target_ep_ranks(logical_one), (0,))
+        self.assertEqual(expert_filter.target_ep_ranks(logical_two), (0, 1))
+        self.assertTrue(expert_filter.should_load(logical_zero))
+        self.assertFalse(expert_filter.should_load(logical_one))
+        self.assertTrue(expert_filter.should_load(logical_two))
+
+    def test_redundant_stacked_expert_specs_describe_shards_and_targets(self):
+        model_config = types.SimpleNamespace(
+            num_layers=1,
+            phy2log_path="",
+            eplb_config=types.SimpleNamespace(phy_exp_num=lambda logical: logical + 2),
+        )
+        expert_filter = _ExpertRangeFilter(
+            4,
+            2,
+            1,
+            model_config,
+            types.SimpleNamespace(world_size=2, local_world_size=2),
+        )
+        name = "layers.0.experts.gate_up_proj.weight"
+
+        read_specs = expert_filter.stacked_read_specs(name, (4, 2, 4))
+
+        self.assertEqual(
+            [read_spec.slices[0] for read_spec in read_specs], [0, 1, 2, 3]
+        )
+        self.assertEqual(
+            [read_spec.shard_rank for read_spec in read_specs], [0, 0, 1, 1]
+        )
+        self.assertEqual(
+            [read_spec.target_ranks for read_spec in read_specs],
+            [(0, 1), (0,), (0, 1), (1,)],
+        )
+        self.assertEqual(
+            [read_spec.slices[0] for read_spec in read_specs if read_spec.load],
+            [0, 2, 3],
+        )
+
+    def test_scratch_slices_noncontiguous_redundant_stacked_experts(self):
+        stacked = torch.arange(32, dtype=torch.float32).reshape(4, 2, 4)
+        model_config = types.SimpleNamespace(
+            num_layers=1,
+            phy2log_path="",
+            eplb_config=types.SimpleNamespace(phy_exp_num=lambda logical: logical + 2),
+        )
+        expert_filter = _ExpertRangeFilter(
+            4,
+            2,
+            1,
+            model_config,
+            types.SimpleNamespace(world_size=2, local_world_size=2),
+        )
+        name = "layers.0.experts.gate_up_proj.weight"
+
+        with tempfile.TemporaryDirectory() as model_path:
+            checkpoint = os.path.join(model_path, "model.safetensors")
+            save_file({name: stacked}, checkpoint)
+            result = list(
+                get_all_weights(
+                    [checkpoint],
+                    safetensor_slice_expander=expert_filter,
+                )
+            )
+
+        self.assertEqual(
+            [output_name for output_name, _ in result],
+            [
+                "layers.0.experts.0.gate_up_proj.weight",
+                "layers.0.experts.2.gate_up_proj.weight",
+                "layers.0.experts.3.gate_up_proj.weight",
+            ],
+        )
+        self.assertTrue(torch.equal(result[0][1], stacked[0]))
+        self.assertTrue(torch.equal(result[1][1], stacked[2]))
+        self.assertTrue(torch.equal(result[2][1], stacked[3]))
+
+    def test_identity_expert_placement_does_not_require_ep_per_node(self):
+        model_config = types.SimpleNamespace(
+            num_layers=1,
+            phy2log_path="",
+            eplb_config=types.SimpleNamespace(phy_exp_num=lambda logical: logical),
+        )
+        placement = expert_placement_for_layer(
+            model_config,
+            layer_index=0,
+            logical_expert_count=4,
+            ep_size=2,
+            ep_rank=0,
+            parallelism_config=types.SimpleNamespace(world_size=4, local_world_size=1),
+        )
+
+        self.assertTrue(placement.is_identity)
+        self.assertEqual(placement.local_physical_to_logical, (0, 1))
 
     def test_read_spec_resolver_builds_reusable_dispatch_plan(self):
         loader = self._loader("unused")
@@ -598,6 +706,83 @@ class FoundationLoaderTest(unittest.TestCase):
         )
         self.assertTrue(torch.equal(result[0][1], source[2]))
         self.assertTrue(torch.equal(result[1][1], source[3]))
+
+    def test_fst_read_spec_routes_only_redundant_stacked_expert_rows(self):
+        source = torch.arange(32, dtype=torch.float32).reshape(4, 2, 4)
+
+        class FakeGroup:
+            def __init__(self):
+                self.operations = []
+
+            def size(self):
+                return 2
+
+            def rank(self):
+                return 1
+
+            def send(self, tensor, dst_rank, tag):
+                self.operations.append(("send", dst_rank, tag))
+                self.assert_tensor = tensor.real_tensor.clone()
+
+            def recv(self, tensor, src_rank, tag):
+                self.operations.append(("recv", src_rank, tag))
+                tensor.real_tensor.copy_(source[tag])
+
+        class FakeFileBuffer:
+            def __init__(self):
+                self.pg = FakeGroup()
+                self.base_group = self.pg
+                self.sharded_dims = []
+
+            def get_shape(self, key):
+                return source.shape
+
+            def get_sharded(self, key, dim):
+                self.sharded_dims.append(dim)
+                return source[2:].clone()
+
+            def get_tensor(self, key):
+                raise AssertionError("all-expert broadcast must not be used")
+
+        model_config = types.SimpleNamespace(
+            num_layers=1,
+            phy2log_path="",
+            eplb_config=types.SimpleNamespace(phy_exp_num=lambda logical: logical + 2),
+        )
+        expert_filter = _ExpertRangeFilter(
+            4,
+            2,
+            1,
+            model_config,
+            types.SimpleNamespace(world_size=2, local_world_size=2),
+        )
+        file_buffer = FakeFileBuffer()
+        result = list(
+            iter_read_spec_tensors(
+                file_buffer,
+                ["layers.0.experts.gate_up_proj.weight"],
+                lambda name, shape: ReadSpec.full(name, shape),
+                expert_filter,
+            )
+        )
+
+        self.assertEqual(file_buffer.sharded_dims, [0])
+        self.assertEqual(
+            file_buffer.base_group.operations,
+            [("recv", 0, 0), ("send", 0, 2)],
+        )
+        self.assertTrue(torch.equal(file_buffer.base_group.assert_tensor, source[2]))
+        self.assertEqual(
+            [name for name, _ in result],
+            [
+                "layers.0.experts.0.gate_up_proj.weight",
+                "layers.0.experts.2.gate_up_proj.weight",
+                "layers.0.experts.3.gate_up_proj.weight",
+            ],
+        )
+        self.assertTrue(torch.equal(result[0][1], source[0]))
+        self.assertTrue(torch.equal(result[1][1], source[2]))
+        self.assertTrue(torch.equal(result[2][1], source[3]))
 
     def test_auto_load_method_is_preserved_without_environment_override(self):
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -1403,9 +1588,20 @@ class FoundationLoaderTest(unittest.TestCase):
         ), self.assertRaisesRegex(RuntimeError, "incompatible"):
             NewModelLoader._fastsafetensors_api()
 
-    def test_fastsafetensors_accepts_stacked_experts_for_ep_world(self):
+    def test_fastsafetensors_accepts_redundant_stacked_experts_for_ep_world(self):
         stacked = torch.arange(16, dtype=torch.float32).reshape(4, 2, 2)
-        expert_filter = _ExpertRangeFilter(num_experts=4, ep_size=2, ep_rank=1)
+        model_config = types.SimpleNamespace(
+            num_layers=1,
+            phy2log_path="",
+            eplb_config=types.SimpleNamespace(phy_exp_num=lambda logical: logical + 2),
+        )
+        expert_filter = _ExpertRangeFilter(
+            4,
+            2,
+            1,
+            model_config,
+            types.SimpleNamespace(world_size=2, local_world_size=2),
+        )
 
         with tempfile.TemporaryDirectory() as model_path:
             checkpoint = os.path.join(model_path, "model.safetensors")

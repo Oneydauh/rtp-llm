@@ -343,8 +343,6 @@ def _extract_moe_config_values(model_config: ModelConfig, load_config: Any):
         enable_eplb = enable_eplb()
     if not isinstance(enable_eplb, bool):
         raise TypeError("eplb_config.enable_eplb must be a bool")
-    if enable_eplb:
-        raise ValueError("EPLB is not supported by the Qwen2 MoE newloader path")
     values.update(
         num_experts=num_experts,
         top_k=top_k,

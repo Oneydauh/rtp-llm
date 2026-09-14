@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+#include <thread>
 #include <torch/extension.h>
 #include "rtp_llm/cpp/models/eplb/ExpertBalancerPythonWrapper.h"
 #include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
@@ -38,7 +40,8 @@ struct EplbPlanBuffers {
               size_t    moe_size,
               size_t    ep_size,
               DataType  dtype,
-              QuantAlgo quant_algo);
+              QuantAlgo quant_algo,
+              bool      allocate_weight_buffers = true);
 };
 
 struct BalanceStatsBuffers {
@@ -58,15 +61,24 @@ struct LoadFlags {
 
     void init();
 
-    void setReady(bool ready);
-    bool isReady(size_t world_size);
+    void setLoading();
+    void setReady();
+    void setFailed();
+
+    enum class SyncStatus {
+        LOADING,
+        READY,
+        FAILED,
+    };
+    SyncStatus sync(size_t world_size);
 };
 
 enum class EplbPlanStatus {
     INIT,
     PREPARING,
     LOADING,
-    LOADED
+    LOADED,
+    FAILED
 };
 
 class EplbController {
@@ -119,10 +131,16 @@ private:
     void resetPlan(bool force_clean = false);
     void createPlan();
     void updateStats(OverallExpertStats& stats);
+    void startPlanWeightLoad();
+    void joinPlanWeightLoad();
+    void rollbackPlan();
     void loadPlanWeights();
-    bool syncPlanWeightsLoadStatus();
+    LoadFlags::SyncStatus syncPlanWeightsLoadStatus(EplbPlanStatus status);
     void processPlanWeights();
     void applyPlanWeights(ModelBase& model);
+
+    void        setLoadError(std::string error);
+    std::string getLoadError() const;
 
     // helpful functions
     void copyFromTensor(const torch::Tensor& src, torch::Tensor& dst);
@@ -158,6 +176,9 @@ private:
     ExpertBalancerPythonWrapper  eplb_python_wrapper_;
 
     mutable std::mutex eplb_plan_status_mutex_;
+    mutable std::mutex load_error_mutex_;
+    std::thread        load_thread_;
+    std::string        load_error_;
 
     bool test_mode_ = false;
 };
