@@ -64,6 +64,34 @@ load("@rtp_deps//:pip.bzl", "pip_deps")
 
 pip_deps()
 
+# H20 smoke test infrastructure: the pre-warmed CUDA 12.9 pip hub predates
+# these two aliases even though the lockfile contains both wheels. Reuse the
+# intact split-wheel repositories without changing product dependencies.
+local_repository(
+    name = "pip_gpu_cuda12_9_torch_jsonschema",
+    path = "/data1/hengcang.wyd/bazel_perf_output_20260911/external/pip_gpu_cuda12_9_torch_jsonschema",
+)
+
+local_repository(
+    name = "pip_gpu_cuda12_9_torch_xgrammar",
+    path = "/data1/hengcang.wyd/bazel_perf_output_20260911/external/pip_gpu_cuda12_9_torch_xgrammar",
+)
+
+local_repository(
+    name = "pip_gpu_cuda12_9_torch_jsonschema_specifications",
+    path = "/data1/hengcang.wyd/bazel_perf_output_20260911/external/pip_gpu_cuda12_9_torch_jsonschema_specifications",
+)
+
+local_repository(
+    name = "pip_gpu_cuda12_9_torch_referencing",
+    path = "/data1/hengcang.wyd/bazel_perf_output_20260911/external/pip_gpu_cuda12_9_torch_referencing",
+)
+
+local_repository(
+    name = "pip_gpu_cuda12_9_torch_rpds_py",
+    path = "/data1/hengcang.wyd/bazel_perf_output_20260911/external/pip_gpu_cuda12_9_torch_rpds_py",
+)
+
 load("@pip_cpu_torch//:requirements.bzl", pip_cpu_torch_install_deps = "install_deps")
 pip_cpu_torch_install_deps()
 
@@ -79,14 +107,8 @@ pip_gpu_cuda12_torch_install_deps()
 load("@pip_gpu_cuda12_9_torch//:requirements.bzl", pip_gpu_cuda12_9_torch_install_deps = "install_deps")
 pip_gpu_cuda12_9_torch_install_deps()
 
-load("@pip_gpu_cuda13_torch//:requirements.bzl", pip_gpu_cuda13_torch_install_deps = "install_deps")
-pip_gpu_cuda13_torch_install_deps()
-
 load("@pip_cuda12_arm_torch//:requirements.bzl", pip_cuda12_arm_torch_install_deps = "install_deps")
 pip_cuda12_arm_torch_install_deps()
-
-load("@pip_cuda13_arm_torch//:requirements.bzl", pip_cuda13_arm_torch_install_deps = "install_deps")
-pip_cuda13_arm_torch_install_deps()
 
 load("@pip_gpu_rocm_torch//:requirements.bzl", pip_gpu_rocm_torch_install_deps = "install_deps")
 pip_gpu_rocm_torch_install_deps()

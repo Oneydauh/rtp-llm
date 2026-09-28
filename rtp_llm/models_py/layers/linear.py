@@ -55,6 +55,7 @@ class LinearBase(RtpModule):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         bias: bool = False,
+        bias_as_matrix: bool = False,
         params_dtype: torch.dtype = torch.float16,
         **kwargs,
     ):
@@ -64,6 +65,8 @@ class LinearBase(RtpModule):
         _require_positive_int(output_size, "output_size")
         if not isinstance(bias, bool):
             raise TypeError("bias must be a bool")
+        if not isinstance(bias_as_matrix, bool):
+            raise TypeError("bias_as_matrix must be a bool")
         if not isinstance(params_dtype, torch.dtype):
             raise TypeError("params_dtype must be a torch.dtype")
         self.input_size = input_size
@@ -72,6 +75,7 @@ class LinearBase(RtpModule):
         self.tp_rank = tp_rank
         self.prefix = prefix
         self.params_dtype = params_dtype
+        self.bias_as_matrix = bias_as_matrix
         self._main_weight_loaded = False
         self._loaded_parameter_names = set()
 

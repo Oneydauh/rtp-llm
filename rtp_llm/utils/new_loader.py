@@ -10,6 +10,24 @@ class NewLoaderConfigSource(Protocol):
     require_weight_update: Optional[bool]
 
 
+_INDEPENDENT_TOPOLOGY_MODEL_TYPES = frozenset(
+    {
+        "deepseek2",
+        "deepseek3",
+        "deepseek_v31",
+        "deepseek_v32",
+        "glm_5",
+        "glm4_moe_lite",
+        "kimi_k2",
+        "qwen_3",
+        "qwen_3_moe",
+        "qwen_3_tool",
+        "qwen3_vl",
+        "qwen3_vl_moe",
+    }
+)
+
+
 def is_new_loader_enabled(
     model_config: NewLoaderConfigSource, *, default_enabled: bool = False
 ) -> bool:
@@ -88,9 +106,16 @@ def new_loader_unsupported_reason(
         parallelism_config.get_ffn_tp_rank(),
     )
     physical_tp = (parallelism_config.tp_size, parallelism_config.tp_rank)
-    if parallelism_config.prefill_cp_config.is_enabled() or attn_tp != physical_tp:
+    supports_independent_topology = (
+        getattr(model_config, "model_type", None)
+        in _INDEPENDENT_TOPOLOGY_MODEL_TYPES
+    )
+    if (
+        parallelism_config.prefill_cp_config.is_enabled()
+        or attn_tp != physical_tp
+    ) and not supports_independent_topology:
         return "Context parallelism is not supported by this newloader slice"
-    if ffn_tp != attn_tp:
+    if ffn_tp != attn_tp and not supports_independent_topology:
         return (
             "Independent FFN TP/sequence parallelism is not supported by this "
             "newloader slice"

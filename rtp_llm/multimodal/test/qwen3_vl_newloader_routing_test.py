@@ -67,6 +67,42 @@ def _model_config_json():
 
 
 class Qwen3VLNewLoaderRoutingTest(unittest.TestCase):
+    def test_qwen3_vl_mixin_forwards_fst_to_standalone_vision_loader(self):
+        visual = torch.nn.Identity()
+        visual.spatial_merge_size = 2
+        mm_related_params = types.SimpleNamespace(
+            config={"ckpt_path": "/tmp/model"},
+            vit_weights=object(),
+        )
+        processor = types.SimpleNamespace(image_processor=None)
+
+        with mock.patch(
+            "rtp_llm.multimodal.multimodal_mixins.qwen3_vl_mixin."
+            "AutoProcessor.from_pretrained",
+            return_value=processor,
+        ), mock.patch(
+            "rtp_llm.models_py.new_models.qwen3_vl.vision.load_qwen3_vl_vision",
+            return_value=visual,
+        ) as load_vision:
+            mixin = Qwen3_VLMixin.__new__(Qwen3_VLMixin)
+            mixin.compute_dtype = torch.float16
+            mixin.device = "cuda"
+            mixin.mm_related_params = mm_related_params
+            mixin.load_method = LoadMethod.FASTSAFETENSORS
+            mixin.ckpt_path = "/tmp/model"
+            mixin.use_new_loader = True
+            mixin._init_multimodal()
+
+        load_vision.assert_called_once_with(
+            vision_config=mm_related_params.config,
+            model_path="/tmp/model",
+            compute_dtype=torch.float16,
+            device="cuda",
+            load_method=LoadMethod.FASTSAFETENSORS,
+        )
+        self.assertIs(mixin.mm_part.visual, visual)
+        self.assertIsNone(mm_related_params.vit_weights)
+
     def test_qwen3_vl_mixin_uses_standalone_newloader_vision(self):
         vision_config = _vision_config()
         source = Qwen3VLForVisionEmbedding(

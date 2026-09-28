@@ -378,15 +378,6 @@ def _extract_config_values(
         _positive_int(size, f"{name} size")
         if isinstance(rank, bool) or not isinstance(rank, int) or not 0 <= rank < size:
             raise ValueError(f"Invalid {name} partition: rank={rank}, size={size}")
-    if (attn_tp_size, attn_tp_rank) != (tp_size, tp_rank):
-        raise ValueError(
-            "Context parallelism is not supported by the Qwen dense newloader slice"
-        )
-    if (ffn_tp_size, ffn_tp_rank) != (attn_tp_size, attn_tp_rank):
-        raise ValueError(
-            "Independent FFN TP/sequence parallelism is not supported by the "
-            "Qwen dense newloader slice"
-        )
     if (lm_head_tp_size, lm_head_tp_rank) != (tp_size, tp_rank):
         raise ValueError(
             "A separate LM head topology is not supported by the Qwen dense "
@@ -417,15 +408,6 @@ def _extract_config_values(
 
 
 def _validate_supported_parallelism(parallelism_config: Any) -> None:
-    prefill_cp = getattr(parallelism_config, "prefill_cp_config", None)
-    if prefill_cp is not None:
-        for checker_name in ("is_enabled", "is_prefill_enabled"):
-            checker = getattr(prefill_cp, checker_name, None)
-            if callable(checker) and bool(checker()):
-                raise ValueError(
-                    "Context parallelism is not supported by the Qwen dense "
-                    "newloader slice"
-                )
     ffn_disaggregate = getattr(parallelism_config, "ffn_disaggregate_config", None)
     if bool(getattr(ffn_disaggregate, "enable_ffn_disaggregate", False)):
         raise ValueError(

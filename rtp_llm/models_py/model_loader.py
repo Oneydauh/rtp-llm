@@ -249,9 +249,9 @@ class _StagedFSTLoadCoordinator:
     def handles(self, child: nn.Module) -> bool:
         return child in self._module_names
 
-    def load_child(self, child: nn.Module, weights: Any) -> None:
+    def prepare_child(self, child: nn.Module) -> None:
+        """Materialize one staged leaf before a custom parent writes into it."""
         if child not in self._module_names:
-            child.load_weights(weights)
             return
         if child in self._finalized:
             raise RuntimeError(
@@ -266,10 +266,27 @@ class _StagedFSTLoadCoordinator:
             self._peak_active = max(
                 self._peak_active, len(self._prepared - self._finalized)
             )
-        child.load_weights(weights)
+
+    def finalize_child_if_complete(self, child: nn.Module) -> None:
+        """Postprocess a prepared leaf once its logical checkpoint is complete."""
+        if child not in self._module_names:
+            return
+        if child not in self._prepared:
+            raise RuntimeError(
+                "Staged checkpoint completion was reported before preparation for "
+                f"{self._module_names[child]} ({type(child).__name__})"
+            )
         if child.checkpoint_load_complete():
             child.process_weights_after_loading()
             self._finalized.add(child)
+
+    def load_child(self, child: nn.Module, weights: Any) -> None:
+        if child not in self._module_names:
+            child.load_weights(weights)
+            return
+        self.prepare_child(child)
+        child.load_weights(weights)
+        self.finalize_child_if_complete(child)
 
     def finish(self) -> None:
         unfinished = [
@@ -1258,7 +1275,16 @@ class NewModelLoader:
         return process_group
 
     @staticmethod
-    def _fastsafetensors_bbuf_size_kb(checkpoint_files: List[str]) -> int:
+    def _fastsafetensors_bbuf_size_kb(
+        checkpoint_files: List[str], *, use_host_staging: bool = False
+    ) -> int:
+        # The nogds and SHM readers allocate this bounce buffer as pinned host
+        # memory for every loader rank.  Sizing it to a multi-GiB checkpoint
+        # shard can exhaust the process/container memlock budget before the
+        # first read.  Keep the library's 16 MiB default for host staging;
+        # shard-sized buffering is useful only for GDS.
+        if use_host_staging:
+            return _FASTSAFETENSORS_MIN_BBUF_SIZE_KB
         max_shard_bytes = max(os.path.getsize(path) for path in checkpoint_files)
         max_shard_kb = (max_shard_bytes + 1023) // 1024
         return min(
@@ -1267,14 +1293,116 @@ class NewModelLoader:
         )
 
     @staticmethod
-    def _cuda_cufile_available() -> bool:
+    def _checkpoint_uses_local_block_device(
+        checkpoint_files: List[str],
+    ) -> Optional[bool]:
+        """Whether any selected checkpoint resides on a visible block device."""
+        if platform.system() != "Linux" or not checkpoint_files:
+            return None
+        sys_block_devices = "/sys/dev/block"
+        if not os.path.isdir(sys_block_devices):
+            return None
+        try:
+            devices = {
+                os.stat(os.path.realpath(os.fspath(path))).st_dev
+                for path in checkpoint_files
+            }
+        except OSError:
+            return None
+        return any(
+            os.path.exists(
+                os.path.join(
+                    sys_block_devices,
+                    f"{os.major(device)}:{os.minor(device)}",
+                )
+            )
+            for device in devices
+        )
+
+    @staticmethod
+    def _cuda_local_gds_prerequisites_available(
+        checkpoint_files: List[str],
+    ) -> bool:
+        """Quickly reject local block mounts that cannot provide a GDS path.
+
+        Local block storage GDS needs either nvidia-fs or the upstream PCI
+        P2PDMA support used by CUDA 12.8+.  Non-block filesystems remain
+        subject to the native cuFile registration probe because vendor/RDMA
+        implementations have different prerequisites.
+        """
+        uses_local_block_device = NewModelLoader._checkpoint_uses_local_block_device(
+            checkpoint_files
+        )
+        if uses_local_block_device is not True:
+            return True
+        if os.path.exists("/sys/module/nvidia_fs"):
+            return True
+        try:
+            # ``/proc/kallsyms`` can contain hundreds of thousands of entries.
+            # A decoded Python line loop costs seconds on large hosts, so keep
+            # the capability check in one binary read/search.
+            with open("/proc/kallsyms", "rb") as kallsyms:
+                return b" p2pdma_pgmap_ops" in kallsyms.read()
+        except OSError:
+            # Fail open when the container hides kernel capability information;
+            # the shard registration probe below remains the source of truth.
+            return True
+
+    @staticmethod
+    def _cuda_cufile_available(
+        checkpoint_files: Optional[List[str]] = None,
+    ) -> bool:
         """Use fastsafetensors' native probe as the GDS source of truth."""
+        if (
+            checkpoint_files
+            and not NewModelLoader._cuda_local_gds_prerequisites_available(
+                checkpoint_files
+            )
+        ):
+            logger.info(
+                "Local checkpoint filesystem has neither nvidia-fs nor "
+                "PCI P2PDMA support; skipping libcufile initialization"
+            )
+            return False
         try:
             from fastsafetensors import cpp as fastsafetensors_cpp
         except (ImportError, OSError, RuntimeError):
             return False
         try:
-            return bool(fastsafetensors_cpp.is_cufile_found())
+            # The native backend discovers libcufile lazily.  Querying before
+            # this initialization always reports False even when CUDA ships a
+            # usable libcufile.so, which silently forced every CUDA load onto
+            # the much slower nogds path.
+            fastsafetensors_cpp.load_nvidia_functions()
+            if not fastsafetensors_cpp.is_cufile_found():
+                return False
+            if checkpoint_files:
+                if fastsafetensors_cpp.init_gds() != 0:
+                    return False
+                # Probe the smallest shard first.  Tail shards are commonly
+                # smaller and are also the most likely to expose filesystem or
+                # direct-I/O registration constraints.  A failing checkpoint
+                # then falls back before paying registration cost for every
+                # multi-GiB shard.
+                registration_order = sorted(
+                    checkpoint_files, key=lambda path: os.path.getsize(path)
+                )
+                for path in registration_order:
+                    try:
+                        handle = fastsafetensors_cpp.gds_file_handle(
+                            os.fspath(path), False, True
+                        )
+                        del handle
+                    except (OSError, RuntimeError) as exc:
+                        logger.warning(
+                            "libcufile cannot register checkpoint shard %s; "
+                            "NewLoader fastsafetensors is falling back to the "
+                            "CUDA nogds path: %s",
+                            path,
+                            exc,
+                        )
+                        return False
+            return True
         except (AttributeError, OSError, RuntimeError):
             return False
 
@@ -1291,7 +1419,10 @@ class NewModelLoader:
         return "Cuda"
 
     @staticmethod
-    def _fastsafetensors_use_nogds(device: torch.device) -> bool:
+    def _fastsafetensors_use_nogds(
+        device: torch.device,
+        checkpoint_files: Optional[List[str]] = None,
+    ) -> bool:
         if device.type == "cpu":
             return True
         if os.environ.get("FASTSAFETENSORS_NOGDS", "0") == "1":
@@ -1299,11 +1430,12 @@ class NewModelLoader:
         if (
             device.type == "cuda"
             and torch.version.hip is None
-            and not NewModelLoader._cuda_cufile_available()
+            and not NewModelLoader._cuda_cufile_available(checkpoint_files)
         ):
             logger.warning(
-                "libcufile.so is unavailable; NewLoader fastsafetensors is "
-                "falling back to the CUDA nogds path"
+                "libcufile.so is unavailable or cannot register the selected "
+                "checkpoint shards; NewLoader fastsafetensors is falling back "
+                "to the CUDA nogds path"
             )
             return True
         return False
@@ -1311,6 +1443,7 @@ class NewModelLoader:
     @staticmethod
     def _fastsafetensors_backend_options(
         device: torch.device,
+        checkpoint_files: Optional[List[str]] = None,
     ) -> Tuple[bool, bool]:
         """Return ``(nogds, use_shm)`` for the active accelerator backend.
 
@@ -1318,7 +1451,19 @@ class NewModelLoader:
         Therefore CUDA GDS must set both flags to false; enabling ``use_shm``
         would silently select the shared-memory reader instead of GDS.
         """
-        use_nogds = NewModelLoader._fastsafetensors_use_nogds(device)
+        force_nogds = os.environ.get("FASTSAFETENSORS_NOGDS", "0") == "1"
+        if force_nogds:
+            return True, False
+        force_shm = (
+            device.type == "cuda"
+            and torch.version.hip is None
+            and os.environ.get("FASTSAFETENSORS_USE_SHM", "0") == "1"
+        )
+        if force_shm:
+            return False, True
+        use_nogds = NewModelLoader._fastsafetensors_use_nogds(
+            device, checkpoint_files
+        )
         use_shm = (
             device.type == "cuda" and torch.version.hip is not None and not use_nogds
         )
@@ -1421,9 +1566,27 @@ class NewModelLoader:
                     f"CUDA device range [0, {device_count})"
                 )
 
-        distributed_reason = self._fastsafetensors_distributed_reason(expert_filter)
-        if distributed_reason is not None:
-            return distributed_reason
+        isolated_load = bool(
+            getattr(model, "fastsafetensors_load_isolated", False)
+        )
+        if isolated_load:
+            if (
+                self.load_config.tp_size != 1
+                or self.load_config.tp_rank != 0
+                or self.load_config.ep_size != 1
+                or self.load_config.ep_rank != 0
+                or expert_filter is not None
+            ):
+                return (
+                    "isolated fastsafetensors loading requires TP=1, EP=1, "
+                    "rank zero, and no expert checkpoint routing"
+                )
+        else:
+            distributed_reason = self._fastsafetensors_distributed_reason(
+                expert_filter
+            )
+            if distributed_reason is not None:
+                return distributed_reason
 
         try:
             ParallelLoader, _ = self._fastsafetensors_api()
@@ -1467,12 +1630,21 @@ class NewModelLoader:
                 else target_device.index
             )
             try:
+                use_nogds, use_shm = self._fastsafetensors_backend_options(
+                    target_device, checkpoint_files
+                )
                 free_bytes, _ = torch.cuda.mem_get_info(device_index)
                 model_bytes = self._model_storage_bytes(model)
                 max_shard_bytes = max(
                     os.path.getsize(path) for path in checkpoint_files
                 )
-                bbuf_bytes = self._fastsafetensors_bbuf_size_kb(checkpoint_files) * 1024
+                bbuf_bytes = (
+                    self._fastsafetensors_bbuf_size_kb(
+                        checkpoint_files,
+                        use_host_staging=use_nogds or use_shm,
+                    )
+                    * 1024
+                )
             except (OSError, RuntimeError, ValueError) as exc:
                 return f"cannot determine fastsafetensors memory safety: {exc}"
             required_bytes = model_bytes + 3 * max(max_shard_bytes, bbuf_bytes)
@@ -1542,7 +1714,16 @@ class NewModelLoader:
             automatic=automatic,
             expert_filter=expert_filter,
         )
-        reason = self._synchronize_fastsafetensors_prerequisite(reason)
+        # Most distributed loads must make one consistent backend decision,
+        # including replicated TP=1/DP ranks.  A small number of auxiliary
+        # modules are intentionally instantiated on only one rank, however;
+        # those modules use fastsafetensors' SingleGroup and must not enter a
+        # WORLD collective whose other ranks will never call this loader.
+        isolated_load = bool(
+            getattr(model, "fastsafetensors_load_isolated", False)
+        )
+        if not isolated_load:
+            reason = self._synchronize_fastsafetensors_prerequisite(reason)
         if reason is None:
             selected = NewLoaderLoadMethod.FASTSAFETENSORS
             logger.info(
@@ -1584,9 +1765,18 @@ class NewModelLoader:
         if target_device.type == "cuda" and target_device.index is None:
             loader_device = f"cuda:{torch.cuda.current_device()}"
         use_nogds, use_shm = NewModelLoader._fastsafetensors_backend_options(
-            target_device
+            target_device, checkpoint_files
         )
-        bbuf_size_kb = NewModelLoader._fastsafetensors_bbuf_size_kb(checkpoint_files)
+        bbuf_size_kb = NewModelLoader._fastsafetensors_bbuf_size_kb(
+            checkpoint_files, use_host_staging=use_nogds or use_shm
+        )
+        logger.info(
+            "NewLoader fastsafetensors backend: nogds=%s, use_shm=%s, "
+            "bbuf_size=%.2fMiB",
+            use_nogds,
+            use_shm,
+            bbuf_size_kb / 1024,
+        )
         loader_kwargs = dict(
             pg=process_group,
             hf_weights_files=sorted(os.fspath(path) for path in checkpoint_files),

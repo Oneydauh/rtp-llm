@@ -1,5 +1,6 @@
 import json
 import os
+import platform
 import sys
 import tempfile
 import types
@@ -39,7 +40,10 @@ from rtp_llm.models_py.weight_mapper import (
     get_all_weights,
     select_safetensor_files,
 )
-from rtp_llm.utils.new_loader import is_new_loader_enabled
+from rtp_llm.utils.new_loader import (
+    is_new_loader_enabled,
+    new_loader_unsupported_reason,
+)
 from safetensors.torch import save_file
 
 
@@ -192,6 +196,50 @@ class FoundationLoaderTest(unittest.TestCase):
         self.assertFalse(is_new_loader_enabled(config, default_enabled=True))
         config.use_new_loader = True
         self.assertTrue(is_new_loader_enabled(config, default_enabled=False))
+
+    def test_loader_routing_allows_independent_topology_only_for_capable_models(self):
+        def model_config(model_type):
+            return types.SimpleNamespace(
+                model_type=model_type,
+                use_new_loader=True,
+                require_weight_update=False,
+                enable_output_vocab_pruning=False,
+                eplb_config=types.SimpleNamespace(enable_eplb=lambda: False),
+                expert_num=0,
+                ptuning_path="",
+                lora_infos={},
+                quant_config=None,
+            )
+
+        parallelism = types.SimpleNamespace(
+            tp_size=2,
+            tp_rank=1,
+            get_attn_tp_size=lambda: 1,
+            get_attn_tp_rank=lambda: 0,
+            get_ffn_tp_size=lambda: 2,
+            get_ffn_tp_rank=lambda: 1,
+            prefill_cp_config=types.SimpleNamespace(is_enabled=lambda: True),
+            ffn_disaggregate_config=types.SimpleNamespace(
+                enable_ffn_disaggregate=False
+            ),
+        )
+
+        self.assertIsNone(
+            new_loader_unsupported_reason(
+                model_config("glm_5"), parallelism_config=parallelism
+            )
+        )
+        self.assertIsNone(
+            new_loader_unsupported_reason(
+                model_config("qwen_3"), parallelism_config=parallelism
+            )
+        )
+        self.assertEqual(
+            new_loader_unsupported_reason(
+                model_config("qwen_2"), parallelism_config=parallelism
+            ),
+            "Context parallelism is not supported by this newloader slice",
+        )
 
     def _loader(self, model_path, **kwargs):
         config = types.SimpleNamespace(model_type="foundation_test_model")
@@ -1420,6 +1468,22 @@ class FoundationLoaderTest(unittest.TestCase):
         self.assertEqual(loader_kwargs["bbuf_size_kb"], 16 * 1024)
         close.assert_called_once_with()
 
+    def test_fastsafetensors_nogds_bounds_pinned_bounce_buffer(self):
+        four_gib = 4 * 1024 * 1024 * 1024
+        with mock.patch.object(os.path, "getsize", return_value=four_gib):
+            self.assertEqual(
+                NewModelLoader._fastsafetensors_bbuf_size_kb(
+                    ["large.safetensors"], use_host_staging=True
+                ),
+                16 * 1024,
+            )
+            self.assertEqual(
+                NewModelLoader._fastsafetensors_bbuf_size_kb(
+                    ["large.safetensors"], use_host_staging=False
+                ),
+                2 * 1024 * 1024,
+            )
+
     def test_fastsafetensors_postprocesses_online_quantized_leaves_as_they_complete(
         self,
     ):
@@ -1751,6 +1815,38 @@ class FoundationLoaderTest(unittest.TestCase):
 
         self.assertIs(loader_kwargs["pg"], single_group)
 
+    def test_fastsafetensors_isolated_rank_skips_world_prerequisite_sync(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            checkpoint = os.path.join(model_path, "model.safetensors")
+            save_file(_weights(), checkpoint)
+            loader = self._loader(
+                model_path,
+                tp_size=1,
+                tp_rank=0,
+                load_method=NewLoaderLoadMethod.FASTSAFETENSORS,
+            )
+            model = _FoundationModel(None, None)
+            model.fastsafetensors_load_isolated = True
+            with mock.patch.object(
+                loader,
+                "_fastsafetensors_api",
+                return_value=(mock.Mock(), mock.Mock()),
+            ), mock.patch.object(
+                torch.distributed, "is_initialized", return_value=True
+            ), mock.patch.object(
+                torch.distributed, "get_world_size", return_value=2
+            ), mock.patch.object(
+                torch.distributed, "all_gather_object"
+            ) as all_gather:
+                selected = loader._select_load_method(
+                    NewLoaderLoadMethod.FASTSAFETENSORS,
+                    model,
+                    [checkpoint],
+                )
+
+        self.assertEqual(selected, NewLoaderLoadMethod.FASTSAFETENSORS)
+        all_gather.assert_not_called()
+
     def test_fastsafetensors_uses_world_group_for_ep_routing(self):
         loader_kwargs = {}
 
@@ -1953,15 +2049,206 @@ class FoundationLoaderTest(unittest.TestCase):
         self.assertFalse(loader_kwargs["nogds"])
         self.assertFalse(loader_kwargs["use_shm"])
 
+    def test_fastsafetensors_explicit_cuda_shm_uses_small_buffer(self):
+        loader_kwargs = {}
+
+        class FakeSingleGroup:
+            def rank(self):
+                return 0
+
+        class FakeParallelLoader:
+            def __init__(self, **kwargs):
+                loader_kwargs.update(kwargs)
+                self.loader = types.SimpleNamespace(close=mock.Mock())
+
+            def iterate_weights(self):
+                return iter(())
+
+        fake_fastsafetensors = types.ModuleType("fastsafetensors")
+        fake_fastsafetensors.ParallelLoader = FakeParallelLoader
+        fake_fastsafetensors.SingleGroup = FakeSingleGroup
+
+        with tempfile.TemporaryDirectory() as model_path:
+            checkpoint = os.path.join(model_path, "model.safetensors")
+            save_file({"value": torch.ones(1)}, checkpoint)
+            with mock.patch.dict(
+                sys.modules, {"fastsafetensors": fake_fastsafetensors}
+            ), mock.patch.dict(
+                os.environ, {"FASTSAFETENSORS_USE_SHM": "1"}, clear=True
+            ), mock.patch.object(
+                torch.version, "hip", None
+            ), mock.patch.object(
+                NewModelLoader, "_cuda_cufile_available"
+            ) as cufile_probe:
+                list(
+                    self._loader("unused")._fastsafetensors_weights_iterator(
+                        [checkpoint], "cuda:0", None, None
+                    )
+                )
+
+        self.assertFalse(loader_kwargs["nogds"])
+        self.assertTrue(loader_kwargs["use_shm"])
+        self.assertEqual(loader_kwargs["bbuf_size_kb"], 16 * 1024)
+        cufile_probe.assert_not_called()
+
     def test_cuda_cufile_probe_uses_fastsafetensors_backend(self):
         fake_fastsafetensors = types.ModuleType("fastsafetensors")
-        fake_fastsafetensors.cpp = types.SimpleNamespace(is_cufile_found=lambda: False)
+        initialize = mock.Mock()
+        probe = mock.Mock(return_value=False)
+        fake_fastsafetensors.cpp = types.SimpleNamespace(
+            load_nvidia_functions=initialize,
+            is_cufile_found=probe,
+        )
         with mock.patch.dict(sys.modules, {"fastsafetensors": fake_fastsafetensors}):
             self.assertFalse(NewModelLoader._cuda_cufile_available())
+        initialize.assert_called_once_with()
+        probe.assert_called_once_with()
 
-        fake_fastsafetensors.cpp = types.SimpleNamespace(is_cufile_found=lambda: True)
+    def test_cuda_cufile_probe_checks_checkpoint_registration(self):
+        fake_fastsafetensors = types.ModuleType("fastsafetensors")
+        register = mock.Mock()
+        fake_fastsafetensors.cpp = types.SimpleNamespace(
+            load_nvidia_functions=mock.Mock(),
+            is_cufile_found=mock.Mock(return_value=True),
+            init_gds=mock.Mock(return_value=0),
+            gds_file_handle=register,
+        )
+        sizes = {"first.safetensors": 2, "second.safetensors": 1}
+        with mock.patch.dict(
+            sys.modules, {"fastsafetensors": fake_fastsafetensors}
+        ), mock.patch.object(os.path, "getsize", side_effect=sizes.__getitem__):
+            with mock.patch.object(
+                NewModelLoader,
+                "_cuda_local_gds_prerequisites_available",
+                return_value=True,
+            ):
+                self.assertTrue(
+                    NewModelLoader._cuda_cufile_available(
+                        ["first.safetensors", "second.safetensors"]
+                    )
+                )
+        self.assertEqual(
+            register.call_args_list,
+            [
+                mock.call("second.safetensors", False, True),
+                mock.call("first.safetensors", False, True),
+            ],
+        )
+
+        register.side_effect = RuntimeError("cuFileHandleRegister failed")
+        with mock.patch.dict(
+            sys.modules, {"fastsafetensors": fake_fastsafetensors}
+        ), mock.patch.object(os.path, "getsize", return_value=1), mock.patch.object(
+            NewModelLoader,
+            "_cuda_local_gds_prerequisites_available",
+            return_value=True,
+        ):
+            self.assertFalse(
+                NewModelLoader._cuda_cufile_available(["unsupported.safetensors"])
+            )
+
+        initialize = mock.Mock()
+        probe = mock.Mock(return_value=True)
+        fake_fastsafetensors.cpp = types.SimpleNamespace(
+            load_nvidia_functions=initialize,
+            is_cufile_found=probe,
+        )
         with mock.patch.dict(sys.modules, {"fastsafetensors": fake_fastsafetensors}):
             self.assertTrue(NewModelLoader._cuda_cufile_available())
+        initialize.assert_called_once_with()
+        probe.assert_called_once_with()
+
+    def test_cuda_cufile_skips_registration_without_local_gds_prerequisites(self):
+        fake_fastsafetensors = types.ModuleType("fastsafetensors")
+        register = mock.Mock()
+        fake_fastsafetensors.cpp = types.SimpleNamespace(
+            load_nvidia_functions=mock.Mock(),
+            is_cufile_found=mock.Mock(return_value=True),
+            init_gds=mock.Mock(return_value=0),
+            gds_file_handle=register,
+        )
+        with mock.patch.dict(
+            sys.modules, {"fastsafetensors": fake_fastsafetensors}
+        ), mock.patch.object(
+            NewModelLoader,
+            "_cuda_local_gds_prerequisites_available",
+            return_value=False,
+        ):
+            self.assertFalse(
+                NewModelLoader._cuda_cufile_available(["model.safetensors"])
+            )
+        fake_fastsafetensors.cpp.init_gds.assert_not_called()
+        fake_fastsafetensors.cpp.load_nvidia_functions.assert_not_called()
+        register.assert_not_called()
+
+    def test_cuda_local_gds_prerequisites(self):
+        with mock.patch.object(
+            NewModelLoader,
+            "_checkpoint_uses_local_block_device",
+            return_value=True,
+        ), mock.patch.object(os.path, "exists", return_value=False), mock.patch(
+            "builtins.open",
+            mock.mock_open(read_data=b"00000000 d unrelated_symbol\n"),
+        ):
+            self.assertFalse(
+                NewModelLoader._cuda_local_gds_prerequisites_available(
+                    ["model.safetensors"]
+                )
+            )
+
+        with mock.patch.object(
+            NewModelLoader,
+            "_checkpoint_uses_local_block_device",
+            return_value=True,
+        ), mock.patch.object(os.path, "exists", return_value=False), mock.patch(
+            "builtins.open",
+            mock.mock_open(read_data=b"00000000 d p2pdma_pgmap_ops\n"),
+        ):
+            self.assertTrue(
+                NewModelLoader._cuda_local_gds_prerequisites_available(
+                    ["model.safetensors"]
+                )
+            )
+
+        with mock.patch.object(
+            NewModelLoader,
+            "_checkpoint_uses_local_block_device",
+            return_value=False,
+        ):
+            self.assertTrue(
+                NewModelLoader._cuda_local_gds_prerequisites_available(
+                    ["model.safetensors"]
+                )
+            )
+
+    def test_checkpoint_local_block_device_detection(self):
+        block_device = os.makedev(259, 2)
+        stat_result = types.SimpleNamespace(st_dev=block_device)
+        with mock.patch.object(
+            platform, "system", return_value="Linux"
+        ), mock.patch.object(os.path, "isdir", return_value=True), mock.patch.object(
+            os, "stat", return_value=stat_result
+        ), mock.patch.object(
+            os.path,
+            "exists",
+            side_effect=lambda path: path == "/sys/dev/block/259:2",
+        ):
+            self.assertTrue(
+                NewModelLoader._checkpoint_uses_local_block_device(
+                    ["/data1/models/model.safetensors"]
+                )
+            )
+
+        with mock.patch.object(
+            platform, "system", return_value="Linux"
+        ), mock.patch.object(os.path, "isdir", return_value=True), mock.patch.object(
+            os, "stat", return_value=stat_result
+        ), mock.patch.object(os.path, "exists", return_value=False):
+            self.assertFalse(
+                NewModelLoader._checkpoint_uses_local_block_device(
+                    ["/mnt/nas/model.safetensors"]
+                )
+            )
 
     def test_auto_falls_back_on_rocm(self):
         loader = NewModelLoader(

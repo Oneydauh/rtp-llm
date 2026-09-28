@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from PIL import Image
-from transformers import AutoProcessor, Qwen2VLImageProcessor
+from transformers import AutoProcessor
 
 from rtp_llm.config.py_config_modules import VitConfig
 from rtp_llm.multimodal.multimodal_mixin_register import register_multimodal_mixin
@@ -42,9 +42,6 @@ except Exception as e:
 class Qwen3_5MoeImageEmbedding(Qwen3_VLImageEmbedding):
     def __init__(self, mm_related_params: VitParameters):
         self.mm_processor = AutoProcessor.from_pretrained(
-            mm_related_params.config["ckpt_path"]
-        )
-        self.mm_processor.image_processor = Qwen2VLImageProcessor.from_pretrained(
             mm_related_params.config["ckpt_path"]
         )
         config_hf = Qwen3_5MoeVisionConfig.from_pretrained(

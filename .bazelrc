@@ -5,7 +5,7 @@ fetch:downloader --experimental_remote_downloader=grpc://com.taobao.search.bazel
 build --python_top=//:python310 --incompatible_use_python_toolchains=false # force use /opt/conda310/bin/python3
 
 build --spawn_strategy=local # avoid nvcc conflicts
-build --action_env PYTHON_BIN_PATH="/opt/conda310/bin/python3"
+build --action_env PYTHON_BIN_PATH="/data1/chuzihao.czh/miniforge3/bin/python"
 build --cxxopt="-std=c++17" --copt="-DGTEST_USE_OWN_TR1_TUPLE=0" --copt="-DEIGEN_MAX_CPP_VER=11"
 build -c opt
 build --copt -O2

@@ -84,6 +84,7 @@ class Qwen2Attention(RtpModule):
         params_dtype: torch.dtype = torch.float16,
         prefix: str = "self_attn",
         qkv_bias: bool = True,
+        qkv_bias_as_matrix: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -103,6 +104,7 @@ class Qwen2Attention(RtpModule):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
             bias=qkv_bias,
+            bias_as_matrix=qkv_bias_as_matrix,
             params_dtype=params_dtype,
         )
         self.o_proj = RowParallelLinear(
@@ -149,6 +151,7 @@ class Qwen2DecoderLayer(RtpModule):
         rms_norm_eps: float = 1e-6,
         prefix: str = "layer",
         qkv_bias: bool = True,
+        qkv_bias_as_matrix: bool = False,
     ):
         super().__init__()
         self.input_layernorm = RMSNorm(
@@ -166,6 +169,7 @@ class Qwen2DecoderLayer(RtpModule):
             params_dtype=params_dtype,
             prefix=f"{prefix}.self_attn",
             qkv_bias=qkv_bias,
+            qkv_bias_as_matrix=qkv_bias_as_matrix,
         )
         self.post_attention_layernorm = RMSNorm(
             hidden_size, eps=rms_norm_eps, params_dtype=params_dtype
@@ -426,6 +430,9 @@ class Qwen2ForCausalLM(GptModelBase):
 
         cfg = _extract_config_values(model_config, load_config)
         _validate_supported_parallelism(parallelism_config)
+        dp_size = getattr(parallelism_config, "dp_size", 1)
+        if isinstance(dp_size, bool) or not isinstance(dp_size, int) or dp_size <= 0:
+            raise ValueError(f"DP size must be a positive integer, got {dp_size!r}")
         self.tie_word_embeddings = (
             bool(model_config.get("tie_word_embeddings", False))
             if isinstance(model_config, dict)
@@ -477,6 +484,10 @@ class Qwen2ForCausalLM(GptModelBase):
                     rms_norm_eps=cfg["rms_norm_eps"],
                     prefix=f"layers.{i}",
                     qkv_bias=self.QKV_BIAS,
+                    # Legacy DP assembly retains QKV bias as [1, N], which
+                    # selects a distinct BF16 add path from the rank-local [N]
+                    # form. Preserve that numerical contract for golden parity.
+                    qkv_bias_as_matrix=dp_size > 1,
                 )
                 for i in range(cfg["num_layers"])
             ]

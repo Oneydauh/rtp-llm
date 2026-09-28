@@ -645,6 +645,11 @@ def _vision_config_from_model(
 
 
 class Qwen3VLForVisionEmbedding(RtpModule):
+    # Local multimodal preprocessing constructs this auxiliary model on rank 0
+    # only, even when the language model uses multiple distributed ranks.
+    # Its checkpoint load is therefore process-local rather than collective.
+    fastsafetensors_load_isolated = True
+
     WEIGHTS_MAPPER = WeightsMapper(
         prefix_mapping={"model.visual.": "visual."},
     )
@@ -702,6 +707,7 @@ def load_qwen3_vl_vision(
     model_path: str,
     compute_dtype: torch.dtype,
     device: str,
+    load_method: NewLoaderLoadMethod | str = NewLoaderLoadMethod.SCRATCH,
 ) -> Qwen3VLVisionTransformer:
     model_config = {
         "model_type": "qwen3_vl_vision",
@@ -711,7 +717,7 @@ def load_qwen3_vl_vision(
     load_config = NewLoaderConfig(
         compute_dtype=compute_dtype,
         device=device,
-        load_method=NewLoaderLoadMethod.SCRATCH,
+        load_method=load_method,
     )
     loader = NewModelLoader(
         model_config=model_config,

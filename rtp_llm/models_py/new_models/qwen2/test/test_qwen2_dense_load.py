@@ -204,6 +204,8 @@ class Qwen2LoadTest(unittest.TestCase):
         cp_enabled=False,
         prefill_cp_enabled=False,
         ffn_disaggregate=False,
+        dp_size=1,
+        dp_rank=0,
     ):
         attn_tp_size = tp_size if attn_tp_size is None else attn_tp_size
         attn_tp_rank = tp_rank if attn_tp_rank is None else attn_tp_rank
@@ -216,6 +218,8 @@ class Qwen2LoadTest(unittest.TestCase):
             tp_rank=tp_rank,
             ep_size=1,
             ep_rank=0,
+            dp_size=dp_size,
+            dp_rank=dp_rank,
             prefill_cp_config=types.SimpleNamespace(
                 is_enabled=lambda: cp_enabled,
                 is_prefill_enabled=lambda: prefill_cp_enabled,
@@ -286,6 +290,23 @@ class Qwen2LoadTest(unittest.TestCase):
             set(model.runtime_weight_view()),
             {"embedding", "final_layernorm.gamma", "lm_head"},
         )
+
+    def test_qwen2_qkv_preserves_legacy_bias_shape_by_dp_topology(self):
+        for dp_size, expected_shape in ((1, (8,)), (2, (1, 8))):
+            with self.subTest(dp_size=dp_size):
+                model = Qwen2ForCausalLM(
+                    self._config(), self._load_config(dp_size=dp_size)
+                )
+                qkv_proj = model.layers[0].self_attn.qkv_proj
+
+                self.assertEqual(qkv_proj.bias_as_matrix, dp_size > 1)
+                with patch(
+                    "torch.nn.functional.linear",
+                    return_value=torch.empty(1, qkv_proj.output_size),
+                ) as linear:
+                    qkv_proj(torch.ones(1, qkv_proj.input_size))
+
+                self.assertEqual(tuple(linear.call_args.args[2].shape), expected_shape)
 
     def test_untied_model_rejects_missing_lm_head(self):
         config = self._config()

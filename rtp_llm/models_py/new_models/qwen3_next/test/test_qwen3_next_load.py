@@ -7,7 +7,11 @@ from unittest import mock
 
 import torch
 from rtp_llm.config.model_config import ModelConfig
-from rtp_llm.models_py.model_loader import NewLoaderConfig, NewModelLoader
+from rtp_llm.models_py.model_loader import (
+    NewLoaderConfig,
+    NewModelLoader,
+    _StagedFSTLoadCoordinator,
+)
 from rtp_llm.models_py.new_models.qwen3_next.language import (
     Qwen3NextForCausalLM,
     Qwen3NextGatedDeltaNet,
@@ -234,6 +238,47 @@ def _mtp_weights(embedding_prefix="model.language_model."):
 
 
 class Qwen3NextLoadTest(unittest.TestCase):
+    def test_multimodal_embedding_masks_placeholder_ids_before_injection(self):
+        model = Qwen3NextForCausalLM(_config(), _load_config())
+        with torch.no_grad():
+            model.embed_tokens.weight.copy_(
+                torch.arange(32, dtype=torch.float32).reshape(8, 4)
+            )
+
+        image_feature = torch.tensor([[10.0, 20.0, 30.0, 40.0]])
+        inputs = types.SimpleNamespace(
+            input_ids=torch.tensor([1, 99, 2]),
+            embedding_inputs=types.SimpleNamespace(
+                text_tokens_mask=torch.tensor([True, False, True])
+            ),
+            multimodal_inputs=types.SimpleNamespace(
+                multimodal_features=[image_feature],
+                mm_features_locs=torch.tensor([1]),
+            ),
+        )
+
+        hidden_states = model._embed_inputs(inputs)
+
+        expected = model.embed_tokens(torch.tensor([1, 0, 2])).detach()
+        expected[1] = image_feature[0]
+        torch.testing.assert_close(hidden_states, expected)
+
+    def test_multimodal_features_require_locations(self):
+        model = Qwen3NextForCausalLM(_config(), _load_config())
+        inputs = types.SimpleNamespace(
+            input_ids=torch.tensor([1]),
+            embedding_inputs=types.SimpleNamespace(
+                text_tokens_mask=torch.tensor([False])
+            ),
+            multimodal_inputs=types.SimpleNamespace(
+                multimodal_features=[torch.ones(1, 4)],
+                mm_features_locs=None,
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "without mm_features_locs"):
+            model._embed_inputs(inputs)
+
     def test_production_model_type_alias_uses_qwen3_next_newloader(self):
         self.assertIs(get_model_class("qwen35_moe"), Qwen3NextForCausalLM)
 
@@ -526,6 +571,33 @@ class Qwen3NextLoadTest(unittest.TestCase):
         torch.testing.assert_close(moe.shared_expert_gate.weight, torch.ones(1, 4))
         torch.testing.assert_close(model.lm_head.weight, model.embed_tokens.weight)
 
+    def test_online_fp8_preserves_moe_routing_and_shared_gate_precision(self):
+        config = _config()
+        config.moe_layer_index = [0]
+        source_quant = types.SimpleNamespace(
+            get_runtime_method_key=lambda: "fp8_block_online",
+            modules_to_not_convert=[],
+        )
+        quant_config = QuantizationConfig(
+            "fp8_block_online", source_config=source_quant
+        )
+        config.quant_config = source_quant
+        model = Qwen3NextForCausalLM(
+            config,
+            _load_config(quant_config=quant_config),
+        )
+
+        moe = model.layers[0].mlp
+        # Legacy LoadQuantPerBlockFp8Weight quantizes expert/shared-expert
+        # matrices but intentionally leaves the two routing gates untouched.
+        self.assertEqual(moe.gate.quant_config.quant_type, "none")
+        self.assertEqual(moe.shared_expert_gate.quant_config.quant_type, "none")
+        self.assertEqual(
+            moe.shared_expert.gate_up_proj.quant_config.quant_type,
+            "fp8_block_online",
+        )
+        self.assertEqual(moe.experts._quant_family, "fp8_per_block_online")
+
     def test_untied_missing_lm_head_fails_integrity(self):
         model = Qwen3NextForCausalLM(_config(tie=False), _load_config())
         model.load_weights(_dense_weights())
@@ -753,6 +825,21 @@ class Qwen3NextLinearAttentionLoadTest(unittest.TestCase):
             expected_ba = torch.cat([b[rank : rank + 1], a[rank : rank + 1]], dim=0).t()
             torch.testing.assert_close(layer.in_proj_qkvz.weight, expected_qkvz)
             torch.testing.assert_close(layer.in_proj_ba_w, expected_ba)
+
+    def test_staged_fst_finalizes_children_written_by_custom_parent(self):
+        layer = self._layer(0)
+        staged_children = [layer.in_proj_qkvz, layer.out_proj]
+        coordinator = _StagedFSTLoadCoordinator(layer, staged_children, "cpu")
+        layer._rtp_staged_load_coordinator = coordinator
+        try:
+            layer.load_weights(self._split_projection_weights())
+            coordinator.finish()
+        finally:
+            del layer._rtp_staged_load_coordinator
+
+        self.assertTrue(layer.in_proj_qkvz._post_load_done)
+        self.assertTrue(layer.out_proj._post_load_done)
+        NewModelLoader._validate_loaded_weights(layer)
 
     def test_split_projection_completeness_and_layout_mixing_fail(self):
         weights = self._split_projection_weights()

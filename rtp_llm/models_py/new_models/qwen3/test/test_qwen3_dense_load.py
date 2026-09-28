@@ -410,27 +410,51 @@ class Qwen3LoadTest(unittest.TestCase):
 
         self.assertEqual(model.layers[0].self_attn.num_kv_heads, 2)
 
-    def test_context_parallel_topology_is_rejected(self):
+    def test_context_parallel_topology_is_applied_to_owners(self):
         load_config = self._load_config(
             tp_size=2,
             tp_rank=1,
             attn_tp_size=1,
             attn_tp_rank=0,
-            ffn_tp_size=1,
-            ffn_tp_rank=0,
+            ffn_tp_size=2,
+            ffn_tp_rank=1,
             cp_enabled=True,
         )
 
-        with self.assertRaisesRegex(ValueError, "Context parallelism"):
-            Qwen3ForCausalLM(self._config(), load_config)
+        model = Qwen3ForCausalLM(self._config(), load_config)
 
-    def test_prefill_context_parallel_mode_is_rejected(self):
+        self.assertEqual(
+            (model.embed_tokens.tp_size, model.embed_tokens.tp_rank), (1, 0)
+        )
+        self.assertEqual(
+            (
+                model.layers[0].self_attn.qkv_proj.tp_size,
+                model.layers[0].self_attn.qkv_proj.tp_rank,
+            ),
+            (1, 0),
+        )
+        self.assertEqual(
+            (
+                model.layers[0].mlp.gate_up_proj.tp_size,
+                model.layers[0].mlp.gate_up_proj.tp_rank,
+            ),
+            (2, 1),
+        )
+        self.assertEqual((model.lm_head.tp_size, model.lm_head.tp_rank), (2, 1))
+
+        weights = self._weights()
+        model.load_weights(weights)
+        _validate(model)
+        torch.testing.assert_close(
+            model.lm_head.weight, weights["model.embed_tokens.weight"][4:]
+        )
+
+    def test_prefill_context_parallel_mode_is_accepted(self):
         load_config = self._load_config(prefill_cp_enabled=True)
 
-        with self.assertRaisesRegex(ValueError, "Context parallelism"):
-            Qwen3ForCausalLM(self._config(), load_config)
+        Qwen3ForCausalLM(self._config(), load_config)
 
-    def test_independent_ffn_topology_is_rejected(self):
+    def test_independent_ffn_topology_is_applied(self):
         load_config = self._load_config(
             tp_size=2,
             tp_rank=1,
@@ -438,8 +462,22 @@ class Qwen3LoadTest(unittest.TestCase):
             ffn_tp_rank=0,
         )
 
-        with self.assertRaisesRegex(ValueError, "Independent FFN"):
-            Qwen3ForCausalLM(self._config(), load_config)
+        model = Qwen3ForCausalLM(self._config(), load_config)
+
+        self.assertEqual(
+            (
+                model.layers[0].self_attn.qkv_proj.tp_size,
+                model.layers[0].self_attn.qkv_proj.tp_rank,
+            ),
+            (2, 1),
+        )
+        self.assertEqual(
+            (
+                model.layers[0].mlp.gate_up_proj.tp_size,
+                model.layers[0].mlp.gate_up_proj.tp_rank,
+            ),
+            (1, 0),
+        )
 
     def test_ffn_disaggregation_is_rejected(self):
         load_config = self._load_config(ffn_disaggregate=True)

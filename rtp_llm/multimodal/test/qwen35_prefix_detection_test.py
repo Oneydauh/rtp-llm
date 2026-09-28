@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -8,9 +9,40 @@ from rtp_llm.multimodal.multimodal_mixins.qwen3_5_moe.qwen3_5_moe_mixin import (
     Qwen3_5MoeImageEmbedding,
     Qwen3_5MoeVitWeight,
 )
+from rtp_llm.multimodal.multimodal_mixins.qwen3_5_moe import qwen3_5_moe_mixin
 
 
 class Qwen35PrefixDetectionTest(unittest.TestCase):
+    def test_keeps_checkpoint_selected_image_processor(self):
+        image_processor = object()
+        processor = SimpleNamespace(image_processor=image_processor)
+        vision_config = SimpleNamespace()
+        visual = object()
+        params = SimpleNamespace(config={"ckpt_path": "/fake/qwen35"})
+
+        with (
+            mock.patch.object(
+                qwen3_5_moe_mixin.AutoProcessor,
+                "from_pretrained",
+                return_value=processor,
+            ) as load_processor,
+            mock.patch.object(
+                qwen3_5_moe_mixin.Qwen3_5MoeVisionConfig,
+                "from_pretrained",
+                return_value=vision_config,
+            ),
+            mock.patch.object(
+                qwen3_5_moe_mixin.Qwen3_5MoeVisionModel,
+                "_from_config",
+                return_value=visual,
+            ),
+        ):
+            embedding = Qwen3_5MoeImageEmbedding(params)
+
+        load_processor.assert_called_once_with("/fake/qwen35")
+        self.assertIs(processor, embedding.mm_processor)
+        self.assertIs(image_processor, embedding.mm_processor.image_processor)
+
     def test_image_position_ids_follow_thw_order_and_handle_empty_grid(self):
         embedding = SimpleNamespace(visual=SimpleNamespace(spatial_merge_size=2))
         grid_thw = torch.tensor([[2, 4, 2], [0, 4, 2]], dtype=torch.int32)

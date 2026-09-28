@@ -1,10 +1,14 @@
+import functools
 from typing import NamedTuple, Optional
 
 import torch
 
 try:
-    from flashinfer.prefill import trtllm_fmha_v2_prefill
+    import flashinfer.prefill as _flashinfer_prefill
+
+    trtllm_fmha_v2_prefill = _flashinfer_prefill.trtllm_fmha_v2_prefill
 except (ImportError, AttributeError):
+    _flashinfer_prefill = None
     trtllm_fmha_v2_prefill = None
 
 from rtp_llm.models_py.modules.factory.attention import common
@@ -26,12 +30,47 @@ from rtp_llm.ops.compute_ops import (
 # Pad max_q_len / max_kv_len to this minimum so the dispatch selects flash kernels.
 _TRTLLM_FMHA_V2_MIN_SEQ_LEN = 16
 
-# This interface uses persistent CTAs, so partial outputs stay within each CTA
-# instead of being stored in the workspace. Only a few runtime variables need
-# workspace storage.
+# This interface uses persistent CTAs, so partial outputs stay within each CTA.
+# FlashInfer 0.6.6 additionally stores a (max, sum) float pair for every query
+# token and attention head in this workspace when no stats output is requested.
 _TRTLLM_FMHA_V2_WORKSPACE_SIZE_BYTES = 1024
+_TRTLLM_FMHA_V2_WORKSPACE_ALIGNMENT_BYTES = 128
+_TRTLLM_FMHA_V2_SOFTMAX_STATS_BYTES = 2 * 4
 _g_trtllm_fmha_v2_workspace_pool: list[torch.Tensor] = []
 _g_trtllm_fmha_v2_pool_lock = __import__("threading").Lock()
+
+
+def _install_capture_safe_scale_bmm2_factory():
+    """Cache FlashInfer's read-only device scale outside CUDA Graph capture.
+
+    FlashInfer 0.6.6 creates and initializes a one-element device tensor on
+    every FMHA v2 call.  Scalar device initialization is not permitted while
+    RTP-LLM captures the warm decode graph.  The scale is immutable, so cache
+    it by value, dtype, and device and prime the cache when the op is built.
+    """
+    if _flashinfer_prefill is None:
+        return None
+    factory = getattr(_flashinfer_prefill, "_create_scale_bmm2_d_tensor", None)
+    if factory is None:
+        return None
+    if getattr(factory, "_rtp_llm_capture_safe", False):
+        return factory
+
+    cached_factory = functools.lru_cache(maxsize=None)(factory)
+    cached_factory._rtp_llm_capture_safe = True
+    _flashinfer_prefill._create_scale_bmm2_d_tensor = cached_factory
+    return cached_factory
+
+
+_capture_safe_scale_bmm2_factory = _install_capture_safe_scale_bmm2_factory()
+
+
+def _prime_capture_safe_scale_bmm2(
+    scale: float, dtype: torch.dtype, device: torch.device
+) -> Optional[torch.Tensor]:
+    if _capture_safe_scale_bmm2_factory is None:
+        return None
+    return _capture_safe_scale_bmm2_factory(float(scale), dtype, torch.device(device))
 
 
 def _supports_trtllm_fmha_v2(attn_configs: AttentionConfigs) -> bool:
@@ -89,6 +128,22 @@ def _release_trtllm_fmha_v2_workspace(buf: torch.Tensor) -> None:
         _g_trtllm_fmha_v2_workspace_pool.append(buf)
 
 
+def _ensure_trtllm_fmha_v2_workspace(
+    buf: torch.Tensor, batch_size: int, max_q_len: int, head_num: int
+) -> torch.Tensor:
+    required_bytes = (
+        batch_size * max_q_len * head_num * _TRTLLM_FMHA_V2_SOFTMAX_STATS_BYTES
+    )
+    alignment = _TRTLLM_FMHA_V2_WORKSPACE_ALIGNMENT_BYTES
+    required_bytes = ((required_bytes + alignment - 1) // alignment) * alignment
+    # FMHA v2 also allocates a small aligned tile-id counter after the stats.
+    required_bytes += alignment
+    required_bytes = max(required_bytes, _TRTLLM_FMHA_V2_WORKSPACE_SIZE_BYTES)
+    if buf.numel() >= required_bytes:
+        return buf
+    return torch.zeros(required_bytes, dtype=torch.uint8, device=buf.device)
+
+
 class TRTLLMFMHAv2Params(NamedTuple):
     batch_size: int
     max_q_len: int
@@ -118,6 +173,14 @@ class TRTLLMFMHAv2PagedPrefillOp:
         # tokens bidirectional as required by non-causal attention.
         self.mask_mode = "causal" if attn_configs.is_causal else "padding"
         self.workspace_buffer = _get_trtllm_fmha_v2_workspace()
+        compute_dtype = (
+            torch.float8_e4m3fn
+            if self.kv_cache_dtype == KvCacheDataType.FP8
+            else attn_configs.dtype
+        )
+        self._scale_bmm2_d = _prime_capture_safe_scale_bmm2(
+            1.0, compute_dtype, self.workspace_buffer.device
+        )
 
     def __del__(self) -> None:
         _release_trtllm_fmha_v2_workspace(self.workspace_buffer)
@@ -194,6 +257,12 @@ class TRTLLMFMHAv2PagedPrefillOp:
                 f"Q and paged KV cache must use the same dtype, got "
                 f"Q={compute_dtype} and KV={kv_cache_5d.dtype}"
             )
+        self.workspace_buffer = _ensure_trtllm_fmha_v2_workspace(
+            self.workspace_buffer,
+            params.batch_size,
+            params.max_q_len,
+            self.head_num,
+        )
         o = trtllm_fmha_v2_prefill(
             qkv=(q, kv_cache_5d),
             input_layout="Q_PAGED_KV_HND",
@@ -233,6 +302,14 @@ class TRTLLMFMHAv2PrefillOp:
         # tokens bidirectional as required by non-causal attention.
         self.mask_mode = "causal" if attn_configs.is_causal else "padding"
         self.workspace_buffer = _get_trtllm_fmha_v2_workspace()
+        compute_dtype = (
+            torch.float8_e4m3fn
+            if self.kv_cache_dtype == KvCacheDataType.FP8
+            else attn_configs.dtype
+        )
+        self._scale_bmm2_d = _prime_capture_safe_scale_bmm2(
+            1.0, compute_dtype, self.workspace_buffer.device
+        )
 
     def __del__(self) -> None:
         _release_trtllm_fmha_v2_workspace(self.workspace_buffer)
@@ -303,6 +380,12 @@ class TRTLLMFMHAv2PrefillOp:
             )
             fmha_input = (q, kv)
             input_layout = "CONTIGUOUS_Q_KV"
+        self.workspace_buffer = _ensure_trtllm_fmha_v2_workspace(
+            self.workspace_buffer,
+            params.batch_size,
+            params.max_q_len,
+            self.head_num,
+        )
         o = trtllm_fmha_v2_prefill(
             qkv=fmha_input,
             input_layout=input_layout,

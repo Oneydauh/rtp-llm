@@ -179,10 +179,15 @@ class ParallelLMHead(RtpModule):
             raise RuntimeError("Failed to assign LM head weight")
 
     def _copy_local_tied_weight(self, tensor: torch.Tensor) -> None:
-        if tuple(tensor.shape) != tuple(self.weight.shape):
+        local_shape = tuple(self.weight.shape)
+        global_shape = (self.vocab_size, self.hidden_size)
+        if tuple(tensor.shape) == global_shape:
+            start = self.tp_rank * self.vocab_size_per_partition
+            tensor = tensor[start : start + self.vocab_size_per_partition]
+        elif tuple(tensor.shape) != local_shape:
             raise ValueError(
-                f"Tied LM head shard must have shape {tuple(self.weight.shape)}, "
-                f"got {tuple(tensor.shape)}"
+                f"Tied LM head weight must have local shape {local_shape} or "
+                f"global shape {global_shape}, got {tuple(tensor.shape)}"
             )
         if not self._assign_weight(self, "weight", tensor.contiguous()):
             raise RuntimeError("Failed to assign tied LM head weight")

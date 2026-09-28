@@ -22,6 +22,6 @@ genrule(
         "libpython3.10.so",
     ],
     cmd = """
-cp -f "/opt/conda310/lib/libpython3.10.so" "$(@D)/libpython3.10.so"
+cp -f "/data1/chuzihao.czh/miniforge3/lib/libpython3.10.so" "$(@D)/libpython3.10.so"
    """,
 )

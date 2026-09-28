@@ -272,6 +272,7 @@ class Qwen3_VLMixin(Qwen2_5_VLMixin):
                 model_path=self.ckpt_path,
                 compute_dtype=self.compute_dtype,
                 device=self.device,
+                load_method=self.load_method,
             )
             self.mm_part = Qwen3_VLImageEmbedding(self.mm_related_params, visual=visual)
             self.mm_related_params.vit_weights = None

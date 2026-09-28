@@ -176,6 +176,14 @@ def git_deps():
         path = "3rdparty/protobuf",
     )
 
+    # Internal cache-store BUILD targets are analyzed by the H20 smoke binary.
+    # Expose the in-tree RDMA repository while retaining the OSS git sources.
+    native.new_local_repository(
+        name = "alibaba_rdma",
+        path = "internal_source/rdma",
+        build_file = clean_dep("@rtp_llm//internal_source:rdma.BUILD"),
+    )
+
     new_git_repository(
         name = "rapidjson",
         remote = "https://github.com/Tencent/rapidjson.git",

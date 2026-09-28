@@ -87,7 +87,7 @@ py_library(
         "@//:using_ppu": [],
         "@//:cuda_pre_12_9": [],
         "@//:using_cuda13_x86": [],
-        "@//:using_cuda12_9_x86": ["@pip_gpu_cuda12_9_torch//watchdog"],
+        "@//:using_cuda12_9_x86": [],
         "@//:using_cuda13_arm": [],
         "@//:using_cuda12_arm": [],
         "@//:using_rocm": [],

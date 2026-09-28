@@ -22,7 +22,11 @@ from rtp_llm.models_py.model_desc.block_map import (
 )
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
 from rtp_llm.models_py.module_base import RtpModule, copy_weight_
-from rtp_llm.models_py.modules import FakeBalanceExpert, SelectTopk
+from rtp_llm.models_py.modules import (
+    FakeBalanceExpert,
+    MultimodalEmbeddingInjector,
+    SelectTopk,
+)
 from rtp_llm.models_py.new_models.model_base import (
     required_config_value,
     select_fmha_impl_for_layer,
@@ -737,6 +741,11 @@ class Qwen3NextGatedDeltaNet(RtpModule):
                 "Split QKV/Z scalar weight scales cannot be fused without "
                 "dequantization and requantization"
             )
+        # Split QKV/Z checkpoints are copied into disjoint slices of one child
+        # parameter.  Tell the FST coordinator to materialize that staged child
+        # before taking the target reference; the second part can then mark the
+        # logical parameter complete and trigger online quantization.
+        self._prepare_child_weight_loading(self.in_proj_qkvz)
         target = getattr(self.in_proj_qkvz, parameter, None)
         if not isinstance(target, nn.Parameter):
             raise RuntimeError(
@@ -784,6 +793,7 @@ class Qwen3NextGatedDeltaNet(RtpModule):
         loaded_parts.add(component)
         if loaded_parts == {"qkv", "z"}:
             self.in_proj_qkvz._record_parameter_loaded(parameter)
+        self._finalize_child_weight_loading(self.in_proj_qkvz)
 
     def _load_split_ba(self, component: str, tensor: torch.Tensor) -> None:
         if self._ba_layout is not None and self._ba_layout != "split":
@@ -854,15 +864,16 @@ class Qwen3NextGatedDeltaNet(RtpModule):
             if name == "in_proj_qkvz.weight":
                 self._claim_layout(self._qkvz_layouts, "weight", "fused")
                 reordered = reorder_qkvz([tensor], self.linear_attn_config)
-                self.in_proj_qkvz.load_weights(
-                    {"weight": self._split_qkvz_rows(reordered, 1)}
+                self._load_child_weights(
+                    self.in_proj_qkvz, {"weight": self._split_qkvz_rows(reordered, 1)}
                 )
             elif name == "in_proj_qkvz.weight_scale_inv":
                 self._claim_layout(self._qkvz_layouts, "weight_scale_inv", "fused")
                 block_n, _ = self._block_size(self.in_proj_qkvz)
                 reordered = reorder_qkvz_scale(tensor, self.linear_attn_config, block_n)
-                self.in_proj_qkvz.load_weights(
-                    {"weight_scale_inv": self._split_qkvz_rows(reordered, block_n)}
+                self._load_child_weights(
+                    self.in_proj_qkvz,
+                    {"weight_scale_inv": self._split_qkvz_rows(reordered, block_n)},
                 )
             elif name == "in_proj_qkvz.weight_scale":
                 self._claim_layout(self._qkvz_layouts, "weight_scale", "fused")
@@ -872,10 +883,10 @@ class Qwen3NextGatedDeltaNet(RtpModule):
                     local = self._split_qkvz_rows(
                         reorder_qkvz([tensor], self.linear_attn_config), 1
                     )
-                self.in_proj_qkvz.load_weights({"weight_scale": local})
+                self._load_child_weights(self.in_proj_qkvz, {"weight_scale": local})
             elif name == "in_proj_qkvz.input_scale":
                 self._claim_layout(self._qkvz_layouts, "input_scale", "fused")
-                self.in_proj_qkvz.load_weights({"input_scale": tensor})
+                self._load_child_weights(self.in_proj_qkvz, {"input_scale": tensor})
             elif name.startswith("in_proj_qkv."):
                 self._load_split_qkvz("qkv", name.removeprefix("in_proj_qkv."), tensor)
             elif name.startswith("in_proj_z."):
@@ -918,13 +929,18 @@ class Qwen3NextGatedDeltaNet(RtpModule):
                 if not self._assign_weight(self, "norm_w", tensor.contiguous()):
                     raise RuntimeError("Failed to load linear attention norm")
             elif name == "out_proj.weight":
-                self.out_proj.load_weights({"weight": self._split_out_weight(tensor)})
+                self._load_child_weights(
+                    self.out_proj, {"weight": self._split_out_weight(tensor)}
+                )
             elif name == "out_proj.weight_scale_inv":
-                self.out_proj.load_weights(
-                    {"weight_scale_inv": self._split_out_block_scale(tensor)}
+                self._load_child_weights(
+                    self.out_proj,
+                    {"weight_scale_inv": self._split_out_block_scale(tensor)},
                 )
             elif name in ("out_proj.weight_scale", "out_proj.input_scale"):
-                self.out_proj.load_weights({name.rsplit(".", 1)[-1]: tensor})
+                self._load_child_weights(
+                    self.out_proj, {name.rsplit(".", 1)[-1]: tensor}
+                )
             else:
                 raise RuntimeError(f"Unsupported Qwen3-Next linear tensor {name!r}")
 
@@ -1513,7 +1529,12 @@ class Qwen3NextMoEBlock(RtpModule):
             output_size=expert_num,
             tp_size=1,
             tp_rank=0,
-            quant_config=quant_config,
+            # Keep routing logits in the checkpoint dtype.  The legacy
+            # online-FP8 loader deliberately excludes W.moe_gate from its
+            # quantization allowlist: quantizing this small projection can
+            # change top-k expert selection even when the expert weights
+            # themselves are quantized correctly.
+            quant_config=None,
             prefix=f"{prefix}.gate",
             bias=False,
             params_dtype=params_dtype,
@@ -1573,7 +1594,10 @@ class Qwen3NextMoEBlock(RtpModule):
                 output_size=1,
                 tp_size=1,
                 tp_rank=0,
-                quant_config=quant_config,
+                # Match the legacy FP8 allowlist.  This sigmoid gate is not a
+                # GEMM worth quantizing and its numerical value directly
+                # scales the shared-expert contribution.
+                quant_config=None,
                 prefix=f"{prefix}.shared_expert_gate",
                 bias=False,
                 params_dtype=params_dtype,
@@ -1921,6 +1945,7 @@ class Qwen3NextForCausalLM(GptModelBase):
         if not math.isfinite(self.logit_scale):
             raise ValueError("logit_scale must be finite")
         self._lm_head_postprocessed = False
+        self.multimodal_embedding_injector = MultimodalEmbeddingInjector()
 
         self.embed_tokens = VocabParallelEmbedding(
             vocab_size=cfg["vocab_size"],
@@ -1955,8 +1980,51 @@ class Qwen3NextForCausalLM(GptModelBase):
             "lm_head": self.lm_head.weight,
         }
 
+    def _embed_inputs(self, inputs: PyModelInputs) -> torch.Tensor:
+        input_ids = inputs.input_ids
+        embedding_inputs = inputs.embedding_inputs
+        text_tokens_mask = (
+            None if embedding_inputs is None else embedding_inputs.text_tokens_mask
+        )
+        multimodal_inputs = inputs.multimodal_inputs
+        features = (
+            []
+            if multimodal_inputs is None
+            else multimodal_inputs.multimodal_features or []
+        )
+        locations = (
+            None if multimodal_inputs is None else multimodal_inputs.mm_features_locs
+        )
+
+        if features and text_tokens_mask is None:
+            raise ValueError(
+                "Qwen3.5 received multimodal features without text_tokens_mask"
+            )
+        if features and locations is None:
+            raise ValueError(
+                "Qwen3.5 received multimodal features without mm_features_locs"
+            )
+
+        if text_tokens_mask is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            if text_tokens_mask.numel() != input_ids.numel():
+                raise ValueError(
+                    "text_tokens_mask must contain one entry per input token"
+                )
+            text_mask = text_tokens_mask.to(
+                device=input_ids.device, dtype=torch.bool
+            ).view_as(input_ids)
+            safe_input_ids = torch.where(text_mask, input_ids, 0)
+            hidden_states = self.embed_tokens(safe_input_ids)
+            hidden_states = hidden_states * text_mask.unsqueeze(-1)
+
+        if multimodal_inputs is None:
+            return hidden_states
+        return self.multimodal_embedding_injector(hidden_states, features, locations)
+
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
-        hidden_states = self.embed_tokens(inputs.input_ids)
+        hidden_states = self._embed_inputs(inputs)
         if fmha_impl is None:
             fmha_impl = self.prepare_fmha_impl(inputs)
         attn_meta = _build_qwen3_next_metadata(inputs, hidden_states)

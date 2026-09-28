@@ -205,9 +205,9 @@ exports_files(["cc_test_wrapper.sh"])
 
 py_runtime(
     name = "python310",
-    interpreter_path = "/opt/conda310/bin/python",
+    interpreter_path = "/data1/chuzihao.czh/miniforge3/bin/python",
     python_version = "PY3",
-    stub_shebang = "#!/opt/conda310/bin/python",
+    stub_shebang = "#!/data1/chuzihao.czh/miniforge3/bin/python",
     visibility = ["//visibility:public"],
 )
 

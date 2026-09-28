@@ -400,6 +400,18 @@ class RtpModule(nn.Module):
             return
         coordinator.load_child(child, weights)
 
+    def _prepare_child_weight_loading(self, child: nn.Module) -> None:
+        """Prepare a staged child before a custom loader writes its storage."""
+        coordinator = getattr(self, "_rtp_staged_load_coordinator", None)
+        if coordinator is not None:
+            coordinator.prepare_child(child)
+
+    def _finalize_child_weight_loading(self, child: nn.Module) -> None:
+        """Finalize a staged child after a custom loader updates completeness."""
+        coordinator = getattr(self, "_rtp_staged_load_coordinator", None)
+        if coordinator is not None:
+            coordinator.finalize_child_if_complete(child)
+
     def _dispatch(self, module: nn.Module, name: str, tensor: torch.Tensor) -> bool:
         if module is self:
             load_plan = getattr(self, "_rtp_checkpoint_load_plan", None)

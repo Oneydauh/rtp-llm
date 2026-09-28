@@ -30,6 +30,8 @@ class UnquantizedLinearMethod(QuantizeMethodBase):
     def apply(
         self, layer, x: torch.Tensor, bias: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        if bias is not None and getattr(layer, "bias_as_matrix", False):
+            bias = bias.view(1, -1)
         return torch.nn.functional.linear(x, layer.weight, bias)
 
     def process_weights_after_loading(self, layer) -> None:

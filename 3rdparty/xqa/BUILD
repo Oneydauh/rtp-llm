@@ -4,7 +4,7 @@ load("@//3rdparty/xqa:def.bzl", "compile_xqa_libs")
 
 genrule(
     name = "gen_header",
-    cmd = "/opt/conda310/bin/python $< --output $@",
+    cmd = "/data1/chuzihao.czh/miniforge3/bin/python $< --output $@",
     outs = ["mha_sm90.h"],
     srcs = ["gen_header.py"],
     tags = ["local"],

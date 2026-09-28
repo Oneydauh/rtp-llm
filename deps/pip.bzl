@@ -10,7 +10,7 @@ def pip_deps():
     pip_parse(
         name = "pip_cpu_torch",
         requirements_lock = "@rtp_deps//:requirements_lock_torch_cpu.txt",
-        python_interpreter = "/opt/conda310/bin/python3",
+        python_interpreter = "/data1/chuzihao.czh/miniforge3/bin/python",
         extra_pip_args = PIP_EXTRA_ARGS,
         timeout = 3600,
     )
@@ -18,7 +18,7 @@ def pip_deps():
     pip_parse(
         name = "pip_arm_torch",
         requirements_lock = "@rtp_deps//:requirements_lock_torch_arm.txt",
-        python_interpreter = "/opt/conda310/bin/python3",
+        python_interpreter = "/data1/chuzihao.czh/miniforge3/bin/python",
         extra_pip_args = PIP_EXTRA_ARGS,
         timeout = 3600,
     )
@@ -26,7 +26,7 @@ def pip_deps():
     pip_parse(
         name = "pip_ppu_torch",
         requirements_lock = "@rtp_deps//:requirements_lock_torch_gpu_cuda12.txt",
-        python_interpreter = "/opt/conda310/bin/python3",
+        python_interpreter = "/data1/chuzihao.czh/miniforge3/bin/python",
         extra_pip_args = PIP_EXTRA_ARGS,
         timeout = 3600,
     )
@@ -34,7 +34,7 @@ def pip_deps():
     pip_parse(
         name = "pip_gpu_cuda12_torch",
         requirements_lock = "@rtp_deps//:requirements_lock_torch_gpu_cuda12.txt",
-        python_interpreter = "/opt/conda310/bin/python3",
+        python_interpreter = "/data1/chuzihao.czh/miniforge3/bin/python",
         extra_pip_args = PIP_EXTRA_ARGS,
         timeout = 3600,
         quiet = False,
@@ -43,20 +43,23 @@ def pip_deps():
     pip_parse(
         name = "pip_gpu_cuda12_9_torch",
         requirements_lock = "@rtp_deps//:requirements_lock_torch_gpu_cuda12_9.txt",
-        python_interpreter = "/opt/conda310/bin/python3",
+        python_interpreter = "/data1/chuzihao.czh/miniforge3/bin/python",
         extra_pip_args = PIP_EXTRA_ARGS,
         timeout = 3600,
         quiet = False,
         # Regenerate pre-warmed CI hubs created before the grammar-admission
         # dependencies entered this lock. The annotation only versions the
         # xgrammar wheel repository; existing unrelated wheels stay cached.
-        annotations = {"xgrammar": package_annotation()},
+        annotations = {
+            "watchdog": package_annotation(),
+            "xgrammar": package_annotation(),
+        },
     )
 
     pip_parse(
         name = "pip_gpu_cuda13_torch",
         requirements_lock = "@rtp_deps//:requirements_lock_torch_gpu_cuda13.txt",
-        python_interpreter = "/opt/conda310/bin/python3",
+        python_interpreter = "/data1/chuzihao.czh/miniforge3/bin/python",
         extra_pip_args = PIP_EXTRA_ARGS + ["--quiet"],
         timeout = 3600,
         quiet = False,
@@ -65,7 +68,7 @@ def pip_deps():
     pip_parse(
         name = "pip_cuda12_arm_torch",
         requirements_lock = "@rtp_deps//:requirements_lock_cuda12_arm.txt",
-        python_interpreter = "/opt/conda310/bin/python3",
+        python_interpreter = "/data1/chuzihao.czh/miniforge3/bin/python",
         extra_pip_args = PIP_EXTRA_ARGS,
         timeout = 3600,
         quiet = False,
@@ -74,7 +77,7 @@ def pip_deps():
     pip_parse(
         name = "pip_cuda13_arm_torch",
         requirements_lock = "@rtp_deps//:requirements_lock_cuda13_arm.txt",
-        python_interpreter = "/opt/conda310/bin/python3",
+        python_interpreter = "/data1/chuzihao.czh/miniforge3/bin/python",
         extra_pip_args = PIP_EXTRA_ARGS,
         timeout = 3600,
         quiet = False,
@@ -83,7 +86,7 @@ def pip_deps():
     pip_parse(
         name = "pip_gpu_rocm_torch",
         requirements_lock = "@rtp_deps//:requirements_lock_rocm.txt",
-        python_interpreter = "/opt/conda310/bin/python3",
+        python_interpreter = "/data1/chuzihao.czh/miniforge3/bin/python",
         extra_pip_args = PIP_EXTRA_ARGS,
         timeout = 12000,
         # PR #1334 updated both packages, but pre-warmed CI hubs can retain the

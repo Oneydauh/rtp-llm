@@ -19,10 +19,54 @@ from rtp_llm.models_py.modules.factory.attention.cuda_impl.test.trt_tests.trt_te
 from rtp_llm.models_py.modules.factory.attention.cuda_impl.trt import (
     FlashInferTRTLLMFMHAv2PrefillImpl,
     TRTLLMFMHAv2PrefillOp,
+    _ensure_trtllm_fmha_v2_workspace,
+    _prime_capture_safe_scale_bmm2,
 )
 from rtp_llm.models_py.utils.arch import is_sm12x
 from rtp_llm.ops import KvCacheDataType, RopeStyle
 from rtp_llm.ops.compute_ops import get_typemeta
+
+
+class TestTRTLLMFMHAv2Workspace(unittest.TestCase):
+    def test_bmm2_scale_is_reused_during_cuda_graph_capture(self):
+        scale = _prime_capture_safe_scale_bmm2(
+            1.0, torch.bfloat16, torch.device("cuda")
+        )
+        self.assertIsNotNone(scale)
+        self.assertIs(
+            scale,
+            _prime_capture_safe_scale_bmm2(
+                1.0, torch.bfloat16, torch.device("cuda")
+            ),
+        )
+        expected = scale + 1
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_scale = _prime_capture_safe_scale_bmm2(
+                1.0, torch.bfloat16, torch.device("cuda")
+            )
+            captured_output = captured_scale + 1
+        graph.replay()
+        torch.cuda.synchronize()
+
+        self.assertIs(captured_scale, scale)
+        torch.testing.assert_close(captured_output, expected)
+
+    def test_reuses_sufficient_workspace(self):
+        workspace = torch.zeros(2176, dtype=torch.uint8)
+
+        actual = _ensure_trtllm_fmha_v2_workspace(workspace, 1, 16, 16)
+
+        self.assertIs(actual, workspace)
+
+    def test_grows_for_softmax_stats(self):
+        workspace = torch.zeros(1024, dtype=torch.uint8)
+
+        actual = _ensure_trtllm_fmha_v2_workspace(workspace, 4, 512, 32)
+
+        self.assertEqual(actual.numel(), 4 * 512 * 32 * 2 * 4 + 128)
+        self.assertEqual(actual.dtype, torch.uint8)
 
 
 class TestTRTLLMFMHAv2PrefillOpBF16(TRTLLMFMHAv2TestBase):
