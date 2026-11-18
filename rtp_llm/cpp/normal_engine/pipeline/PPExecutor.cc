@@ -358,10 +358,10 @@ PPExecutor::PPExecutor(const EngineInitParams&                params,
                 stageLayerRange(parallelism_config_, parallelism_config_.pp_rank, params.model_config_.num_layers);
             // Python-owned experts do not populate legacy DenseWeights.
             DataType moe_weight_type = DataType::TYPE_FP16;
-            int64_t moe_inter_size = 0;
+            int64_t  moe_inter_size  = 0;
             if (!ExpertBalancerPythonWrapper::usesDirectInstall(params.py_eplb)) {
                 const auto& moe_kernel = params.gpt_weights.layers[first_moe_layer].ffn_weights.moe_gate_weight->kernel;
-                moe_weight_type = torchDTypeToDataType(moe_kernel.dtype());
+                moe_weight_type        = torchDTypeToDataType(moe_kernel.dtype());
                 moe_inter_size = params.model_config_.isGatedActivation() ? moe_kernel.size(1) / 2 : moe_kernel.size(1);
             }
 

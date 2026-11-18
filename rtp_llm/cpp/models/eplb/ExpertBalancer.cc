@@ -17,7 +17,7 @@ void EplbPlanBuffers::init(size_t    log_exp_num,
                            size_t    ep_size,
                            DataType  dtype,
                            QuantAlgo quant_algo,
-                           bool allocate_weights) {
+                           bool      allocate_weights) {
     auto gpu_i32 = torch::TensorOptions(torch::kInt32).device(torch::kCUDA);
     auto cpu_i32 = torch::kInt32;
 
@@ -73,14 +73,15 @@ void BalanceStatsBuffers::reset() {
 }
 
 void LoadFlags::init() {
-    flag_gpu = torch::zeros({2}, torch::TensorOptions(torch::kInt32).device(torch::kCUDA));
+    flag_gpu  = torch::zeros({2}, torch::TensorOptions(torch::kInt32).device(torch::kCUDA));
     flag_sync = torch::zeros_like(flag_gpu);
     flag_host = torch::zeros({2}, torch::kInt32).pin_memory();
 }
 
 void LoadFlags::setReady(bool ready) {
     flag_gpu.zero_();
-    if (ready) flag_gpu.narrow(0, 0, 1).fill_(1);
+    if (ready)
+        flag_gpu.narrow(0, 0, 1).fill_(1);
 }
 
 void LoadFlags::setFailed() {
@@ -95,7 +96,8 @@ LoadFlags::SyncStatus LoadFlags::sync(size_t group_size, ParallelMode mode) {
     }
     flag_host.copy_(flag_sync);
     const int* values = flag_host.data_ptr<int>();
-    if (values[0] != static_cast<int>(group_size)) return SyncStatus::LOADING;
+    if (values[0] != static_cast<int>(group_size))
+        return SyncStatus::LOADING;
     return values[1] == 0 ? SyncStatus::READY : SyncStatus::FAILED;
 }
 
@@ -109,7 +111,7 @@ void EplbController::init(const EPLBConfig& eplb_control_data, const EPLBConfig&
     control_step = eplb_config.eplb_control_step;
     RTP_LLM_LOG_INFO("EPLB control step: %d", control_step);
 
-    auto eplb_control_data_list  = cur_data.toList();
+    auto eplb_control_data_list  = eplb_control_data.toList();
     eplb_control_data_buf_host   = torch::zeros({(int64_t)eplb_control_data_list.size()}, torch::kInt32).pin_memory();
     eplb_control_data_buf_device = torch::zeros({(int64_t)eplb_control_data_list.size()},
                                                 torch::TensorOptions(torch::kInt32).device(torch::kCUDA));
@@ -138,7 +140,7 @@ EPLBConfig EplbController::getAndSyncData(size_t eplb_group_size, ParallelMode p
         lock_guard<mutex> lock(eplb_control_mutex);
         cur_data = eplb_control_data;
     }
-    auto eplb_control_data_list     = eplb_control_data.toList();
+    auto eplb_control_data_list     = cur_data.toList();
     int* eplb_control_data_host_ptr = eplb_control_data_buf_host.data_ptr<int>();
     for (size_t i = 0; i < eplb_control_data_list.size(); ++i) {
         eplb_control_data_host_ptr[i] = eplb_control_data_list[i];
@@ -192,7 +194,8 @@ ExpertBalancer::ExpertBalancer(size_t                       log_exp_num,
     // init memory
     stats_.init(num_layers, log_exp_num, ep_size_);
     direct_install_ = ExpertBalancerPythonWrapper::usesDirectInstall(py_eplb);
-    eplb_plan_buffers_.init(log_exp_num, phy_exp_num, hidden_size, moe_size, ep_size_, dtype, quant_algo, !direct_install_);
+    eplb_plan_buffers_.init(
+        log_exp_num, phy_exp_num, hidden_size, moe_size, ep_size_, dtype, quant_algo, !direct_install_);
     eplb_plan_tensors_.init(log_exp_num, phy_exp_num);
     load_flags_.init();
     load_flags_.setReady(false);
@@ -298,12 +301,18 @@ void ExpertBalancer::excuteEplbPlan(OverallExpertStats& stats, ModelBase& model,
             case EplbPlanStatus::LOADING:
             case EplbPlanStatus::LOADED:
             case EplbPlanStatus::FAILED: {
-                if (status == EplbPlanStatus::FAILED) load_flags_.setFailed();
-                else load_flags_.setReady(status == EplbPlanStatus::LOADED);
+                if (status == EplbPlanStatus::FAILED)
+                    load_flags_.setFailed();
+                else
+                    load_flags_.setReady(status == EplbPlanStatus::LOADED);
                 auto vote = load_flags_.sync(eplb_group_size_, parallel_mode_);
-                if (vote == LoadFlags::SyncStatus::LOADING) break;
+                if (vote == LoadFlags::SyncStatus::LOADING)
+                    break;
                 joinPlanWeightLoad();
+                executor_collector_.update_weights_latency_ms = load_latency_ms_;
                 if (vote == LoadFlags::SyncStatus::FAILED) {
+                    if (!direct_install_)
+                        throw std::runtime_error("Legacy EPLB weight loading failed");
                     finishPlan(false);
                     break;
                 }
@@ -318,11 +327,11 @@ void ExpertBalancer::excuteEplbPlan(OverallExpertStats& stats, ModelBase& model,
                 } catch (const std::exception& e) {
                     RTP_LLM_LOG_ERROR("EPLB install failed: %s", e.what());
                     ok = false;
-                } catch (...) {
-                    ok = false;
-                }
-                if (ok) load_flags_.setReady(true);
-                else load_flags_.setFailed();
+                } catch (...) { ok = false; }
+                if (ok)
+                    load_flags_.setReady(true);
+                else
+                    load_flags_.setFailed();
                 vote = load_flags_.sync(eplb_group_size_, parallel_mode_);
                 if (vote != LoadFlags::SyncStatus::READY && !direct_install_) {
                     throw std::runtime_error("Legacy EPLB installation failed; cannot resume inference");
@@ -336,22 +345,23 @@ void ExpertBalancer::excuteEplbPlan(OverallExpertStats& stats, ModelBase& model,
 
 void ExpertBalancer::startPlanWeightLoad() {
     load_flags_.setReady(false);
-    load_thread_ = std::thread([this] {
+    load_latency_ms_ = 0;
+    load_thread_     = std::thread([this] {
         try {
             loadPlanWeights();
             setPlanStatus(EplbPlanStatus::LOADED);
         } catch (const std::exception& e) {
             RTP_LLM_LOG_ERROR("EPLB load failed on rank %zu: %s", ep_rank_, e.what());
             setPlanStatus(EplbPlanStatus::FAILED);
-        } catch (...) {
-            setPlanStatus(EplbPlanStatus::FAILED);
-        }
+        } catch (...) { setPlanStatus(EplbPlanStatus::FAILED); }
     });
-    if (test_mode_) joinPlanWeightLoad();
+    if (test_mode_)
+        joinPlanWeightLoad();
 }
 
 void ExpertBalancer::joinPlanWeightLoad() {
-    if (!load_thread_.joinable()) return;
+    if (!load_thread_.joinable())
+        return;
     if (PyGILState_Check()) {
         py::gil_scoped_release release;
         load_thread_.join();
@@ -362,28 +372,28 @@ void ExpertBalancer::joinPlanWeightLoad() {
 
 void ExpertBalancer::finishPlan(bool committed) {
     if (direct_install_) {
-        int layer = eplb_plan_tensors_.layer_id_buf.item<int>();
+        int  layer    = eplb_plan_tensors_.layer_id_buf.item<int>();
         bool finished = true;
         try {
             eplb_python_wrapper_.finishBalancePlan(layer, committed);
         } catch (const std::exception& e) {
             RTP_LLM_LOG_ERROR("EPLB finalize failed: %s", e.what());
             finished = false;
-        } catch (...) {
-            finished = false;
-        }
+        } catch (...) { finished = false; }
         // Never let healthy peers resume serving after a peer's rollback or
         // commit failed. No rank may continue on an unknown generation.
-        if (finished) load_flags_.setReady(true);
-        else load_flags_.setFailed();
+        if (finished)
+            load_flags_.setReady(true);
+        else
+            load_flags_.setFailed();
         if (load_flags_.sync(eplb_group_size_, parallel_mode_) != LoadFlags::SyncStatus::READY) {
             throw std::runtime_error("EPLB finalization diverged; cannot resume inference");
         }
         executor_collector_.update_weights_qps = committed;
-        executor_collector_.update_layer_id = layer;
+        executor_collector_.update_layer_id    = layer;
     }
     if (!committed || ++balance_layer_cnt_ >= balance_layer_per_step_) {
-        update_cnt_ = 0;
+        update_cnt_        = 0;
         balance_layer_cnt_ = 0;
     } else {
         update_cnt_ = eplb_control_data_.eplb_update_time;
@@ -402,7 +412,8 @@ void ExpertBalancer::copyFromTensor(const torch::Tensor& src, torch::Tensor& dst
 }
 
 void ExpertBalancer::copyToTensor(const torch::Tensor& src, torch::Tensor& dst) {
-    dst.copy_(src, /*non_blocking=*/true);
+    // A separate worker immediately consumes these host tensors.
+    dst.copy_(src, /*non_blocking=*/false);
 }
 
 void ExpertBalancer::createPlan() {
@@ -417,14 +428,21 @@ void ExpertBalancer::createPlan() {
     stats_.gpu_loads.copy_(stats_.gpu_loads_gpu);
 
     if (is_eplb_group_root_) {
-        eplb_python_wrapper_.createBalancePlan(stats_.log_stats, stats_.gpu_loads, eplb_plan_tensors_);
+        try {
+            eplb_python_wrapper_.createBalancePlan(stats_.log_stats, stats_.gpu_loads, eplb_plan_tensors_);
 
-        // copy tensor(host) to gpu tensor
-        // note: it's ok to use async copy, since the tensor host ptr will not be released
-        copyFromTensor(eplb_plan_tensors_.layer_id_buf, eplb_plan_buffers_.layer_id_buf);
-        copyFromTensor(eplb_plan_tensors_.logic_expert_cnt, eplb_plan_buffers_.logic_expert_cnt);
-        copyFromTensor(eplb_plan_tensors_.log2phy, eplb_plan_buffers_.log2phy);
-        copyFromTensor(eplb_plan_tensors_.phy2log, eplb_plan_buffers_.phy2log);
+            // copy tensor(host) to gpu tensor
+            // note: it's ok to use async copy, since the tensor host ptr will not be released
+            copyFromTensor(eplb_plan_tensors_.layer_id_buf, eplb_plan_buffers_.layer_id_buf);
+            copyFromTensor(eplb_plan_tensors_.logic_expert_cnt, eplb_plan_buffers_.logic_expert_cnt);
+            copyFromTensor(eplb_plan_tensors_.log2phy, eplb_plan_buffers_.log2phy);
+            copyFromTensor(eplb_plan_tensors_.phy2log, eplb_plan_buffers_.phy2log);
+        } catch (const std::exception& error) {
+            RTP_LLM_LOG_ERROR("EPLB plan creation failed: %s", error.what());
+            eplb_plan_buffers_.layer_id_buf.fill_(-1);
+        } catch (...) { eplb_plan_buffers_.layer_id_buf.fill_(-1); }
+        // A failing planner must still participate in the broadcast, so every
+        // peer observes the invalid layer and stops before starting reload.
     }
 
     if (eplb_group_size_ > 1) {
@@ -467,7 +485,8 @@ void ExpertBalancer::loadPlanWeights() {
 
     eplb_python_wrapper_.loadBalanceWeight(ep_rank_, ep_size_, eplb_plan_tensors_);
 
-    executor_collector_.update_weights_latency_ms = autil::TimeUtility::currentTimeInMilliSeconds() - start_time_ms;
+    // Publish to the metrics collector on the inference thread after joining.
+    load_latency_ms_ = autil::TimeUtility::currentTimeInMilliSeconds() - start_time_ms;
 }
 
 void ExpertBalancer::applyPlanWeights(ModelBase& model) {

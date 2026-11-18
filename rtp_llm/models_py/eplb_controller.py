@@ -1,11 +1,11 @@
 """Dynamic EPLB controller backed by NewModelLoader checkpoint streaming."""
 
-from functools import partial
 import logging
 import random
 import threading
 from collections import deque
 from enum import Enum
+from functools import partial
 from queue import Queue
 from typing import Any, Deque, Dict, Sequence
 
@@ -113,8 +113,12 @@ class NewLoaderExpertBalancer:
                 raise ValueError(
                     "Dynamic EPLB model contains MoE layers outside its PP stage"
                 )
-        if self.num_gpu % self.num_nodes:
-            self.num_nodes = 1
+        # rebalance_experts uses a global (one-node) solve on its non-hierarchical
+        # path. Match main's explicit topology error on the hierarchical path.
+        if self.num_groups % self.num_nodes == 0 and self.num_gpu % self.num_nodes:
+            raise ValueError(
+                f"Hierarchical EPLB requires ep_size={self.num_gpu} divisible by num_nodes={self.num_nodes}"
+            )
 
         eplb_config = model_config.eplb_config
         self.select_layer_method = _SelectLayerMethod(eplb_config.balance_method)

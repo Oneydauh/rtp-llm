@@ -9,7 +9,8 @@ void EplbPlanTensors::init(int log_exp_num, int phy_exp_num) {
     // note: no need to init moe_weight_1 and moe_weight_2
 }
 
-ExpertBalancerPythonWrapper::ExpertBalancerPythonWrapper(py::object py_eplb): direct_install_(usesDirectInstall(py_eplb)), py_eplb_(std::move(py_eplb)) {}
+ExpertBalancerPythonWrapper::ExpertBalancerPythonWrapper(py::object py_eplb):
+    direct_install_(usesDirectInstall(py_eplb)), py_eplb_(std::move(py_eplb)) {}
 
 void ExpertBalancerPythonWrapper::createBalancePlan(torch::Tensor&   log_stats,
                                                     torch::Tensor&   gpu_loads,
@@ -58,7 +59,7 @@ void ExpertBalancerPythonWrapper::loadBalanceWeight(int ep_rank, int ep_size, Ep
 bool ExpertBalancerPythonWrapper::usesDirectInstall(const py::object& controller) {
     py::gil_scoped_acquire gil;
     return controller && !controller.is_none() && py::hasattr(controller, "supports_python_weight_install")
-        && controller.attr("supports_python_weight_install")().cast<bool>();
+           && controller.attr("supports_python_weight_install")().cast<bool>();
 }
 
 void ExpertBalancerPythonWrapper::installBalancePlan(const EplbPlanTensors& plan) {

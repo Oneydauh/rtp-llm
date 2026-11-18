@@ -248,6 +248,30 @@ class BaseMoEExperts(RtpModule):
             "_eplb_logic_expert_cnt", logic_expert_cnt, persistent=False
         )
         self.register_buffer("_eplb_log2phy", log2phy, persistent=False)
+        # This scalar is read by captured device code; a Python bool would freeze
+        # the pre-install branch in every graph captured during warmup.
+        self.register_buffer("_eplb_active", torch.tensor(False), persistent=False)
+        # Explicit phy2log files need not place a logical expert in its
+        # canonical slot. Keep the legacy choice where valid; otherwise select
+        # a slot that actually contains that expert from the loaded placement.
+        logical_per_rank = self.num_experts // self.ep_size
+        initial_map = self._expert_placement.physical_to_logical
+        first = {}
+        for slot, logical in enumerate(initial_map):
+            first.setdefault(logical, slot)
+        routes = []
+        for logical in range(self.num_experts):
+            canonical = (
+                logical // logical_per_rank
+            ) * self.num_local_experts + logical % logical_per_rank
+            routes.append(
+                canonical if initial_map[canonical] == logical else first[logical]
+            )
+        self.register_buffer(
+            "_initial_expert_route",
+            torch.tensor(routes, dtype=torch.int64),
+            persistent=False,
+        )
         self._eplb_log_stats: Optional[torch.Tensor] = None
         self._eplb_gpu_loads: Optional[torch.Tensor] = None
 
@@ -1133,6 +1157,15 @@ class BaseMoEExperts(RtpModule):
         weights_dict = self._build_weights_dict()
         self._runtime_weights_dict = dict(weights_dict)
         self.fused_moe = FusedMoeFactory().create_fused_moe(adapter, weights_dict)
+        if self._dynamic_eplb_enabled and self.ep_size > 1:
+            # Enable the matching pair before capture, never on the first update.
+            executor = getattr(self.fused_moe, "fused_experts", None)
+            router = getattr(self.fused_moe, "router", None)
+            if hasattr(executor, "use_deterministic_eplb_gather") and hasattr(
+                router, "use_deterministic_eplb_gather"
+            ):
+                executor.use_deterministic_eplb_gather = True
+                router.use_deterministic_eplb_gather = True
 
     def is_cpu_checkpoint_staging(self) -> bool:
         """Loaded CPU parameters without accelerator layout/executor readiness.
@@ -1167,7 +1200,11 @@ class BaseMoEExperts(RtpModule):
     def validate_eplb_reload_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         """Validate a reloaded layer completely before any rank installs it."""
         runtime = self.eplb_runtime_weight_view()
-        for name in self._eplb_weight_names():
+        names = self._eplb_weight_names()
+        unexpected = set(weights).difference(names)
+        if unexpected:
+            raise ValueError(f"Undeclared EPLB reload tensors: {sorted(unexpected)}")
+        for name in names:
             target = runtime.get(name)
             source = weights.get(name)
             if target is None:
@@ -1282,15 +1319,6 @@ class BaseMoEExperts(RtpModule):
             raise ValueError("EPLB routing tensors do not match phy2log")
         self.validate_eplb_reload_weights(weights)
         runtime = self.eplb_runtime_weight_view()
-        fused_experts = getattr(self.fused_moe, "fused_experts", None)
-        router = getattr(self.fused_moe, "router", None)
-        deterministic = hasattr(fused_experts, "use_deterministic_eplb_gather")
-        if deterministic:
-            if not hasattr(router, "use_deterministic_eplb_gather"):
-                raise RuntimeError(
-                    "The selected EPLB executor requires a deterministic "
-                    "aggregation-capable router"
-                )
         updates = [
             TensorUpdate(name, runtime[name], weights[name])
             for name in self._eplb_weight_names()
@@ -1302,6 +1330,9 @@ class BaseMoEExperts(RtpModule):
                     W.logic_expert_cnt, self._eplb_logic_expert_cnt, logic_expert_cnt
                 ),
                 TensorUpdate(W.log2phy, self._eplb_log2phy, log2phy),
+                TensorUpdate(
+                    "plan_active", self._eplb_active, torch.ones_like(self._eplb_active)
+                ),
             ]
         )
         transaction = RuntimeWeightTransaction(updates)
@@ -1309,18 +1340,9 @@ class BaseMoEExperts(RtpModule):
         self._eplb_previous_runtime_state = (
             self._expert_placement,
             self._eplb_plan_installed,
-            (
-                (fused_experts, fused_experts.use_deterministic_eplb_gather)
-                if deterministic
-                else None
-            ),
-            (router, router.use_deterministic_eplb_gather) if deterministic else None,
         )
         try:
             transaction.install()
-            if deterministic:
-                fused_experts.use_deterministic_eplb_gather = True
-                router.use_deterministic_eplb_gather = True
             self._expert_placement = placement
             self._eplb_plan_installed = True
             if not defer_commit:
@@ -1338,15 +1360,9 @@ class BaseMoEExperts(RtpModule):
             transaction.commit()
         else:
             transaction.rollback()
-            placement, installed, executor_flag, router_flag = (
+            self._expert_placement, self._eplb_plan_installed = (
                 self._eplb_previous_runtime_state
             )
-            self._expert_placement = placement
-            self._eplb_plan_installed = installed
-            for flag in (executor_flag, router_flag):
-                if flag is not None:
-                    owner, previous = flag
-                    owner.use_deterministic_eplb_gather = previous
         self._eplb_install_transaction = None
         self._eplb_previous_runtime_state = None
 
@@ -1372,7 +1388,9 @@ class BaseMoEExperts(RtpModule):
         logical_ids = topk_ids.to(dtype=torch.int64)
         valid = (logical_ids >= 0) & (logical_ids < self.num_experts)
         safe_logical_ids = logical_ids.clamp(0, self.num_experts - 1)
-        if self._dynamic_eplb_enabled and self._eplb_plan_installed:
+        physical_ids = self._initial_expert_route[safe_logical_ids]
+        if self._dynamic_eplb_enabled:
+            canonical_ids = physical_ids
             flat_logical = safe_logical_ids.reshape(-1)
             replica_counts = self._eplb_logic_expert_cnt.index_select(
                 0, flat_logical
@@ -1389,16 +1407,7 @@ class BaseMoEExperts(RtpModule):
             physical_ids = self._eplb_log2phy[flat_logical, replica_ids].reshape_as(
                 logical_ids
             )
-            mapped = torch.where(valid, physical_ids, logical_ids)
-            self._record_eplb_stats(logical_ids, mapped)
-            return mapped.to(dtype=topk_ids.dtype)
-        logical_per_rank = self.num_experts // self.ep_size
-        physical_per_rank = self.physical_num_experts // self.ep_size
-        owner_rank = torch.div(
-            safe_logical_ids, logical_per_rank, rounding_mode="floor"
-        )
-        local_logical_id = torch.remainder(safe_logical_ids, logical_per_rank)
-        physical_ids = owner_rank * physical_per_rank + local_logical_id
+            physical_ids = torch.where(self._eplb_active, physical_ids, canonical_ids)
         mapped = torch.where(valid, physical_ids, logical_ids)
         if self._dynamic_eplb_enabled:
             self._record_eplb_stats(logical_ids, mapped)
@@ -1455,7 +1464,7 @@ class BaseMoEExperts(RtpModule):
             )
         physical_topk_ids = self._map_logical_to_physical(topk_ids)
         extra_finalize_args = None
-        if self._dynamic_eplb_enabled and self._eplb_plan_installed:
+        if self._dynamic_eplb_enabled:
             extra_finalize_args = {
                 "eplb_logical_topk_ids": topk_ids,
                 "eplb_logical_experts_per_rank": self.num_experts // self.ep_size,

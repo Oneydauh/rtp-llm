@@ -87,7 +87,7 @@ py_test(
 # backported scheduler/cache/PP engine. Production routing is integrated later.
 py_library(
     name = "new_weight_loader",
-    srcs = glob([
+    srcs = ["eplb_controller.py"] + glob([
         "layers/*.py",
         "new_models/*.py",
         "new_models/**/*.py",
@@ -101,6 +101,7 @@ py_library(
     deps = [
         ":models",
         ":new_loader_core",
+        "//rtp_llm:eplb",
         "//rtp_llm:fastsafetensors",
         "//rtp_llm:ops",
         "//rtp_llm/models_py/distributed:collective_torch",
@@ -138,6 +139,15 @@ py_test(
         ":new_weight_loader",
         "//rtp_llm:transformers",
     ],
+)
+
+py_test(
+    name = "eplb_direct_reload_test",
+    srcs = ["eplb_direct_test.py"],
+    main = "eplb_direct_test.py",
+    deps = [":new_weight_loader"],
+    env = {"CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1"},
+    timeout = "moderate",
 )
 
 py_library(
