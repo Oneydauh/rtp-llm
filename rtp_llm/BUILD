@@ -164,6 +164,13 @@ _JIT_CACHE_SRCS = [
 ]
 _JIT_CACHE_ENV_SRCS = ["utils/jit_cache_env.py"]
 
+# safetensors.torch.save_file uses NumPy even for ordinary torch tensors.
+# The optional framework requirements are not in safetensors' wheel metadata.
+py_library(
+    name = "safetensors_torch",
+    deps = [":numpy", ":safetensors", ":torch"],
+)
+
 py_library(
     name = "utils",
     srcs = glob([
@@ -257,11 +264,22 @@ py_library(
 )
 
 py_library(
+    name = "device_detection",
+    srcs = [
+        "device/__init__.py",
+        "device/architecture.py",
+        "device/device_type.py",
+    ],
+    deps = [":torch"],
+)
+
+py_library(
     name = "device",
     srcs = glob([
         "device/**/*.py",
-    ]),
+    ], exclude = ["device/__init__.py", "device/architecture.py", "device/device_type.py"]),
     deps = [
+        ":device_detection",
         ":torch",
         ":psutil",
         ":utils",
@@ -295,12 +313,23 @@ py_library(
 )
 
 py_library(
+    name = "model_factory_register",
+    srcs = ["model_factory_register.py"],
+    deps = [":utils"],
+)
+
+py_library(
     name = "models",
     srcs = glob([
         "models/*.py",
         "models/**/*.py",
     ], exclude=["models/test/*.py"]),
     deps = [
+        ":async_model",
+        ":config",
+        ":frontend",
+        ":model_factory_register",
+        "//rtp_llm/metrics:metrics",
         ":sentencepiece",
         ":sentence-transformers",
         ":transformers",
@@ -404,6 +433,8 @@ py_library(
         "config/**/*.py",
     ]),
     deps = [
+        ":ops",
+        ":pydantic",
         "//rtp_llm/distribute:distribute",
         "//rtp_llm/models_py/distributed:rank_layout",
         ":multimodal"
@@ -506,13 +537,13 @@ py_library(
         'start_backend_server.py',
         'start_dash_sc_server.py',
         '_ft_pickler.py',
-        'model_factory_register.py',
     ],
     deps = [
         "//rtp_llm/server:server",
         "//rtp_llm/distribute:distribute",
         "//rtp_llm/models_py/distributed:rank_layout",
         ":uvicorn",
+        ":model_factory_register",
         ":fastapi",
         ":psutil",
         ":oss2",

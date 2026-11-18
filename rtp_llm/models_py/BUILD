@@ -24,10 +24,13 @@ py_library(
         "weight_mapper.py",
     ],
     deps = [
-        "//rtp_llm:safetensors",
-        "//rtp_llm:torch",
+        "//rtp_llm:device_detection",
+        "//rtp_llm:safetensors_torch",
         "//rtp_llm/models_py/distributed:rank_layout",
-    ],
+    ] + select({
+        "@//:using_ppu": [":ppu_entrypoint"],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
 )
 
@@ -111,9 +114,17 @@ py_library(
         "**/*_test.py",
         "**/test_*.py",
     ]),
+    # Full model owners import both native binding modules. Place the DSOs
+    # together in the package path used by rtp_llm.ops; the portable reader
+    # above deliberately has no native inference dependency.
+    data = [
+        "//rtp_llm/libs:librtp_compute_ops_so",
+        "//rtp_llm/libs:libth_transformer_config_so",
+    ],
     deps = [
         ":models",
         ":new_loader_core",
+        "//rtp_llm:config",
         "//rtp_llm:eplb",
         "//rtp_llm/model_loader/tipc:tipc",
         "//rtp_llm:fastsafetensors",
@@ -627,6 +638,8 @@ py_library(
         ":modules",
         ":kernels",
         ":configs",
+        "//rtp_llm:config",
+        "//rtp_llm:device",
         "//rtp_llm:warmup",
         "//rtp_llm/model_loader:loader",
     ] + select({
