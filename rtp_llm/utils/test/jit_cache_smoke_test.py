@@ -1,9 +1,11 @@
 """Real-model smoke coverage for remote JIT publish and restore."""
 
+import asyncio
 import contextlib
 import json
 import logging
 import os
+import shlex
 import shutil
 import tempfile
 import time
@@ -140,12 +142,14 @@ def _send_request(
 def _send_cuda_ipc_weight_update(
     server: "MagaServerManager", model_path: str, timeout: float
 ) -> None:
-    import grpc
     import torch
     from safetensors import safe_open
 
-    from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2 import UpdateWeightsRequestPB
-    from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2_grpc import RpcServiceStub
+    from rtp_llm.server.server_args.server_args import setup_args
+    from rtp_llm.utils.test.smoke_weight_update_rpc import (
+        paused_weight_update,
+        rank_addresses,
+    )
 
     index = json.loads((Path(model_path) / "model.safetensors.index.json").read_text())
     shard = Path(model_path) / index["weight_map"][WEIGHT_NAME]
@@ -157,15 +161,20 @@ def _send_cuda_ipc_weight_update(
     ):
         from rtp_llm.model_loader.tipc import CudaIpcHelper
 
-        request = UpdateWeightsRequestPB(
-            name=WEIGHT_NAME,
-            desc=CudaIpcHelper().build_tensor_meta(tensor).hex(),
-            method="cuda_ipc",
+        env = setup_args(shlex.split(os.environ["SMOKE_ARGS"]))
+        # custom_smoke_test derives WORLD_SIZE and server flags from the same
+        # declaration. Address every engine process reserved for this run.
+        members = rank_addresses(
+            server.port, env.server_config, int(os.environ["WORLD_SIZE"])
         )
-        with grpc.insecure_channel(f"127.0.0.1:{server.port + 1}") as channel:
-            RpcServiceStub(channel).UpdateWeights(
-                request, timeout=timeout, wait_for_ready=True
+        asyncio.run(
+            paused_weight_update(
+                members,
+                WEIGHT_NAME,
+                CudaIpcHelper().build_tensor_meta(tensor).hex(),
+                timeout,
             )
+        )
         torch.cuda.synchronize()
 
 
