@@ -52,6 +52,12 @@ py_test(
 )
 
 py_test(
+    name = "ft_module_install_test",
+    srcs = ["ft_module_install_test.py"],
+    deps = [":new_loader_core"],
+)
+
+py_test(
     name = "rank_local_ft_test",
     srcs = ["rank_local_ft_test.py"],
     env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1"},

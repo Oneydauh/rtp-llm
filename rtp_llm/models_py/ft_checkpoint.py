@@ -497,7 +497,7 @@ class FTCheckpoint:
                 )
             used_sources.update(binding.sources)
             used_targets.add(binding.target)
-            del tensor
+            del tensor, values
         if used_sources != self.entries.keys():
             raise ValueError(
                 f"Unbound FT tensors: {sorted(self.entries.keys() - used_sources)}"
@@ -523,6 +523,7 @@ class FTCheckpoint:
                 # Module-owned loaders also own checkpoint provenance flags and
                 # tied-parameter fan-out. Reuse them after all layout validation.
                 binding.install(values)
+            del values
             owner_name, _, name = path.rpartition(".")
             owner = model.get_submodule(owner_name) if owner_name else model
             marker = getattr(owner, "_record_parameter_loaded", None)
