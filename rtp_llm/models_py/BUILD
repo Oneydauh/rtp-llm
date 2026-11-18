@@ -150,6 +150,27 @@ py_test(
     timeout = "moderate",
 )
 
+py_test(
+    name = "qwen3_moe_checkpoint_test",
+    srcs = [
+        "qwen3_moe_checkpoint_test.py",
+        "serving_route_checkpoint_test.py",
+    ],
+    main = "qwen3_moe_checkpoint_test.py",
+    deps = [":new_weight_loader", "//rtp_llm:models"],
+)
+
+py_test(
+    name = "qwen3_moe_native_service_test",
+    srcs = [
+        "qwen3_moe_native_service_test.py",
+        "qwen3_moe_checkpoint_test.py",
+        "serving_route_checkpoint_test.py",
+    ],
+    main = "qwen3_moe_native_service_test.py",
+    deps = [":new_weight_loader", "//rtp_llm:models"],
+)
+
 py_library(
     name = "utils",
     srcs = glob([
