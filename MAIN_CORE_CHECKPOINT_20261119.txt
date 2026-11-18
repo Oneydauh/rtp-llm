@@ -1,0 +1,63 @@
+Main carrier: first portable NewLoader core checkpoint
+======================================================
+
+Base: main f559bb4 + direct Qwen3 main adaptation 603a79d.
+Workspace: /data2/home/hengcang.wyd/newloader_recovery_20261117_133/agent_main_core_20261119
+Branch: develop/newloader-main-core-20261119
+Owner: T03; other owners must branch from a committed checkpoint, not edit here.
+
+Imported provenance
+  Explicitly selected 24 previously absent files from recovery 3ca4809:
+  model_loader, module_base, read_spec, registry, weight_mapper,
+  borrowed_parameters, expert_placement, ft_checkpoint, finetune_overlay,
+  fastsafetensors_read_spec, fst_range_reader, meta_checkpoint,
+  lora_checkpoint, runtime_weight_update, direct dense layers, and unquantized
+  quant-method core. This includes the previously saved T04 stage group and
+  stage-node-count helpers, not its later controller/runtime work.
+  No existing main source file was replaced. Main native, collective groups,
+  model_desc runtime, scheduler, cache, PP transport and config ABI stay intact.
+
+Focused adaptations
+  Registry advertises only the migrated qwen_3 owner. Additional owners register
+  themselves as their main-compatible implementations are integrated.
+  NewLoaderConfig adds py_hw_kernel_config and max_generate_batch_size; the
+  latter is validated as a nonnegative integer. Main entry-point integration
+  must supply actual values to preserve decode-cascade configuration.
+  Existing 603a79d Qwen3 owner uses main GptModelBase with a local RtpModule
+  mixin, main layer_ids/capture context, and main PP tensor boundaries.
+
+Verification actually run in user's 133 container
+  Python 3.10, Torch 2.8.0+cu129 from existing user Bazel external tree.
+  CUDA/HIP/ROCR visibility empty; OMP/MKL threads 1; no native build.
+  No native import stubs or monkeypatched loading backends.
+  main_core_checkpoint_test: four test methods PASS, including eight real
+  checkpoint-loading combinations (safetensors/bin x two ownership stages x
+  two sequential TP ranks), direct parameter values, indexed head rows,
+  completeness failure, unknown-weight rejection, and config validation.
+  These are tiny direct-parameter owners, not the full Qwen3 runtime; sequential
+  ranks are not a multi-process/multi-GPU test. Explicit method was scratch.
+  Runner: task root/run_main_core_cpu133.sh
+  Log: task root/main_core_checkpoint_cpu_20261119.log
+
+  Command:
+    bash <task-root>/run_main_core_cpu133.sh rtp_llm.models_py.main_core_checkpoint_test
+
+Not yet verified / not yet integrated
+  Full Qwen3 owner instantiation needs matching main config/compute extensions;
+  existing old recovery extensions are NOT main ABI evidence.
+  No GPU, NCCL, full PPExecutor, golden smoke, CI or performance result.
+  No claim of strict NewFST success: transport helpers are present but their
+  main-carrier native FST backend path still needs dedicated execution.
+  BaseModel production route, BUILD/runfiles integration and all non-Qwen3
+  owners are still pending. The production gate was not opened.
+  Quant backends beyond none are intentionally not imported in this initial
+  dependency checkpoint; their owning agents will port their finalized files.
+  Final T02 valid-vocab narrowing, T17 update transactions, T04 EPLB main-native
+  bridge/controller and recent finetune/FST/checkpoint-format improvements need
+  separate reviewed integration. Do not overwrite main runtime to obtain them.
+
+Commit checks
+  Cached black/isort on edited files, syntax and git diff whitespace checks.
+  Full pre-commit remains unavailable due the previously documented unrelated
+  FlexLB shfmt installation. Save commit uses a one-command hooks override,
+  not a persistent repo/global config change. No push or PR change.
