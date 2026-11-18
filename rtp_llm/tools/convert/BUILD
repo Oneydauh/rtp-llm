@@ -12,6 +12,12 @@ py_library(
     deps = ["//rtp_llm:safetensors"],
 )
 
+py_test(
+    name = "ft_export_metadata_test",
+    srcs = ["ft_export_metadata_test.py"],
+    deps = [":ft_export_metadata", "//rtp_llm:torch"],
+)
+
 py_library(
     name = "convert",
     srcs = glob([
