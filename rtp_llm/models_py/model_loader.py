@@ -1040,7 +1040,7 @@ class NewModelLoader:
                 f"name filtering and would materialize non-local experts: {unsupported}"
             )
 
-    def _create_model(self) -> nn.Module:
+    def _create_model(self, *, ft_load_config=None) -> nn.Module:
         model_type = self._model_type()
         try:
             model_cls = get_model_class(model_type)
@@ -1048,7 +1048,7 @@ class NewModelLoader:
             raise ValueError(
                 f"Model type {model_type!r} is not registered; available={list_models()}"
             ) from exc
-        model = model_cls(self.model_config, self.load_config)
+        model = model_cls(self.model_config, ft_load_config or self.load_config)
         if not isinstance(model, RtpModule):
             raise TypeError(
                 f"Registered model {model_cls.__name__} must inherit RtpModule to "
@@ -1068,6 +1068,14 @@ class NewModelLoader:
             "Created newloader model %s from %s", model_cls.__qualname__, source
         )
         return model
+
+    def _create_checkpoint_model(self, checkpoint):
+        quant = self.load_config.quant_config
+        adapt = getattr(quant, "for_ft_snapshot", None)
+        encoded = adapt() if isinstance(checkpoint, FTCheckpoint) and callable(adapt) else quant
+        if encoded is quant:
+            return self._create_model()
+        return self._create_model(ft_load_config=replace(self.load_config, quant_config=encoded))
 
     @staticmethod
     def _validate_loaded_weights(model: nn.Module) -> None:
@@ -2159,9 +2167,6 @@ class NewModelLoader:
         )
         expert_filter = self._expert_filter()
         self._validate_ep_checkpoint_format(checkpoint_files, expert_filter)
-        with torch.device("cpu"):
-            model = self._create_model()
-        bind_borrowed_parameters(model, self.parameter_aliases, self.load_config.device)
         parallel = self.load_config.parallelism_config
         ft_checkpoint = meta_checkpoint or FTCheckpoint.open(
             self._resolved_model_path(),
@@ -2181,6 +2186,9 @@ class NewModelLoader:
                 else getattr(self.model_config, "num_layers", None)
             ),
         )
+        with torch.device("cpu"):
+            model = self._create_checkpoint_model(ft_checkpoint)
+        bind_borrowed_parameters(model, self.parameter_aliases, self.load_config.device)
         if ft_checkpoint is not None:
             # Format adapters own their import and return before the HF/FST
             # borrowed-parameter filters. Do not let them mutate target loans.

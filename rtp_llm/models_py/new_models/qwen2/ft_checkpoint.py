@@ -400,9 +400,17 @@ def load_gqa_ffn_ft_checkpoint(model, checkpoint):
             from rtp_llm.models_py.quant_methods.block_fp8_ft import (
                 block_moe_ft_bindings,
             )
+            from rtp_llm.models_py.quant_methods.channel_tensor_moe_ft import (
+                nonblock_moe_ft_bindings,
+            )
 
+            expert_binding = (
+                block_moe_ft_bindings
+                if layer.mlp.experts._quant_family == "fp8_per_block"
+                else nonblock_moe_ft_bindings
+            )
             bindings.extend(
-                block_moe_ft_bindings(
+                expert_binding(
                     layer.mlp.experts, src, dst + "mlp.experts", checkpoint, layer_id
                 )
             )

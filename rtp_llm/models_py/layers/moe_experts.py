@@ -377,6 +377,10 @@ class BaseMoEExperts(RtpModule):
             )
 
         source_method = moe_checkpoint_method_key(source_config)
+        if source_method == getattr(self._quant_config, "ft_encoded_online_source", None):
+            # FT stored the actual output of OldLoader's online quantizer; its
+            # parameters must already match the prequantized owner exactly.
+            source_method = source_method.removesuffix("_online")
         source_family = {
             **self._BASE_QUANT_MAP,
             **self._EXTRA_QUANT_MAP,

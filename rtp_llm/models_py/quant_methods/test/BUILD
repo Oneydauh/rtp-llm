@@ -38,3 +38,10 @@ py_test(
     exec_properties = {"gpu": "H20"},
     tags = ["H20"],
 )
+
+py_test(
+    name = "test_moe_ft_scalar",
+    srcs = ["test_moe_ft_scalar.py", "test_block_fp8_ft.py"],
+    main = "test_moe_ft_scalar.py",
+    deps = ["//rtp_llm/models_py:new_weight_loader"],
+)

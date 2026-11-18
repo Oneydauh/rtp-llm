@@ -207,6 +207,20 @@ class QuantizationConfig:
         """Return the validated output/input FP8 block dimensions."""
         return self.weight_block_size[0], self.weight_block_size[1]
 
+    def for_ft_snapshot(self):
+        """FT already contains the output of the requested load-time quantizer.
+
+        Do not mutate the source ModelConfig: executor selection still sees the
+        original runtime algorithm. Only the parameter staging ABI changes,
+        and the format adapter must validate all kernels and scales as usual.
+        """
+        if self.quant_type not in ("fp8_online", "fp8_block_online", "fp8_per_channel_online"):
+            return self
+        encoded = QuantizationConfig(self.quant_type.removesuffix("_online"), self.source_config,
+                                     self.ignored_layers, self.hw_kernel_config)
+        encoded.ft_encoded_online_source = self.quant_type
+        return encoded
+
     @staticmethod
     def _normalize_ignored(values: Iterable[str]) -> List[str]:
         if isinstance(values, str):

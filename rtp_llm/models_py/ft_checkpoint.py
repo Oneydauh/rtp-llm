@@ -276,8 +276,8 @@ class FTCheckpoint:
             )
         return tuple(ids)
 
-    def read_expert_rows(self, name, layer_id, placement):
-        """Read one already-sharded projection/scale in *target* physical order.
+    def _expert_row_sources(self, name, layer_id, placement):
+        """Locate rows of an already-sharded projection in target physical order.
 
         Main's CLI exports either pure TP (all EP=0, distinct expert TP slices)
         or one worker per EP, with no redundant experts and canonical slot order.
@@ -334,12 +334,32 @@ class FTCheckpoint:
                 # Replicated experts in explicit placements have identical
                 # semantic values; prefer the rank-local source when available.
                 if logical not in sources or xyz[2] == t.ep_rank:
-                    sources[logical] = (key, path, slot)
+                    sources[logical] = (xyz, key, path, slot)
         if len(sources) != logical_count:
             raise ValueError(f"FT source placement omits logical experts for {name}")
+        return [sources[i] for i in placement.local_physical_to_logical], expected_tail
+
+    def read_expert_rank_scalars(self, name, weight_name, layer_id, placement):
+        """Restore a rank-wide legacy scalar for each selected expert slot."""
+        if not name.startswith(f"layers.{layer_id}.") or name not in self.entries:
+            raise ValueError(f"FT calibration not owned by layer/stage: {name}")
+        rows, _ = self._expert_row_sources(weight_name, layer_id, placement)
+        cache = {}
+        for xyz, *_ in rows:
+            if xyz in cache:
+                continue
+            key, path = self._by_rank[xyz][name]
+            scalar = self._read_tensor(key, path)
+            if scalar.numel() != 1 or scalar.dtype != torch.float32:
+                raise ValueError(f"Expected one float32 FT calibration scalar: {key}")
+            cache[xyz] = scalar.reshape(())
+        return torch.stack([cache[xyz] for xyz, *_ in rows])
+
+    def read_expert_rows(self, name, layer_id, placement):
+        """Read only rows belonging to the selected destination expert slots."""
+        rows, expected_tail = self._expert_row_sources(name, layer_id, placement)
         runs = []
-        for logical in placement.local_physical_to_logical:
-            key, path, slot = sources[logical]
+        for _, key, path, slot in rows:
             if runs and runs[-1][:2] == (key, path) and runs[-1][3] == slot:
                 runs[-1] = (key, path, runs[-1][2], slot + 1)
             else:
@@ -497,9 +517,8 @@ class FTCheckpoint:
                 if binding.read
                 else tuple(self.read(name) for name in binding.sources)
             )
-            tensor = binding.convert(values)
             if binding.install is None:
-                target.copy_(tensor)
+                target.copy_(binding.convert(values))
             else:
                 # Module-owned loaders also own checkpoint provenance flags and
                 # tied-parameter fan-out. Reuse them after all layout validation.
