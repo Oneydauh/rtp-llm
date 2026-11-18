@@ -4,6 +4,7 @@ import os
 import platform
 import re
 import time
+from itertools import chain
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
@@ -13,6 +14,7 @@ import torch.nn as nn
 
 import rtp_llm.models_py.weight_mapper as weight_mapper
 from rtp_llm.models_py.borrowed_parameters import (
+    FixedHostCheckpointStorage,
     bind_borrowed_parameters,
     borrowed_parameter_ids,
     exclude_borrowed_checkpoint_weights,
@@ -2336,12 +2338,33 @@ class NewModelLoader:
                 for module in coordinator_modules:
                     module._rtp_staged_load_coordinator = staged_coordinator
         if accelerator_fst:
-            weights = self._fastsafetensors_weights_iterator(
-                selected_files,
-                self.load_config.device,
-                base_filter,
-                base_expander,
-                base_resolver,
+            from rtp_llm.models_py.fst_file_plan import plan_fst_files
+            from rtp_llm.models_py.fst_range_reader import iter_fst_range_tensors
+
+            _, single_group = self._fastsafetensors_api()
+            process_group = self._fastsafetensors_process_group(
+                single_group, selected_files, base_expander
+            )
+            host_prefixes = tuple(
+                name + "." if name else "" for name, module in model.named_modules()
+                if isinstance(module, FixedHostCheckpointStorage)
+            )
+            shared, independent = plan_fst_files(
+                selected_files, self._resolved_model_path(), process_group,
+                overlay.base_filter(model_filter) if overlay is not None else model_filter,
+                (lambda key: self._mapped_checkpoint_name(model,key).startswith(host_prefixes))
+                if host_prefixes else None,
+            )
+            if independent:
+                logger.info("NewLoader FST: %d collective files; %d use independent native CPU range reads",
+                            len(shared),len(independent))
+            weights = chain(
+                self._fastsafetensors_weights_iterator(
+                    shared, self.load_config.device, base_filter, base_expander, base_resolver
+                ) if shared else (),
+                iter_fst_range_tensors(independent, name_filter=base_filter,
+                    slice_expander=base_expander, read_spec_resolver=base_resolver)
+                if independent else (),
             )
         elif method == NewLoaderLoadMethod.FASTSAFETENSORS:
             from rtp_llm.models_py.fst_range_reader import iter_fst_range_tensors

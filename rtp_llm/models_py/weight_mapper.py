@@ -372,9 +372,9 @@ def select_safetensor_files(
 ) -> List[str]:
     """Select shards containing at least one accepted checkpoint tensor.
 
-    The model predicate must be rank-invariant. Rank-specific expert slicing is
-    intentionally applied later so a future collective loader cannot diverge
-    across ranks while opening shards.
+    Model predicates can be rank-local (e.g. fixed-host PLE tables). The FST
+    transport reconciles these file and key schedules across its actual group;
+    rank-specific expert slicing is applied separately.
     """
     files = list(checkpoint_files)
     if name_filter is None or not files:

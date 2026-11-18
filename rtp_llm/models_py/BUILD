@@ -13,6 +13,7 @@ py_library(
         "fastsafetensors_read_spec.py",
         "finetune_overlay.py",
         "fst_range_reader.py",
+        "fst_file_plan.py",
         "ft_checkpoint.py",
         "lora_checkpoint.py",
         "meta_checkpoint.py",
@@ -220,6 +221,21 @@ py_library(
     srcs = ["owner_migration_checkpoint_test.py"],
     deps = [":new_weight_loader"],
     visibility = ["//rtp_llm/model_loader/test:__pkg__"],
+)
+
+py_library(
+    name = "ple_residency_test_cases",
+    testonly = True,
+    srcs = ["new_models/qwen4_exp/ple_residency_test.py"],
+    deps = [":new_weight_loader"],
+    visibility = ["//rtp_llm/models/qwen4_exp/test:__pkg__"],
+)
+
+py_test(
+    name = "ple_host_fst_routing_test",
+    srcs = ["new_models/qwen4_exp/ple_residency_test.py"],
+    main = "new_models/qwen4_exp/ple_residency_test.py",
+    deps = [":new_weight_loader"],
 )
 
 py_test(

@@ -12,6 +12,7 @@ from typing import Optional
 import torch
 from torch import nn
 
+from rtp_llm.models_py.borrowed_parameters import FixedHostCheckpointStorage
 from rtp_llm.models_py.module_base import RtpModule, copy_weight_
 from rtp_llm.models_py.read_spec import ReadSpec, unwrap_checkpoint_tensor
 
@@ -22,7 +23,7 @@ def _positive_int(value, name):
     return value
 
 
-class Qwen4PLEHostTable(RtpModule):
+class Qwen4PLEHostTable(FixedHostCheckpointStorage, RtpModule):
     """Own this TP rank's independent n-gram shards, never a combined table.
 
     Shapes are discovered as each local shard arrives. Zero-sized placeholders
@@ -62,6 +63,7 @@ class Qwen4PLEHostTable(RtpModule):
         self.compute_dtype = dtype
         self.source_fp8 = source_fp8
         self.preserve_fp8 = preserve_fp8
+        self._ft_predequantized = False
         self.shard_rows = (
             None if shard_rows is None else _positive_int(shard_rows, "shard_rows")
         )
@@ -87,12 +89,6 @@ class Qwen4PLEHostTable(RtpModule):
             )
         else:
             self.register_buffer("weight_scale", None)
-
-    def _apply(self, fn, recurse=True):
-        # Host residency and raw storage dtype are part of this leaf's runtime
-        # contract. This also excludes it from FST GPU destination allocation.
-        # Metadata/projections are separate modules and still migrate normally.
-        return self
 
     def owns_checkpoint_name(self, name: str) -> bool:
         match = self._SHARD.fullmatch(name)
@@ -171,9 +167,62 @@ class Qwen4PLEHostTable(RtpModule):
                 self._mark_weight_loaded(parameter_name)
             self._seen.add(name)
 
+    def load_ft_shards(self, checkpoint, layer_id):
+        """Import this rank's OldLoader runtime shards without touching peer ranks.
+
+        The old exporter drops the scale after conversion to BF16. Import that
+        table as a materialized runtime value; applying an HF scale again corrupts it.
+        Return consumed names for the enclosing model adapter's completeness check.
+        """
+        if self._seen:
+            raise RuntimeError("PLE FT restore requires a fresh table")
+        if type(layer_id) is not int or layer_id < 0:
+            raise ValueError("invalid PLE FT layer id")
+        from rtp_llm.utils.model_weight import W
+
+        prefix = f"layers.{layer_id}."
+        tables = {
+            f"{prefix}{W.qwen4_ple_ngram_shards}.{i}": i for i in self.shard_indices
+        }
+        scale = prefix + W.qwen4_ple_ngram_scale
+        owned = set(tables) | ({scale} if self.preserve_fp8 else set())
+        actual = {
+            k
+            for k in checkpoint.entries
+            if k.startswith(prefix + W.qwen4_ple_ngram_shards + ".") or k == scale
+        }
+        if actual != owned:
+            raise ValueError(
+                f"PLE FT shard/scale ownership mismatch: missing={owned - actual}, unexpected={actual - owned}"
+            )
+        if self.preserve_fp8:
+            self.load_weights({"weight_scale": checkpoint.read(scale)})
+        self._ft_predequantized = self.source_fp8 and not self.preserve_fp8
+        if self._ft_predequantized:
+            self.weight_scale = None
+        for key, index in tables.items():
+            tensor = checkpoint.read(key)
+            name = f"shard_{index}"
+            dtype = torch.float8_e4m3fn if self.preserve_fp8 else self.compute_dtype
+            if tensor.device.type != "cpu" or tensor.dtype != dtype:
+                raise ValueError(
+                    f"Unexpected PLE FT storage for {key}: {tensor.device}/{tensor.dtype}"
+                )
+            if self._ft_predequantized:
+                self._validate_shape(tensor.shape)
+                self._parameters[name].data = tensor.detach().clone()
+                self.shard_rows = tensor.shape[0]
+                self._mark_weight_loaded(name)
+                self._seen.add(name + ".weight")
+                self._scaled.add(index)
+            else:
+                self.load_weights({name + ".weight": tensor})
+        self.validate_weights_loaded()
+        return owned
+
     def validate_weights_loaded(self, loaded_tensor_ids=None):
         expected = {f"shard_{index}.weight" for index in self.shard_indices}
-        if self.source_fp8:
+        if self.source_fp8 and not self._ft_predequantized:
             expected.add("weight_scale")
         missing = expected - self._seen
         if missing:
@@ -182,7 +231,7 @@ class Qwen4PLEHostTable(RtpModule):
 
     def process_weights_after_loading(self):
         self.validate_weights_loaded()
-        if self.source_fp8 and not self.preserve_fp8:
+        if self.source_fp8 and not self.preserve_fp8 and not self._ft_predequantized:
             # Match OldLoader exactly: cast values AND scalar to compute dtype
             # before multiplication, not FP32 dequant followed by a final cast.
             scale = self.weight_scale.to(dtype=self.compute_dtype)
