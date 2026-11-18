@@ -182,6 +182,21 @@ def load_gqa_ffn_ft_checkpoint(model, checkpoint):
 
     embedding = model.embed_tokens
     head = model.lm_head
+    if head is None and "global.lm_head" in checkpoint.entries:
+        # A generation FT archive is also a valid source for a non-generation
+        # deployment of this backbone. Only exclude the unused *projection*;
+        # the last stage still needs its final norm, and undeclared tensors
+        # must continue to fail the strict FT coverage check.
+        from rtp_llm.ops import TaskType
+
+        cfg = model.config
+        task = (
+            cfg.get("task_type")
+            if isinstance(cfg, dict)
+            else getattr(cfg, "task_type", None)
+        )
+        if task is not None and task != TaskType.LANGUAGE_MODEL:
+            del checkpoint.entries["global.lm_head"]
     if any(
         (leaf.tp_size, leaf.tp_rank) != (tp, rank)
         for leaf in (embedding, head)

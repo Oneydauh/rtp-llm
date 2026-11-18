@@ -125,6 +125,24 @@ class MainFTStageTest(unittest.TestCase):
                                 module.self_attn.qkv_proj.weight,
                                 record["self_attention_weights.query_weight.kernel"].T,
                             )
+                        # A non-generating consumer of this exact generation
+                        # archive needs the final norm, but not its LM projection.
+                        from rtp_llm.ops import TaskType
+
+                        embedding_config = SimpleNamespace(**vars(config))
+                        embedding_config.task_type = TaskType.DENSE_EMBEDDING
+                        other_loader = NewModelLoader(
+                            embedding_config, load, model_path=directory
+                        )
+                        backbone = other_loader.load()
+                        self.assertIsNone(backbone.lm_head)
+                        self.assertEqual(other_loader.loaded_method.value, method)
+                        if stage:
+                            torch.testing.assert_close(
+                                backbone.norm.weight, torch.full((4,), 7.0)
+                            )
+                        else:
+                            self.assertIsNone(backbone.norm)
 
 
 if __name__ == "__main__":
