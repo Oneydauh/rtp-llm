@@ -92,7 +92,7 @@ class MainCoreCheckpointTest(unittest.TestCase):
         )
         loader = NewModelLoader(config, load, model_path=directory)
         model = loader.load()
-        self.assertEqual(loader._selected_load_method, NewLoaderLoadMethod.SCRATCH)
+        self.assertEqual(loader.loaded_method, NewLoaderLoadMethod.SCRATCH)
         self.assertTrue(model.postprocessed)
         self.assertFalse(model.training)
         return model
@@ -144,6 +144,28 @@ class MainCoreCheckpointTest(unittest.TestCase):
                 "Checkpoint filter|not loaded|Missing|missing|loaded",
             ):
                 self._load(directory)
+
+    def test_failed_retry_does_not_report_a_successful_backend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "model.safetensors")
+            values = payload()
+            save_file(values, path)
+            loader = NewModelLoader(
+                SimpleNamespace(model_type="_main_core_checkpoint_test", stage=0),
+                NewLoaderConfig(device="cpu", load_method="scratch", tp_size=2),
+                model_path=directory,
+            )
+            self.assertIsNone(loader.loaded_method)
+            previous = loader.load()
+            self.assertEqual(loader.loaded_method, NewLoaderLoadMethod.SCRATCH)
+            del values["model.layers.0.weight"]
+            save_file(values, path)
+            with self.assertRaises((ValueError, RuntimeError)):
+                loader.load()
+            self.assertIsNone(loader.loaded_method)
+            torch.testing.assert_close(
+                previous.layers["0"].weight, payload()["model.layers.0.weight"][:3]
+            )
 
     def test_unknown_weight_is_not_silently_dropped(self):
         values = payload()

@@ -554,6 +554,11 @@ class NewModelLoader:
         self._safetensor_catalog_cache = _CHECKPOINT_CATALOG_UNSET
         self._selected_load_method: Optional[NewLoaderLoadMethod] = None
 
+    @property
+    def loaded_method(self) -> Optional[NewLoaderLoadMethod]:
+        """Backend of the last load attempt, or None until that attempt succeeds."""
+        return self._selected_load_method
+
     def _finetune_overlay(self, checkpoint_files=None):
         from rtp_llm.models_py.finetune_overlay import FinetuneCheckpointOverlay
 
@@ -2027,6 +2032,9 @@ class NewModelLoader:
 
     @torch.inference_mode()
     def load(self) -> nn.Module:
+        # Backend selection alone does not publish a model. On retry, do not
+        # expose the previous attempt's backend as evidence for this attempt.
+        self._selected_load_method = None
         requested_method = self._resolve_load_method()
         meta_checkpoint = None
         if self._model_type() == "llama":
@@ -2154,7 +2162,6 @@ class NewModelLoader:
             selected_files,
             expert_filter,
         )
-        self._selected_load_method = method
         logger.info(
             "NewLoader load method: requested=%s, selected=%s",
             requested_method.value,
@@ -2238,4 +2245,5 @@ class NewModelLoader:
         self._run_post_load_hooks(model)
         validate_borrowed_parameters(model)
         model.eval()
+        self._selected_load_method = method
         return model
