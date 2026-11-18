@@ -27,6 +27,7 @@ class Glm4MoeAttention(RtpModule):
         quant_config,
         params_dtype,
         use_qk_norm,
+        qkv_bias=True,
         rms_norm_eps,
         prefix,
     ):
@@ -45,7 +46,7 @@ class Glm4MoeAttention(RtpModule):
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
-            bias=True,
+            bias=qkv_bias,
             prefix=f"{prefix}.qkv_proj",
             **linear,
         )
@@ -166,6 +167,7 @@ class Glm4MoeDecoderLayer(RtpModule):
         moe_layers,
         use_qk_norm,
         correction_bias,
+        qkv_bias=True,
     ):
         super().__init__()
         prefix = f"layers.{layer_idx}"
@@ -190,6 +192,7 @@ class Glm4MoeDecoderLayer(RtpModule):
             quant_config=cfg["quant_config"],
             params_dtype=cfg["params_dtype"],
             use_qk_norm=use_qk_norm,
+            qkv_bias=qkv_bias,
             rms_norm_eps=cfg["rms_norm_eps"],
             prefix=f"{prefix}.self_attn",
         )

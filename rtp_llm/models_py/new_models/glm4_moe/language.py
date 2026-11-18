@@ -15,8 +15,8 @@ from rtp_llm.ops.compute_ops import PyModelOutputs
 from .parameters import install_glm4_parameters
 
 
-class Glm4MoeForCausalLM(Qwen3ForCausalLM):
-    """Only the common embedding/tied-head checkpoint lifecycle is inherited."""
+class GqaMoeForCausalLM(Qwen3ForCausalLM):
+    """Direct GQA MoE owner; model-specific installers describe checkpoint layout."""
 
     # Expert/projection updates need explicit owner preflight, not the dense
     # model's blanket checkpoint-update capability.
@@ -34,11 +34,11 @@ class Glm4MoeForCausalLM(Qwen3ForCausalLM):
             validate_attention_lora_checkpoint_target,
         )
 
-        validate_attention_lora_checkpoint_target(name, "GLM4 MoE")
+        validate_attention_lora_checkpoint_target(name, type(self).__name__)
 
     def __init__(self, model_config, load_config):
         if not isinstance(model_config, ModelConfig):
-            raise TypeError("GLM4 MoE requires a typed ModelConfig")
+            raise TypeError(f"{type(self).__name__} requires a typed ModelConfig")
         parallel = load_config.parallelism_config
         _validate_supported_parallelism(parallel)
         GptModelBase.__init__(
@@ -63,7 +63,7 @@ class Glm4MoeForCausalLM(Qwen3ForCausalLM):
             ep_size=load_config.ep_size,
             ep_rank=load_config.ep_rank,
         )
-        install_glm4_parameters(
+        self._install_parameters(
             self,
             cfg,
             layer_ids=self.layer_ids(),
@@ -114,3 +114,7 @@ class Glm4MoeForCausalLM(Qwen3ForCausalLM):
             out.pp_intermediates = {"hidden_states": materialized}
             return out
         return capture.finalize(hidden, residual)
+
+
+class Glm4MoeForCausalLM(GqaMoeForCausalLM):
+    _install_parameters = staticmethod(install_glm4_parameters)

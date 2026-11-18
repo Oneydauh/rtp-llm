@@ -16,8 +16,19 @@ from .decoder import Glm4MoeDecoderLayer
 
 
 def install_glm4_parameters(owner, cfg, *, layer_ids, partitioned):
+    install_gqa_moe_parameters(
+        owner,
+        cfg,
+        layer_ids=layer_ids,
+        partitioned=partitioned,
+        layout=Glm4CheckpointLayout.read(cfg["model_config"]),
+        qkv_bias=True,
+    )
+
+
+def install_gqa_moe_parameters(owner, cfg, *, layer_ids, partitioned, layout, qkv_bias):
     model_config = cfg["model_config"]
-    owner._layout = Glm4CheckpointLayout.read(model_config)
+    owner._layout = layout
     owner._owned_layer_ids = layer_ids
     owner._pipeline_partitioned = partitioned
     first = 0 in owner._owned_layer_ids
@@ -49,6 +60,7 @@ def install_glm4_parameters(owner, cfg, *, layer_ids, partitioned):
             moe_layers=owner._layout.routed_layers,
             use_qk_norm=owner._layout.use_qk_norm,
             correction_bias=owner._layout.correction_bias,
+            qkv_bias=qkv_bias,
         )
         for i in owner._owned_layer_ids
     }
@@ -73,7 +85,7 @@ def install_glm4_parameters(owner, cfg, *, layer_ids, partitioned):
             tp_size=cfg["lm_head_tp_size"],
             tp_rank=cfg["lm_head_tp_rank"],
             params_dtype=cfg["lm_head_params_dtype"],
-            **output_vocab_head_kwargs(model_config)
+            **output_vocab_head_kwargs(model_config),
         )
         if last
         else None

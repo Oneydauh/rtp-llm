@@ -111,6 +111,11 @@ def is_model_registered(model_type: str) -> bool:
 
 # Additional owners are registered only after their main-compatible port lands.
 register_lazy_model(
+    "qwen_3_moe",
+    "rtp_llm.models_py.new_models.qwen3_moe.language",
+    "Qwen3MoeForCausalLM",
+)
+register_lazy_model(
     "qwen_3",
     "rtp_llm.models_py.new_models.qwen3",
     "Qwen3ForCausalLM",
