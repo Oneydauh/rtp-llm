@@ -204,6 +204,20 @@ py_test(
 )
 
 py_library(
+    name = "owner_migration_checkpoint_test_cases",
+    testonly = True,
+    srcs = ["owner_migration_checkpoint_test.py"],
+    deps = [":new_weight_loader"],
+    visibility = ["//rtp_llm/model_loader/test:__pkg__"],
+)
+
+py_test(
+    name = "owner_migration_checkpoint_test",
+    srcs = ["owner_migration_checkpoint_test.py"],
+    deps = [":new_weight_loader"],
+)
+
+py_library(
     name = "utils",
     srcs = glob([
         "utils/*.py",
