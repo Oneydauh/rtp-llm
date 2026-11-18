@@ -405,12 +405,19 @@ def _should_use_aiter_flydsl_gdn_prefill(
     )
 
 
+@dataclass(frozen=True)
+class Qwen3NextGdnStateParameters:
+    conv: torch.Tensor
+    dt_bias: torch.Tensor
+    a_log: torch.Tensor
+
+
 class Qwen3NextGatedDeltaNetBase(torch.nn.Module):
     def __init__(
         self,
         linear_attn_config: LinearAttentionConfig,
         parallelism_config: ParallelismConfig,
-        weights: Dict[str, torch.Tensor],
+        weights: Dict[str, torch.Tensor] | Qwen3NextGdnStateParameters,
     ):
         super().__init__()
         self.linear_attn_config = linear_attn_config
@@ -457,9 +464,14 @@ class Qwen3NextGatedDeltaNetBase(torch.nn.Module):
             conv_state_dtype=self.conv_state_dtype,
         )
         # weights
-        self.conv_weights = weights[W.linear_attn_conv1d_w].squeeze(1)
-        self.dt_bias = weights[W.linear_attn_dt_b]
-        self.alog = weights[W.linear_attn_alog]
+        if isinstance(weights, Qwen3NextGdnStateParameters):
+            self.conv_weights = weights.conv
+            self.dt_bias = weights.dt_bias
+            self.alog = weights.a_log
+        else:
+            self.conv_weights = weights[W.linear_attn_conv1d_w].squeeze(1)
+            self.dt_bias = weights[W.linear_attn_dt_b]
+            self.alog = weights[W.linear_attn_alog]
 
     def forward(
         self,
@@ -486,7 +498,7 @@ class Qwen3NextGatedDeltaNetPrefill(Qwen3NextGatedDeltaNetBase):
         self,
         linear_attn_config: LinearAttentionConfig,
         parallelism_config: ParallelismConfig,
-        weights: Dict[str, torch.Tensor],
+        weights: Dict[str, torch.Tensor] | Qwen3NextGdnStateParameters,
     ):
         super().__init__(linear_attn_config, parallelism_config, weights)
 
@@ -1011,7 +1023,7 @@ class Qwen3NextAttention(CausalAttention):
         return attn_out
 
 
-class Qwen3NextGatedDeltaNet(nn.Module):
+class _PackedGdnProjections(nn.Module):
     def __init__(
         self,
         linear_attn_config: LinearAttentionConfig,
@@ -1129,6 +1141,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             quant_config,
             hw_kernel_config=hw_kernel_config,
         )
+
+class Qwen3NextGdnExecution:
+    """Shared GDN forward, including CP, graph replay, and accelerator dispatch."""
 
     def _input_project(
         self, hidden_states: torch.Tensor
@@ -1394,6 +1409,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             reduce_output = getattr(self, "tp_all_reduce", all_reduce)
             attn_output = reduce_output(attn_output, group=Group.TP)
         return attn_output
+
+
+class Qwen3NextGatedDeltaNet(Qwen3NextGdnExecution, _PackedGdnProjections):
+    pass
 
 
 class Qwen3NextDecoderLayer(nn.Module):
