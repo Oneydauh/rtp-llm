@@ -21,6 +21,7 @@ def ppu_suites():
             # Exercise the same host/device copies used to publish PD cache
             # blocks before running the full prefill/decode goldens.
             "//rtp_llm/models_py/bindings/ppu:no_block_copy_test",
+            "//rtp_llm/cpp/cache/test:ppu_kv_pool_zero_test",
             smoke_test(
                 name="streaming_ppu",
                 task_info="data/model/qwen25/q_r_s_fp16_ppu.json",
