@@ -68,7 +68,12 @@ class MlaCheckpointRouteTest(unittest.TestCase):
             )
             layer = loader.load()
             self.assertEqual(loader.loaded_method, method)
-        q = weights["q_proj.weight"].chunk(size, dim=0)[rank]
+        if cfg["q_lora_rank"]:
+            q = weights["q_a_proj.weight"]
+            qb = weights["q_b_proj.weight"].chunk(size, dim=0)[rank]
+            torch.testing.assert_close(layer.q_b_proj.weight, qb)
+        else:
+            q = weights["q_proj.weight"].chunk(size, dim=0)[rank]
         kv = weights["kv_a_proj_with_mqa.weight"]
         torch.testing.assert_close(layer._fused_qkv_a_w, torch.cat([q, kv]))
         x = torch.linspace(-1, 1, q.shape[1], dtype=torch.bfloat16).view(1, -1)
@@ -104,9 +109,8 @@ class MlaCheckpointRouteTest(unittest.TestCase):
     def test_native_fst_projection(self):
         self._run_case(self.cfg, self.weights, NewLoaderLoadMethod.FASTSAFETENSORS)
 
-    @unittest.skipUnless(os.getenv("DEEPSEEK_V2_LITE_CHECKPOINT"), "release fixture not provided")
-    def test_release_layer_fst(self):
-        path = Path(os.environ["DEEPSEEK_V2_LITE_CHECKPOINT"])
+    def _release_layer(self, path):
+        path = Path(path)
         cfg = json.loads((path / "config.json").read_text())
         index = json.loads((path / "model.safetensors.index.json").read_text())["weight_map"]
         prefix = "model.layers.0.self_attn."
@@ -116,6 +120,14 @@ class MlaCheckpointRouteTest(unittest.TestCase):
                 with safe_open(str(path / shard), framework="pt", device="cpu") as f:
                     weights[key[len(prefix):]] = f.get_tensor(key)
         self._run_case(cfg, weights, NewLoaderLoadMethod.FASTSAFETENSORS)
+
+    @unittest.skipUnless(os.getenv("DEEPSEEK_V2_LITE_CHECKPOINT"), "release fixture not provided")
+    def test_release_layer_fst(self):
+        self._release_layer(os.environ["DEEPSEEK_V2_LITE_CHECKPOINT"])
+
+    @unittest.skipUnless(os.getenv("GLM4_MOE_LITE_CHECKPOINT"), "release fixture not provided")
+    def test_release_compressed_q_fst(self):
+        self._release_layer(os.environ["GLM4_MOE_LITE_CHECKPOINT"])
 
 
 if __name__ == "__main__":
