@@ -8,7 +8,10 @@ from types import SimpleNamespace
 
 import torch
 
-from rtp_llm.config.quant_config import Fp8BlockWiseQuantConfig
+from rtp_llm.config.quant_config import (
+    Fp8BlockWiseQuantConfig,
+    Fp8PerChannelCompressedQuantConfig,
+)
 from rtp_llm.models_py.ft_checkpoint import CheckpointTopology, FTCheckpoint
 from rtp_llm.models_py.model_loader import NewModelLoader
 from rtp_llm.models_py.module_base import RtpModule
@@ -18,8 +21,12 @@ from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 from rtp_llm.models_py.quant_methods.test.test_block_fp8_ft import write_ft
 
 
-def tree(root):
-    source = Fp8BlockWiseQuantConfig(bits=8, group_size=128, is_quanted=True)
+def tree(root, channel=False):
+    source = (
+        Fp8PerChannelCompressedQuantConfig(is_quanted=True)
+        if channel
+        else Fp8BlockWiseQuantConfig(bits=8, group_size=128, is_quanted=True)
+    )
     config = SimpleNamespace(
         ckpt_path=str(root),
         num_layers=1,
@@ -63,7 +70,9 @@ def tree(root):
         lm_head_params_dtype=torch.bfloat16,
         rms_norm_eps=1e-6,
         moe_config=None,
-        quant_config=QuantizationConfig("fp8_block", source),
+        quant_config=QuantizationConfig(
+            "fp8_per_channel" if channel else "fp8_block", source
+        ),
         parallelism_config=SimpleNamespace(
             dp_size=1, dp_rank=0, world_size=1, local_world_size=1
         ),
@@ -73,7 +82,7 @@ def tree(root):
     return model
 
 
-def inputs():
+def inputs(channel=False):
     g = torch.Generator().manual_seed(132)
     hf = {}
     ft = {}
@@ -163,8 +172,44 @@ def inputs():
     return hf, ft
 
 
+def channel_inputs():
+    """The per-channel producer retains expert axes and flat-reshapes dense scales."""
+    hf, ft = inputs()
+    for k in list(hf):
+        if k.endswith(".weight_scale_inv"):
+            s = hf.pop(k)
+            hf[k.removesuffix("_inv")] = s.reshape(()) * (
+                1 + torch.arange(128).reshape(128, 1) / 256
+            )
+    for k in list(ft):
+        if not k.endswith(".weight_only_quant_scale"):
+            continue
+        v = ft[k]
+        if "partial_moe_weights" in k:
+            ft[k] = (
+                v.unsqueeze(-2) * (1 + torch.arange(128).reshape(128, 1) / 256)
+            ).flatten(1, 2)
+        else:
+            ft[k] = (v.reshape(-1, 1) * (1 + torch.arange(128) / 256)).reshape(1, -1)
+    # Old FfnWeight merges the shared gate/up producers before quantization.
+    p = "layers.0.ffn_weights.intermediate_weight"
+    w = [
+        ft.pop(p + t + ".kernel").reshape(128, 128).view(torch.uint8) for t in ("", "3")
+    ]
+    s = [ft.pop(p + t + ".weight_only_quant_scale") for t in ("", "3")]
+    ft[p + "13.kernel"] = torch.cat(w).view(torch.float8_e4m3fn).reshape(128, 256)
+    ft[p + "13.weight_only_quant_scale"] = torch.cat(s, dim=1)
+    return hf, ft
+
+
 class GlmFTBlockTest(unittest.TestCase):
     def test_whole_tree(self):
+        self._whole_tree(False)
+
+    def test_channel_tree(self):
+        self._whole_tree(True)
+
+    def _whole_tree(self, channel):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             (root / "config.json").write_text(
@@ -178,16 +223,16 @@ class GlmFTBlockTest(unittest.TestCase):
                     )
                 )
             )
-            hf, ft = inputs()
+            hf, ft = channel_inputs() if channel else inputs()
             write_ft(root, ft)
-            base = tree(root)
+            base = tree(root, channel)
             self.assertTrue(base._layout.correction_bias)
             for name, tensor in hf.items():
                 base.load_weights({name: tensor})
             NewModelLoader._validate_loaded_weights(base)
             for method in ("scratch", "fastsafetensors"):
                 with self.subTest(method=method):
-                    m = tree(root)
+                    m = tree(root, channel)
                     cp = FTCheckpoint.open(root, CheckpointTopology())
                     cp.read_backend = method
                     load_gqa_ffn_ft_checkpoint(m, cp)
@@ -195,6 +240,24 @@ class GlmFTBlockTest(unittest.TestCase):
                     a, b = base.state_dict(), m.state_dict()
                     self.assertEqual(a.keys(), b.keys())
                     for key in a:
+                        if channel and key.endswith(
+                            ("experts.w13_scale", "experts.w2_scale")
+                        ):
+                            # HF only assembles these derived runtime views during
+                            # device postprocessing; compare their actual channel
+                            # sources instead of an unused HF zero buffer.
+                            if key.endswith("w13_scale"):
+                                expected = torch.cat(
+                                    (
+                                        base.layers[0].mlp.experts._up_ch_scales,
+                                        base.layers[0].mlp.experts._gate_ch_scales,
+                                    ),
+                                    dim=1,
+                                )
+                            else:
+                                expected = base.layers[0].mlp.experts._down_ch_scales
+                            torch.testing.assert_close(expected, b[key], atol=0, rtol=0)
+                            continue
                         torch.testing.assert_close(
                             a[key].float(), b[key].float(), atol=0, rtol=0, msg=key
                         )
