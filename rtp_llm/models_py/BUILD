@@ -379,7 +379,12 @@ py_library(
         "//rtp_llm:fastsafetensors",
         "//rtp_llm:ops",
         "//rtp_llm/models_py/distributed:collective_torch",
-    ],
+    ] + select({
+        # The ROCm fastsafetensors wrapper imports fast_safetensors, shipped
+        # in a second wheel that its metadata does not declare as a dependency.
+        "@//:using_rocm": ["//rtp_llm:fast-safetensors"],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
 )
 
