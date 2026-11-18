@@ -243,7 +243,10 @@ py_library(
     deps = [
         ":torch",
         ":utils",
-    ],
+    ] + select({
+        "@//:using_cuda": ["//rtp_llm/models_py:scaled_rope"],
+        "//conditions:default": [],
+    }),
 )
 
 py_library(

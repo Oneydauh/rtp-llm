@@ -511,11 +511,18 @@ py_library(
 )
 
 py_library(
+    name = "scaled_rope",
+    srcs = ["kernels/cuda/scaled_rope.py"],
+    deps = ["//rtp_llm:torch"] + triton_deps(["triton"]),
+    visibility = ["//visibility:public"],
+)
+
+py_library(
     name = "kernels",
     srcs = glob([
         "kernels/*.py",
         "kernels/**/*.py",
-    ], exclude = _DSV4_PPU_KERNELS + ["kernels/**/test/**"]) + select({
+    ], exclude = _DSV4_PPU_KERNELS + ["kernels/**/test/**", "kernels/cuda/scaled_rope.py"]) + select({
         "@//:using_ppu": glob(_DSV4_PPU_KERNELS),
         "//conditions:default": [],
     }),
@@ -524,6 +531,7 @@ py_library(
         "kernels/cuda/marlin_nvfp4/marlin_kernels/LICENSE",
     ] + glob(["kernels/cuda/qsa/*.cu", "kernels/cuda/qsa/*.cuh"]),
     deps = [
+        ":scaled_rope",
         ":utils",
         "//rtp_llm:torch",
         "//rtp_llm/models_py/triton_kernels:common",
