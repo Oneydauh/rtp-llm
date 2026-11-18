@@ -24,6 +24,8 @@ def _disable_fused_rmsnorm(exc: ImportError) -> None:
 
 
 class RMSNorm(RtpModule):
+    supports_independent_weight_updates = True
+
     def prepare_weight_updates(self, weights):
         return prepare_leaf_weight_updates(self, weights)
 
@@ -98,6 +100,8 @@ class RMSNorm(RtpModule):
 
 class RMSResNorm(RtpModule):
     """RMSNorm with the residual-add contract used by decoder runtimes."""
+
+    supports_independent_weight_updates = True
 
     def prepare_weight_updates(self, weights):
         return prepare_leaf_weight_updates(self, weights)

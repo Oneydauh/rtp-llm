@@ -34,6 +34,32 @@ namespace rtp_llm {
 
 namespace {
 
+// The Python writer uses this same lock. Hold it through C++ post layers as
+// those also retain runtime tensor views. Writers drain outstanding GPU work
+// before copying and synchronize before releasing the lock.
+class RuntimeWeightReadGuard {
+public:
+    explicit RuntimeWeightReadGuard(const py::object& model) {
+        py::gil_scoped_acquire acquire;
+        if (py::hasattr(model, "_weight_update_lock")) {
+            lock_ = model.attr("_weight_update_lock");
+            lock_.attr("acquire")();
+        }
+    }
+
+    ~RuntimeWeightReadGuard() {
+        py::gil_scoped_acquire acquire;
+        if (lock_) {
+            lock_.attr("release")();
+            lock_ = py::object();
+        }
+    }
+
+private:
+    py::object lock_;
+};
+
+
 // Pairs init() with a full drain on exceptional exits. DSpark's normal path
 // finishes only writer submissions here and leaves actual publication for the
 // executor's pre-dispatch barrier, preserving overlap with draft computation.
@@ -892,6 +918,7 @@ void PyWrappedModel::updateKVCacheKernelBlockId(const GptModelInputs& inputs) {
 
 GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
     RTP_LLM_PROFILE_SCOPE("py_model.forward");
+    RuntimeWeightReadGuard weight_read(py_model_);
     if (direct_eplb_stats_) {
         // Eager and graph replay both write into these same address-stable
         // buffers. Each forward publishes one batch, not a cumulative count.

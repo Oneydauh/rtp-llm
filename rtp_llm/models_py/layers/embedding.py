@@ -35,6 +35,8 @@ def _validate_vocab_partition(
 
 
 class VocabParallelEmbedding(RtpModule):
+    supports_independent_weight_updates = True
+
     def prepare_weight_updates(self, weights):
         # The manager stages the tied head separately. A conversion copy must
         # never follow the weak reference and write the live head.
@@ -204,6 +206,8 @@ class VocabParallelEmbedding(RtpModule):
 
 
 class ParallelLMHead(RtpModule):
+    supports_independent_weight_updates = True
+
     def prepare_weight_updates(self, weights):
         return prepare_leaf_weight_updates(self, weights)
 
