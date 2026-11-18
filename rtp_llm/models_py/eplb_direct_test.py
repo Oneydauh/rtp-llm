@@ -1,7 +1,7 @@
 """Real two-process FST reload and module transaction contracts.
 
-This exercises the production Python balancer/module with real Gloo agreement,
-not the C++ engine scheduling loop or a model golden. GPU execution is explicit.
+This exercises the production Python balancer/module with real stage agreement,
+not the C++ engine scheduling loop or a model golden. GPU runs use NCCL and CUDA Graph.
 """
 
 import datetime
@@ -110,11 +110,11 @@ def _verify_forward(
     # fixture consumes the actual live checkpoint-backed per-slot down matrix.
     output = experts(
         torch.zeros(len(rows), 32, device=logical.device), weights, logical
-    ).cpu()
+    )
     torch.testing.assert_close(experts.fused_moe.last_physical, expected)
     dist.all_reduce(output, group=group)
     oracle = torch.where(logical >= 0, 100 * stage + 10 * logical + 3, 0)
-    torch.testing.assert_close(output, (oracle * weights).sum(-1).cpu(), rtol=0, atol=0)
+    torch.testing.assert_close(output, (oracle * weights).sum(-1), rtol=0, atol=0)
     torch.testing.assert_close(
         logits[stage].cpu().long(), logical[logical >= 0].cpu().bincount(minlength=4)
     )
@@ -162,7 +162,8 @@ def _unchanged(experts, snapshot):
 def _agree(ok, group=None):
     # Same two-counter contract as native LoadFlags: wait for all terminal
     # peers, then fail the transaction if any peer failed.
-    status = torch.tensor([1, int(not ok)], dtype=torch.int32)
+    device = "cuda" if dist.get_backend(group) == "nccl" else "cpu"
+    status = torch.tensor([1, int(not ok)], dtype=torch.int32, device=device)
     dist.all_reduce(status, group=group)
     assert status[0].item() == dist.get_world_size(group)
     return status[1].item() == 0
@@ -207,8 +208,9 @@ def _rank_worker(rank, rendezvous, folder, use_gpu, auxiliary, stages=1):
         torch.cuda.set_device(world_rank)
         device = f"cuda:{world_rank}"
         torch.cuda.reset_peak_memory_stats()
+    backend = "nccl" if use_gpu else "gloo"
     dist.init_process_group(
-        "gloo",
+        backend,
         init_method=f"file://{rendezvous}",
         rank=world_rank,
         world_size=2 * stages,
@@ -218,13 +220,13 @@ def _rank_worker(rank, rendezvous, folder, use_gpu, auxiliary, stages=1):
         stage_group = None
         if stages > 1:
             for index in range(stages):
-                group = dist.new_group([2 * index, 2 * index + 1], backend="gloo")
+                group = dist.new_group([2 * index, 2 * index + 1], backend=backend)
                 if index == stage:
                     stage_group = group
             # Deliberately same-sized/ranked but spanning stages.
             cross_stage = None
             for members in ([0, 2], [1, 3]):
-                group = dist.new_group(members, backend="gloo")
+                group = dist.new_group(members, backend=backend)
                 if world_rank in members:
                     cross_stage = group
         for dtype in (torch.float32, torch.bfloat16):
@@ -331,13 +333,6 @@ def _rank_worker(rank, rendezvous, folder, use_gpu, auxiliary, stages=1):
             router_weights = torch.tensor(
                 [[0.2, 0.8], [0.25, 0.75], [1.0, 0.0]], device=device
             )
-            # Trace the real map with live buffers as explicit tensor inputs.
-            # References stay the same across installation and rollback.
-            from torch.fx.experimental.proxy_tensor import make_fx
-
-            trace_map = make_fx(lambda ids: experts._map_logical_to_physical(ids))(
-                logical
-            )
             experts.fused_moe = _LocalExpertOutput(
                 experts.eplb_runtime_weight_view()[W.moe_w2], rank
             )
@@ -346,6 +341,26 @@ def _rank_worker(rank, rendezvous, folder, use_gpu, auxiliary, stages=1):
                 torch.zeros(stages, 2, dtype=torch.int32, device=device),
             )
             model._newloader_eplb_bind_stats(*stats)
+            if use_gpu:
+                # Capture actual device routing once, before the first install.
+                # Plan publication must update the same captured storage.
+                graph = torch.cuda.CUDAGraph()
+                experts._map_logical_to_physical(logical)
+                torch.cuda.synchronize()
+                with torch.cuda.graph(graph):
+                    captured = experts._map_logical_to_physical(logical)
+
+                def trace_map(ids):
+                    assert ids.data_ptr() == logical.data_ptr()
+                    graph.replay()
+                    return captured
+
+            else:
+                from torch.fx.experimental.proxy_tensor import make_fx
+
+                trace_map = make_fx(lambda ids: experts._map_logical_to_physical(ids))(
+                    logical
+                )
 
             def verify():
                 _verify_forward(
@@ -413,7 +428,7 @@ def _rank_worker(rank, rendezvous, folder, use_gpu, auxiliary, stages=1):
                     # The inference group progresses while the reload worker
                     # is active. The FST path must never join these collectives.
                     for step in range(4):
-                        payload = torch.tensor([rank + 1.0])
+                        payload = torch.tensor([rank + 1.0], device=device)
                         dist.all_reduce(payload, group=stage_group)
                         assert payload.item() == 3.0
                         if step == 0:
