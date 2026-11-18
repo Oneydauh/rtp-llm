@@ -70,6 +70,22 @@ py_test(
 )
 
 py_test(
+    name = "test_weight_only_int8",
+    srcs = ["test_weight_only_int8.py"],
+    env = {"CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1"},
+    deps = ["//rtp_llm/models_py:new_weight_loader", "//rtp_llm:fastsafetensors", "//rtp_llm:safetensors"],
+)
+
+py_test(
+    name = "test_weight_only_int8_sm8x",
+    srcs = ["test_weight_only_int8.py", "test_weight_only_int8_sm8x.py"],
+    main = "test_weight_only_int8_sm8x.py",
+    tags = ["L20_CU13"],
+    exec_properties = {"gpu": "L20_CU13", "gpu_count": "1"},
+    deps = ["//rtp_llm/models_py:new_weight_loader", "//rtp_llm:safetensors"],
+)
+
+py_test(
     name = "test_groupwise_checkpoint",
     srcs = ["test_groupwise_checkpoint.py"],
     env = {"CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},

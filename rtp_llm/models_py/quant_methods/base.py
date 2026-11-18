@@ -397,6 +397,8 @@ class QuantizationConfig:
                 from rtp_llm.models_py.quant_methods import fp8  # noqa: F401
             elif self.quant_type == "modelopt_fp4":
                 from rtp_llm.models_py.quant_methods import fp4  # noqa: F401
+            elif self.quant_type == "INT8":
+                from rtp_llm.models_py.quant_methods import weight_only_int8  # noqa: F401
             elif self.quant_type == "W8A8_INT8_PER_CHANNEL_COMPRESSED":
                 from rtp_llm.models_py.quant_methods import w8a8_int8  # noqa: F401
             elif self.quant_type in ("awq", "gptq"):
