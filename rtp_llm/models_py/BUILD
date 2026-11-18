@@ -55,6 +55,22 @@ py_test(
     ],
 )
 
+py_test(
+    name = "main_parallel_runtime_test",
+    srcs = ["main_parallel_runtime_test.py"],
+    env = {
+        "CUDA_VISIBLE_DEVICES": "",
+        "HIP_VISIBLE_DEVICES": "",
+        "ROCR_VISIBLE_DEVICES": "",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+    },
+    deps = [
+        ":new_loader_core",
+        "//rtp_llm:fastsafetensors",
+    ],
+)
+
 # Direct parameter owners use main's existing runtime models/helpers, never a
 # backported scheduler/cache/PP engine. Production routing is integrated later.
 py_library(

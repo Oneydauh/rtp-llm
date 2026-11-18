@@ -367,6 +367,56 @@ class NewLoaderConfig:
     # the installed FST's early-release semantics and GPU peak behavior.
     experimental_fst_segmented_reads: bool = False
 
+    @classmethod
+    def from_runtime(cls, parallelism_config, **options) -> "NewLoaderConfig":
+        """Bind checkpoint partitions to this role's finalized service topology.
+
+        Accelerators in the same physical TP group may hold replicated attention
+        and/or FFN weights (e.g. CP prefill). The LM head still joins main's
+        physical TP group; do not infer its partition from either projection.
+        """
+        from rtp_llm.models_py.distributed.rank_layout import RankLayout
+
+        pc = parallelism_config
+        layout = RankLayout.from_parallelism_config(pc)
+        world_rank = pc.world_rank
+        coord = layout.coord_of(world_rank)
+        if pc.ep_size not in (1, layout.lane_stride()):
+            raise ValueError("Runtime EP must be single-rank or span its PP stage")
+        expected = (
+            coord.pp,
+            coord.dp,
+            coord.tp,
+            layout.ep_rank_of(world_rank, pc.ep_size),
+        )
+        actual = (pc.pp_rank, pc.dp_rank, pc.tp_rank, pc.ep_rank)
+        if actual != expected:
+            raise ValueError(
+                f"Checkpoint PP/DP/TP/EP ranks {actual} disagree with "
+                f"runtime world rank {world_rank}: expected {expected}"
+            )
+        if torch.distributed.is_initialized() and (
+            torch.distributed.get_rank() != world_rank
+            or torch.distributed.get_world_size() != layout.world_size()
+        ):
+            raise ValueError(
+                "Configured checkpoint topology disagrees with distributed WORLD"
+            )
+        return cls(
+            parallelism_config=pc,
+            tp_size=pc.tp_size,
+            tp_rank=pc.tp_rank,
+            ep_size=pc.ep_size,
+            ep_rank=pc.ep_rank,
+            attn_tp_size=pc.get_attn_tp_size(),
+            attn_tp_rank=pc.get_attn_tp_rank(),
+            ffn_tp_size=pc.get_ffn_tp_size(),
+            ffn_tp_rank=pc.get_ffn_tp_rank(),
+            lm_head_tp_size=pc.tp_size,
+            lm_head_tp_rank=pc.tp_rank,
+            **options,
+        )
+
     def __post_init__(self) -> None:
         if (
             isinstance(self.max_generate_batch_size, bool)
@@ -1324,13 +1374,38 @@ class NewModelLoader:
                 return f"invalid FST EP stage process group: {error}"
         return None
 
-    def _fastsafetensors_stage_ep_group(self):
-        from rtp_llm.models_py.distributed.collective_torch import Group, _get_group
+    @staticmethod
+    def _runtime_checkpoint_group(group):
+        from rtp_llm.models_py.distributed.collective_torch import _get_group
+
+        return _get_group(group)
+
+    def _stage_group(self):
+        from rtp_llm.models_py.distributed.rank_layout import Group, RankLayout
         from rtp_llm.models_py.fastsafetensors_read_spec import (
             validate_ep_process_group,
         )
 
-        process_group = _get_group(Group.STAGE)
+        pc = self.load_config.parallelism_config
+        layout = RankLayout.from_parallelism_config(pc)
+        stage = self._runtime_checkpoint_group(Group.STAGE)
+        # The prerequisite collective covers the entire stage, including DP
+        # peers, even for a dense draft which has no expert partition.
+        validate_ep_process_group(
+            stage,
+            pc,
+            layout.lane_stride(),
+            layout.rank_in_group(Group.STAGE, pc.world_rank),
+        )
+        return stage
+
+    def _fastsafetensors_stage_ep_group(self):
+        from rtp_llm.models_py.distributed.rank_layout import Group
+        from rtp_llm.models_py.fastsafetensors_read_spec import (
+            validate_ep_process_group,
+        )
+
+        process_group = self._runtime_checkpoint_group(Group.STAGE)
         validate_ep_process_group(
             process_group,
             self.load_config.parallelism_config,
@@ -1366,12 +1441,12 @@ class NewModelLoader:
         if world_size == self.load_config.tp_size:
             logger.info("NewLoader fastsafetensors process group: TP WORLD")
             return torch.distributed.group.WORLD
-        from rtp_llm.models_py.distributed.collective_torch import Group, _get_group
+        from rtp_llm.models_py.distributed.rank_layout import Group
         from rtp_llm.models_py.fastsafetensors_read_spec import (
             validate_tp_process_group,
         )
 
-        process_group = _get_group(Group.TP)
+        process_group = self._runtime_checkpoint_group(Group.TP)
         validate_tp_process_group(
             process_group, self.load_config.tp_size, self.load_config.tp_rank
         )
@@ -1769,19 +1844,30 @@ class NewModelLoader:
                 )
         return None
 
-    @staticmethod
     def _synchronize_fastsafetensors_prerequisite(
+        self,
         local_reason: Optional[str],
     ) -> Optional[str]:
-        """Require every distributed rank to make the same loader decision."""
+        """Agree amongst the consumers actually taking part in this load."""
         if not torch.distributed.is_initialized():
             return local_reason
-        world_size = torch.distributed.get_world_size()
-        if world_size <= 1:
+        pc = self.load_config.parallelism_config
+        # PP draft models may be loaded by the tail stage only. Never enter a
+        # WORLD collective from that stage; the other stages will not join.
+        is_draft = (
+            self.model_config.get("is_mtp", False)
+            if isinstance(self.model_config, dict)
+            else getattr(self.model_config, "is_mtp", False)
+        )
+        group = (
+            self._stage_group() if is_draft and getattr(pc, "pp_size", 1) > 1 else None
+        )
+        participants = torch.distributed.get_world_size(group)
+        if participants <= 1:
             return local_reason
-        reasons: List[Optional[str]] = [None] * world_size
+        reasons: List[Optional[str]] = [None] * participants
         try:
-            torch.distributed.all_gather_object(reasons, local_reason)
+            torch.distributed.all_gather_object(reasons, local_reason, group=group)
         except (RuntimeError, TypeError, ValueError) as exc:
             return (
                 "cannot synchronize fastsafetensors prerequisites across ranks: "
