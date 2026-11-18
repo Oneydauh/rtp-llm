@@ -424,8 +424,8 @@ class KimiLinearKDA(KimiKDAParameters):
     def validate_runtime_device(self, device: torch.device) -> None:
         # CPU is a valid checkpoint destination, including for inspection and
         # later migration. Running the recurrent kernels is a separate contract.
-        if device.type != "cpu" and (device.type != "cuda" or torch.version.hip is not None):
-            raise RuntimeError("Kimi Linear KDA execution requires CUDA")
+        if device.type not in ("cpu", "cuda"):
+            raise RuntimeError(f"Kimi Linear KDA has no runtime for {device}")
 
     def forward(
         self,
