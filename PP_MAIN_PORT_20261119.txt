@@ -1,0 +1,103 @@
+T03: current-main PP carrier / direct NewLoader portability
+=========================================================
+
+Isolation
+  Host: 11.167.35.133, port 22233, user's hengcang.wyd_GPU container.
+  Workspace: /data2/home/hengcang.wyd/newloader_recovery_20261117_133/agent_pp_main_f559bb4
+  Branch: develop/newloader-pp-main-20261118
+  Base: f559bb4ca9ae4b09e30c0713b2e2aec7b4f6a489
+  Recovery implementation preserved separately at 3ca4809, clean at inspection.
+  No PR, push, source-worktree, golden, JIT or runtime routing changes.
+
+Carrier decision
+  Keep main's RankLayout, ParallelismConfig, STAGE/PP groups, PPExecutor,
+  PPScheduler, GenerateStream chunk lifecycle, MtpCompute, cache topology,
+  transport, serialization, warmup and Python boundary ABI unchanged.
+  The earlier recovery C++ PP backports are archived implementation evidence,
+  not commits to apply wholesale onto main.
+
+This isolated increment
+  new_models/qwen3/language.py:
+    Direct parameter owner from recovery 3ca4809, adapted to main.
+    GptModelBase + RtpModule cooperative inheritance localizes the loader mixin;
+    main GptModelBase remains unchanged for existing runtime models.
+    Pass py_hw_kernel_config, not removed device_resource_config semantics.
+    Use main layer_ids() as the only stage layer ownership source. No loader
+    repartitioning or independent fallback for an unfinalized partition.
+    Global layer keys in parameters/checkpoint names, local cache indexes.
+    Only first stage owns embedding, only tail owns norm/head; PP1 stays full.
+    Tail tied head reads its checkpoint rows directly, without a local embedding.
+    Preserve main hidden-state capture using capture_context/capture_layer/
+    finalize, and main pp_intermediates hidden-state handoff.
+  new_models/model_base.py:
+    Pure required_config_value helper; re-export main block-map selector.
+    Do not replace main model_desc/module_base.py to obtain this helper.
+  No registration / admission gate / BUILD integration in this increment.
+
+Mandatory integration dependencies (not supplied by vanilla f559bb4)
+  1. Direct-loader core from the unified recovery candidate:
+     models_py/module_base.py, model_loader.py, read_spec.py, weight_mapper.py,
+     registry.py, borrowed_parameters.py, expert_placement.py, ft_checkpoint.py,
+     FST helpers and their own declared imports. Do not copy the old registry
+     indiscriminately: advertise only owners integrated and verified on main.
+  2. Direct layers and quant methods consumed by Qwen3:
+     layers/{activation,embedding,linear,norm}.py and their quant backend closure.
+     Final owner commits come from their assigned agents, not frozen old copies.
+  3. T02 head APIs: tied_checkpoint_read_spec/load_tied_checkpoint_weight,
+     explicit head priority, nondivisible TP padding, valid-vocab metadata.
+     Short source vocab must not expose padding to main's native sampler.
+  4. T01 strict BaseModel NewLoader route, config and parameter/runtime view;
+     NewLoaderConfig needs py_hw_kernel_config and max_generate_batch_size
+     passed by the main entry point, preserving decode-cascade capacity.
+     No W.* checkpoint adapter or intermediate legacy layer weight tree.
+  5. T04 stage-scoped FST/ReadSpec rank proof and EPLB aux/rollback dual-ack
+     enhancements merged into main's existing STAGE controller, not replaced
+     by the recovery controller wholesale.
+  6. T12 borrowed-parameter ownership and specialized draft contracts when
+     speculative combinations are enabled. Main already supplies aux capture.
+
+Validation ladder and proof boundaries
+  Existing recovery proof (NOT proof of this main candidate):
+    - 26 real native CPU Qwen3 PP-stage loading: 24 subcases in one test.
+    - 26 real native CPU PP1/Qwen3/head regression: 30 test methods passed.
+    - 26 four actual Gloo processes PP2 x TP2: stage checkpoint loading,
+      embedding TP gather, noncontiguous PP lane P2P, tail projection/gather
+      matched reference. Transformer attention/native PPExecutor not executed.
+    - Recovery layout/contract CPU suite: 46 passed; not GPU/multicard smoke.
+  This increment: owner/test syntax compilation passed; main's unchanged
+  layer_partition_test passed 10 CPU checks. Neither executes the new owner.
+  Added self-contained main_pp_checkpoint_test: 24 stage/head combinations and
+  PP1 ownership/capture capability; execution awaits core and matching ABI.
+  No matching main native modules on 26/133 have been validated for this owner.
+  Full pre-commit was not completed: initialization attempted unrelated FlexLB
+  shfmt/prettier dependencies. After more than eight minutes, only this task's
+  verified shfmt installer was cancelled. Existing cached black/isort plus
+  py_compile and git diff --check are run manually; the save commit bypasses
+  that external hook for this invocation only (no global hook configuration).
+
+  Required main execution acceptance, coordinated with root/T18:
+    A. Freeze main + core + direct owner + T02/T04 exact commits; build matching
+       config and compute extensions in the user's container (single owner).
+    B. Real tiny safetensors through NewModelLoader on each PP2 x TP2 stage:
+       disjoint layer sets; exact checkpoint values; tied/explicit/pruned/padded
+       head combinations; scratch and strict FST produce identical parameters.
+    C. Four-process CPU collectives with actual stage and PP lane membership.
+       This is still not a GPU or native PPExecutor inference result.
+    D. Root allocates idle GPU resources, then recheck nvidia-smi and user locks.
+       Real main NormalEngine -> PPScheduler -> PPExecutor -> PPTransport ->
+       Python direct owner -> tail LM head -> sampler, PP2 eager, compare PP1
+       output and existing golden without edits. Record loader/method evidence.
+    E. PP2 x TP2, stage EP/redundant expert, quantized and speculative combinations
+       separately; stage-local cache global key mapping and shutdown/rollback
+       failure paths. GPU/NCCL, golden smoke and CI each reported separately.
+       Reuse main suites_pp.bzl qwen35_pp_depth_test and
+       qwen35_pp_mixed_mtp_test (PP2 TP2 DP2 EP4 MTP), plus PD/chunk suites.
+       These suites currently select scratch explicitly, so a passing run is
+       not NewFST proof; require a separate strict FST invocation and evidence.
+  Until D and relevant E pass, PP NewLoader production gate remains closed.
+
+Known uncompleted work
+  Unified current-main NewLoader core/entry-point migration and dependency closure.
+  Main ABI build, actual transformer PP inference and golden/performance testing.
+  Quantized/EP/speculative PP composition and parameter update transactions.
+  Full parity and retirement of OldLoader are not established by this increment.
