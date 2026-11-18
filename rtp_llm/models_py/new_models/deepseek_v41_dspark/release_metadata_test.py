@@ -56,6 +56,7 @@ class ReleaseDraftMetadataTest(unittest.TestCase):
                 model, model_filter, expert_filter, plan
             )
             selected = {name: shard for name, shard in index.items() if predicate(name)}
+            self.assertNotIn("mtp.2.confidence_head.proj.weight", selected)
             self.assertEqual(len(model.v4.layers), 3)
             if commit:
                 self.assertEqual(len(selected), 14)

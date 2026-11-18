@@ -42,6 +42,10 @@ class V41DraftGlobalsMixin:
                 "hc_head_fn",
                 "hc_head_base",
                 "hc_head_scale",
+                # The released last draft stage includes a training-only
+                # confidence predictor. Inference samples with the Markov head.
+                # Do not filter any other key under confidence_head.
+                "confidence_head.proj.weight",
             )
         }
         return lambda name: name in ("embed.weight", "head.weight") or (

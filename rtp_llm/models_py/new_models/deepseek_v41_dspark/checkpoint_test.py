@@ -63,6 +63,7 @@ def values(commit=False):
             "mtp.0.main_proj.weight": tensor((64, 192), torch.float8_e4m3fn),
             "mtp.0.main_proj.scale": tensor((2, 6), torch.float8_e8m0fnu),
             "mtp.0.main_norm.weight": tensor((64,), torch.bfloat16),
+            "mtp.2.confidence_head.proj.weight": tensor((1, 64), torch.bfloat16),
         }
     )
     if not commit:
@@ -109,6 +110,22 @@ def load_into(model, path, rank, native_fst=False):
 
 
 class DraftCheckpointTest(unittest.TestCase):
+    def test_unknown_confidence_head_weights_still_fail_dispatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.safetensors"
+            for name in (
+                "mtp.2.confidence_head.proj.bias",
+                "mtp.1.confidence_head.proj.weight",
+            ):
+                source = values()
+                del source["mtp.2.confidence_head.proj.weight"]
+                source[name] = torch.ones(1)
+                save_file(source, str(path))
+                for native_fst in (False, True):
+                    with self.subTest(name=name, native_fst=native_fst):
+                        with self.assertRaisesRegex(RuntimeError, "confidence_head"):
+                            load_into(_CheckpointOwner(), path, 0, native_fst)
+
     def test_proposal_scratch_and_native_fst_every_parameter_tp_ep_ranks(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "model.safetensors"
