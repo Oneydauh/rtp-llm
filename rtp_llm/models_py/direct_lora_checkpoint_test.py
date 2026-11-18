@@ -190,6 +190,55 @@ class DirectAdapterTest(unittest.TestCase):
             LoraManager(engine)
         torch.testing.assert_close(self.model.proj.weight, self.base)
 
+    def test_excluded_fp4_owner_merges_actual_rank_local_rows(self):
+        from rtp_llm.models_py.layers.linear import ColumnParallelLinear
+        from rtp_llm.models_py.quant_methods.base import QuantizationConfig
+
+        @register_model("_direct_excluded_fp4")
+        class ExcludedFP4(RtpModule):
+            def __init__(self, config, load):
+                super().__init__()
+                self.proj = ColumnParallelLinear(
+                    3,
+                    2,
+                    tp_size=2,
+                    tp_rank=config.checked_rank,
+                    quant_config=QuantizationConfig(
+                        "modelopt_fp4", ignored_layers=["proj"]
+                    ),
+                    prefix="proj",
+                    params_dtype=torch.bfloat16,
+                )
+
+        path = self.adapter("excluded", ["proj"])
+        for method in ("scratch", "fastsafetensors"):
+            for rank in range(2):
+                with self.subTest(rank=rank, method=method):
+                    config = SimpleNamespace(
+                        model_type="_direct_excluded_fp4", checked_rank=rank
+                    )
+                    loader = NewModelLoader(
+                        config,
+                        NewLoaderConfig(
+                            device="cpu",
+                            load_method=method,
+                            compute_dtype=torch.bfloat16,
+                        ),
+                        model_path=str(self.root),
+                    )
+                    model = loader.load()
+                    self.assertEqual(loader.loaded_method.value, method)
+                    with torch.inference_mode():
+                        premerge = model.proj.weight.clone()
+                    torch.testing.assert_close(
+                        premerge, self.base[rank : rank + 1].bfloat16()
+                    )
+                    merge_startup_lora_checkpoint(model, loader, "a", path)
+                    torch.testing.assert_close(
+                        model.proj.weight,
+                        premerge + self.expected_delta[rank : rank + 1].bfloat16(),
+                    )
+
     def test_request_bridge_registers_only_after_success(self):
         class Wrapper:
             fail = True

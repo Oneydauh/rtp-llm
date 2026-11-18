@@ -139,7 +139,11 @@ class LinearBase(RtpModule):
         return encode(self, name, delta) if callable(encode) else delta
 
     def _checked_lora_factors(self, a, b, input_size, output_size):
-        if self.quant_config.quant_type != "none":
+        from rtp_llm.models_py.quant_methods.unquantized import UnquantizedLinearMethod
+
+        # Excluded or mixed-attention leaves still carry the model's quant
+        # configuration. The selected method owns the actual physical weight.
+        if not isinstance(self.quant_method, UnquantizedLinearMethod):
             raise NotImplementedError(
                 "Quantized LoRA merge requires a quantized update contract"
             )
