@@ -28,6 +28,13 @@ def _bias(values):
 
 
 def load_dense_ft_checkpoint(model, checkpoint):
+    from rtp_llm.models_py.quant_methods.fp8 import (
+        Fp8LinearMethod,
+        Fp8PerChannelLinearMethod,
+    )
+
+    fp8_methods = (Fp8LinearMethod, Fp8PerChannelLinearMethod)
+
     if type(model).__name__ not in ("Qwen2ForCausalLM", "LlamaForCausalLM"):
         raise ValueError("FT adapter is only validated for dense Qwen2/Llama")
     swizzle_flags = set()
@@ -63,8 +70,16 @@ def load_dense_ft_checkpoint(model, checkpoint):
             layer.mlp.gate_up_proj,
             layer.mlp.down_proj,
         ):
-            if not isinstance(linear.quant_method, UnquantizedLinearMethod):
-                raise ValueError("Dense FT import requires unquantized runtime kernels")
+            if not isinstance(
+                linear.quant_method, (UnquantizedLinearMethod, *fp8_methods)
+            ):
+                raise ValueError(
+                    "Dense FT has no declared adapter for this quantized runtime layout"
+                )
+            if isinstance(linear.quant_method, fp8_methods) and swizzled:
+                raise ValueError(
+                    "FP8 FT swizzled source requires an explicit quantized layout decoder"
+                )
     if getattr(model.lm_head, "output_vocab_ids", None):
         raise ValueError(
             "Legacy FT checkpoints cannot be combined with vocabulary pruning"
@@ -72,6 +87,81 @@ def load_dense_ft_checkpoint(model, checkpoint):
 
     tp = checkpoint.topology.tp_size
     rank = checkpoint.topology.tp_rank
+
+    def fp8_bindings(linear, source, destination, projection, layer_prefix):
+        from rtp_llm.models_py.quant_methods.fp8_ft import (
+            PerChannelFP8FTProjection,
+            PerTensorFP8FTProjection,
+        )
+
+        scale = source.removesuffix(".kernel") + ".weight_only_quant_scale"
+        if isinstance(linear.quant_method, Fp8PerChannelLinearMethod):
+            state = PerChannelFP8FTProjection(
+                linear, checkpoint, source, scale, projection
+            )
+            return [
+                RuntimeTensorBinding(
+                    (source, scale),
+                    destination + ".weight",
+                    _identity,
+                    lambda: (state.weight(),),
+                ),
+                RuntimeTensorBinding(
+                    (source, scale),
+                    destination + ".weight_scale",
+                    _identity,
+                    lambda: (state.scale(),),
+                ),
+            ]
+        state = PerTensorFP8FTProjection(linear, checkpoint, source, scale, projection)
+        # These spellings are only legacy serializer boundary names. The quant
+        # module owns all tensor layout, fusion and activation-scale semantics.
+        stems = {
+            "qkv": "pre_layernorm_weights",
+            "out": "self_attention_weights.attention_output_weight",
+            "gate_up": "post_layernorm_weights",
+            "down": "ffn_weights.intermediate_weight2",
+        }
+        stem = layer_prefix + stems[projection]
+        direct, reciprocal = stem + ".static_quant", stem + ".static_quant_reciprocal"
+        dynamic = linear.quant_method.quant_config.activation_dynamic
+        if dynamic and (
+            direct in checkpoint.entries or reciprocal in checkpoint.entries
+        ):
+            raise ValueError(
+                "FP8 FT static source disagrees with dynamic activation configuration"
+            )
+        if not dynamic and not {direct, reciprocal}.issubset(checkpoint.entries):
+            raise ValueError("FP8 FT static activation metadata is incomplete")
+        actual, companion = (
+            (direct, reciprocal) if projection == "out" else (reciprocal, direct)
+        )
+        auxiliary = () if dynamic else (actual, companion)
+        return [
+            RuntimeTensorBinding(
+                (source, scale),
+                destination + ".weight",
+                _identity,
+                lambda: (state.weight(),),
+            ),
+            RuntimeTensorBinding(
+                (scale,),
+                destination + ".weight_scale",
+                _identity,
+                lambda: (state.scale(),),
+            ),
+            RuntimeTensorBinding(
+                (scale, *auxiliary),
+                destination + ".input_scale",
+                _identity,
+                lambda: (
+                    state.input_scale(
+                        None if dynamic else actual, companion, projection != "down"
+                    ),
+                ),
+            ),
+        ]
+
     embedding = model.embed_tokens
     head = model.lm_head
     if (embedding.tp_size, embedding.tp_rank) != (tp, rank) or (
@@ -233,6 +323,23 @@ def load_dense_ft_checkpoint(model, checkpoint):
                 kernel,
             ),
         ):
+            if target in ("self_attn.qkv_proj.weight", "self_attn.o_proj.weight"):
+                linear = (
+                    layer.self_attn.qkv_proj
+                    if "qkv_proj" in target
+                    else layer.self_attn.o_proj
+                )
+                if isinstance(linear.quant_method, fp8_methods):
+                    bindings.extend(
+                        fp8_bindings(
+                            linear,
+                            src + old,
+                            dst + target.removesuffix(".weight"),
+                            "qkv" if "qkv_proj" in target else "out",
+                            src,
+                        )
+                    )
+                    continue
             bindings.append(RuntimeTensorBinding((src + old,), dst + target, convert))
         if layer.self_attn.qkv_proj.bias is not None:
             bindings.append(
@@ -257,6 +364,24 @@ def load_dense_ft_checkpoint(model, checkpoint):
             (down_names, "down", "mlp.down_proj.weight"),
             (gate_names, "gate_up", "mlp.gate_up_proj.weight"),
         ):
+            linear = (
+                layer.mlp.down_proj if projection == "down" else layer.mlp.gate_up_proj
+            )
+            if isinstance(linear.quant_method, fp8_methods):
+                if len(names) != 1:
+                    raise ValueError(
+                        "Per-tensor FP8 FT requires the producer's fused gate/up tensor"
+                    )
+                bindings.extend(
+                    fp8_bindings(
+                        linear,
+                        names[0],
+                        dst + target.removesuffix(".weight"),
+                        projection,
+                        src,
+                    )
+                )
+                continue
             bindings.append(
                 RuntimeTensorBinding(
                     names,
