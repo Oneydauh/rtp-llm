@@ -2148,6 +2148,13 @@ class NewModelLoader:
                 dp_size=getattr(parallel, "dp_size", 1),
                 dp_rank=getattr(parallel, "dp_rank", 0),
             ),
+            num_layers=(
+                self.model_config.get(
+                    "num_layers", self.model_config.get("num_hidden_layers")
+                )
+                if isinstance(self.model_config, dict)
+                else getattr(self.model_config, "num_layers", None)
+            ),
         )
         if ft_checkpoint is not None:
             # Format adapters own their import and return before the HF/FST

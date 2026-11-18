@@ -147,6 +147,24 @@ class RankLocalFTTest(unittest.TestCase):
                 join=True,
             )
 
+    def test_full_export_proves_global_layers_despite_raw_pp_env(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.export(d)
+            index = Path(d) / "model.safetensors.index.json"
+            data = json.loads(index.read_text())
+            data["__env__params__"]["PP_SIZE"] = "2"
+            index.write_text(json.dumps(data))
+            topology = CheckpointTopology(tp_size=2, ep_size=2)
+            checkpoint = FTCheckpoint.open(d, topology, num_layers=2)
+            checkpoint.select_stage(range(1, 2), 2)
+            self.assertEqual(
+                set(checkpoint.entries), {"layers.1.w13", "global.lm_head"}
+            )
+            del data["weight_map"]["rank_01_00_01.layers.1.w13"]
+            index.write_text(json.dumps(data))
+            with self.assertRaisesRegex(ValueError, "full-model layer coverage"):
+                FTCheckpoint.open(d, topology, num_layers=2)
+
     def test_full_export_loads_each_stage_and_moved_or_redundant_expert(self):
         with tempfile.TemporaryDirectory() as d:
             self.export(d)

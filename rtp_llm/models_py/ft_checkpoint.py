@@ -114,7 +114,7 @@ class FTCheckpoint:
         self._overlay = dict(overlay.weights())
 
     @classmethod
-    def open(cls, model_path: str, topology: CheckpointTopology):
+    def open(cls, model_path: str, topology: CheckpointTopology, *, num_layers=None):
         root = Path(model_path).resolve()
         index = root / "model.safetensors.index.json"
         if not index.is_file():
@@ -128,10 +128,9 @@ class FTCheckpoint:
         env = metadata.get("__env__params__", {})
         if not isinstance(env, dict):
             raise ValueError("FT __env__params__ must be an object")
-        if str(env.get("PP_SIZE", "1")) != "1":
-            raise ValueError(
-                "FT pipeline stage-local checkpoint import is not supported"
-            )
+        raw_pp = env.get("PP_SIZE", 1)
+        if not re.fullmatch(r"[1-9]\d*", str(raw_pp)):
+            raise ValueError(f"Invalid FT PP_SIZE: {raw_pp!r}")
         # Match legacy default semantics when older exports omit these fields.
         for axis in ("tp", "dp", "ep"):
             expected = getattr(topology, axis + "_size")
@@ -179,6 +178,27 @@ class FTCheckpoint:
             rank_entries[suffix] = (key, path)
         if requested not in by_rank:
             raise ValueError(f"FT checkpoint has no tensors for rank {requested}")
+        if int(raw_pp) != 1:
+            # WeightConverter always sets pc.pp_size=1 and dumps every layer,
+            # but serializes the caller's original env_params *unmodified*.
+            # Don't misclassify those files as stage-local based on PP_SIZE.
+            # A genuinely stage-local archive does not identify its source
+            # stage in the key contract; don't infer its offset from WORLD.
+            if type(num_layers) is not int or num_layers <= 0:
+                raise ValueError(
+                    "FT PP_SIZE requires proof of full-model layer coverage"
+                )
+            expected_ids = set(range(num_layers))
+            for ranks, entries in by_rank.items():
+                available = {
+                    int(name.split(".", 2)[1])
+                    for name in entries
+                    if name.startswith("layers.")
+                }
+                if available != expected_ids:
+                    raise ValueError(
+                        f"Unproven FT full-model layer coverage on {ranks}"
+                    )
         checkpoint = cls(root, topology, by_rank[requested])
         checkpoint._by_rank = by_rank
         checkpoint.index_metadata = metadata
