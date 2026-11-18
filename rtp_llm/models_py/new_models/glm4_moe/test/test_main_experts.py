@@ -48,6 +48,135 @@ class _ExpertModel(RtpModule):
 
 
 class GenericExpertsCheckpointTest(unittest.TestCase):
+    def test_fp8_expert_checkpoint_staging(self):
+        from safetensors import safe_open
+
+        from rtp_llm.config.quant_config import (
+            Fp8BlockWiseQuantConfig,
+            Fp8PerTensorCompressedQuantConfig,
+        )
+        from rtp_llm.models_py.quant_methods.base import QuantizationConfig
+        from rtp_llm.models_py.quant_methods.moe_quant_key import (
+            moe_checkpoint_method_key,
+        )
+
+        configs = [
+            (
+                Fp8BlockWiseQuantConfig(bits=8, group_size=128, is_quanted=True),
+                "weight_scale_inv",
+            ),
+            (
+                Fp8PerTensorCompressedQuantConfig(is_quanted=True, dynamic=False),
+                "weight_scale",
+            ),
+        ]
+        # On EP rank 1 only logical expert 1 is represented. Verify weight,
+        # calibration and scale planes independently from the checkpoint bytes.
+        for source, scale_suffix in configs:
+            with self.subTest(
+                method=source.get_method()
+            ), tempfile.TemporaryDirectory() as tmp:
+
+                def make_experts():
+                    return BaseMoEExperts(
+                        num_experts=2,
+                        top_k=1,
+                        hidden_size=4,
+                        moe_intermediate_size=4,
+                        tp_size=1,
+                        tp_rank=0,
+                        ep_size=2,
+                        ep_rank=1,
+                        params_dtype=torch.bfloat16,
+                        model_config=SimpleNamespace(
+                            num_layers=1, activation_type="SiGLU", quant_config=source
+                        ),
+                        parallelism_config=SimpleNamespace(
+                            dp_size=1, dp_rank=0, world_size=2, local_world_size=2
+                        ),
+                        moe_config=None,
+                        quant_config=QuantizationConfig(
+                            moe_checkpoint_method_key(source), source
+                        ),
+                        layer_idx=0,
+                    )
+
+                inputs = {}
+                for eid in range(2):
+                    for i, proj in enumerate(("up", "gate", "down"), 1):
+                        prefix = f"{eid}.{proj}_proj."
+                        inputs[prefix + "weight"] = torch.full((4, 4), 8 * eid + i).to(
+                            torch.float8_e4m3fn
+                        )
+                        inputs[prefix + scale_suffix] = torch.tensor([[8.0 * eid + i]])
+                        if scale_suffix == "weight_scale":
+                            inputs[prefix + "input_scale"] = torch.tensor(
+                                [16.0 * eid + i]
+                            )
+                path = str(Path(tmp) / "experts.safetensors")
+                save_file(inputs, path)
+                owner = make_experts()
+                incomplete = make_experts()
+                with safe_open(path, framework="pt", device="cpu") as checkpoint:
+                    for key in checkpoint.keys():
+                        entry = {key: checkpoint.get_tensor(key)}
+                        owner.load_weights(entry)
+                        if key != "1.gate_proj." + scale_suffix:
+                            incomplete.load_weights(entry)
+                owner.validate_weights_loaded()
+                with self.assertRaises(RuntimeError):
+                    incomplete.validate_weights_loaded()
+                torch.testing.assert_close(
+                    owner.w13[0].float(),
+                    torch.cat(
+                        [inputs[f"1.{p}_proj.weight"].float() for p in ("up", "gate")]
+                    ),
+                )
+                torch.testing.assert_close(
+                    owner.w2[0].float(), inputs["1.down_proj.weight"].float()
+                )
+                if scale_suffix == "weight_scale_inv":
+                    torch.testing.assert_close(
+                        owner.w13_scale.flatten(), torch.tensor([9.0, 10.0])
+                    )
+                    torch.testing.assert_close(
+                        owner.w2_scale.flatten(), torch.tensor([11.0])
+                    )
+                else:
+                    torch.testing.assert_close(
+                        owner.checkpoint_input_scales[0],
+                        torch.tensor([18.0, 17.0, 19.0]),
+                    )
+                    torch.testing.assert_close(owner._gate_scales, torch.tensor([10.0]))
+                    torch.testing.assert_close(owner._up_scales, torch.tensor([9.0]))
+                    torch.testing.assert_close(owner._down_scales, torch.tensor([11.0]))
+                # The CUDA-build e4m3fn canonical packing is pure tensor
+                # arithmetic. Do not claim CPU can select/run a fused executor.
+                if torch.version.hip is None:
+                    owner.quant_method.process_weights_after_loading(owner)
+                    if scale_suffix == "weight_scale":
+                        self.assertEqual(owner.w13_scale.item(), 10.0)
+                        self.assertEqual(owner.w2_scale.item(), 11.0)
+                        self.assertEqual(owner.w13_input_scale.item(), 18.0)
+                        self.assertEqual(owner.w2_input_scale.item(), 19.0)
+                        torch.testing.assert_close(
+                            owner.w13_input_scale_inv, torch.tensor(1.0 / 18)
+                        )
+                        torch.testing.assert_close(
+                            owner.w2_input_scale_inv, torch.tensor(1.0 / 19)
+                        )
+                        expected_up = (inputs["1.up_proj.weight"].float() * 0.9).to(
+                            torch.float8_e4m3fn
+                        )
+                        torch.testing.assert_close(
+                            owner.w13[0, :4].float(), expected_up.float()
+                        )
+                    else:
+                        torch.testing.assert_close(
+                            owner.w13_scale.flatten(), torch.tensor([9.0, 10.0])
+                        )
+                    self.assertIsNone(owner.fused_moe)
+
     def test_actual_main_quant_config_keys(self):
         from rtp_llm.config.quant_config import (
             CompressedW4A8Int4PerChannelQuantConfig,
