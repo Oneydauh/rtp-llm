@@ -9,6 +9,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from rtp_llm.models_py.new_models.qwen3_next.gdn_parameters import Qwen3NextGdnParameters
+from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 
 
 class GdnOwnershipTest(unittest.TestCase):
@@ -56,6 +57,36 @@ class GdnOwnershipTest(unittest.TestCase):
         m.load_weights({"in_proj_b.weight": torch.ones(4, 8)})
         with self.assertRaisesRegex(RuntimeError, "mix"):
             m.load_weights({"in_proj_ba.weight": torch.ones(8, 8)})
+
+    def test_fp8_block_scale_grid_uses_the_same_rank_as_its_weights(self):
+        config = SimpleNamespace(linear_key_head_dim=128, linear_value_head_dim=128,
+            linear_num_key_heads=2, linear_num_value_heads=2, linear_conv_kernel_dim=3)
+        quant = QuantizationConfig("fp8_block", source_config=SimpleNamespace(weight_block_size=[128, 128]))
+        q, k, v, z = torch.arange(16, dtype=torch.float32).reshape(8, 2).add(1).chunk(4)
+        out = torch.arange(4, dtype=torch.float32).reshape(2, 2).add(1)
+        for rank in range(2):
+            for layout in (
+                {"in_proj_qkvz.weight_scale_inv": torch.stack((q, k, v, z), dim=1).reshape(8, 2)},
+                {"in_proj_qkv.weight_scale_inv": torch.cat((q, k, v)), "in_proj_z.weight_scale_inv": z},
+            ):
+                m = Qwen3NextGdnParameters(config, 256, 1e-6, 2, rank, torch.float32, quant, "linear_attn")
+                m.load_weights({**layout, "out_proj.weight_scale_inv": out})
+                torch.testing.assert_close(m.in_proj_qkvz.weight_scale_inv, torch.stack([t[rank] for t in (q,k,v,z)]))
+                torch.testing.assert_close(m.out_proj.weight_scale_inv, out[:, rank:rank+1])
+
+    def test_cpu_fst_stream_projects_ba_into_the_rank_local_owner(self):
+        from rtp_llm.models_py.model_loader import NewLoaderConfig, NewModelLoader
+        values = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "model.safetensors")
+            save_file({"in_proj_ba.weight": values}, path)
+            loader = NewModelLoader({}, NewLoaderConfig(device="cpu", load_method="fastsafetensors"), folder)
+            for rank in range(2):
+                owner = self.model(rank)
+                # Explicitly call FST, not auto selection: no scratch fallback.
+                for name, data in loader._fastsafetensors_weights_iterator([path], "cpu", None, None):
+                    owner.load_weights({name: data})
+                torch.testing.assert_close(owner.in_proj_ba_w, values[4*rank:4*rank+4].T)
 
 
 if __name__ == "__main__":

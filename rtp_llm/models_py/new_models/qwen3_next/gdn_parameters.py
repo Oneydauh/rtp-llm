@@ -233,9 +233,9 @@ class Qwen3NextGdnParameters(RtpModule):
         value = getattr(layer.quant_config, "weight_block_size", [128, 128])
         if not isinstance(value, (list, tuple)) or len(value) != 2:
             raise ValueError(f"Invalid FP8 weight_block_size {value!r}")
-        block_n = _positive_int(value[0], "FP8 output block size")
-        block_k = _positive_int(value[1], "FP8 input block size")
-        return block_n, block_k
+        if any(type(size) is not int or size <= 0 for size in value):
+            raise ValueError(f"FP8 block dimensions must be positive integers: {value!r}")
+        return value[0], value[1]
 
     def _split_qkvz_rows(self, tensor: torch.Tensor, unit: int) -> torch.Tensor:
         global_k = self.head_k_dim * self.linear_attn_config.linear_num_key_heads
