@@ -25,6 +25,7 @@ from rtp_llm.models_py.expert_placement import (
 from rtp_llm.models_py.module_base import RtpModule, copy_weight_
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 from rtp_llm.models_py.quant_methods.moe_layout import prepare_moe_weight_layout
+from rtp_llm.models_py.quant_methods.moe_quant_key import moe_checkpoint_method_key
 from rtp_llm.models_py.runtime_weight_update import (
     RuntimeWeightTransaction,
     TensorUpdate,
@@ -351,7 +352,7 @@ class BaseMoEExperts(RtpModule):
                 f"{runtime_method!r} without model_config.quant_config"
             )
 
-        source_method = source_config.get_runtime_method_key()
+        source_method = moe_checkpoint_method_key(source_config)
         source_family = {
             **self._BASE_QUANT_MAP,
             **self._EXTRA_QUANT_MAP,

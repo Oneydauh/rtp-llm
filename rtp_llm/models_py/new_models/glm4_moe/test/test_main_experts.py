@@ -48,6 +48,32 @@ class _ExpertModel(RtpModule):
 
 
 class GenericExpertsCheckpointTest(unittest.TestCase):
+    def test_actual_main_quant_config_keys(self):
+        from rtp_llm.config.quant_config import (
+            CompressedW4A8Int4PerChannelQuantConfig,
+            Fp8BlockWiseQuantConfig,
+            Fp8PerTensorQuantConfig,
+        )
+        from rtp_llm.models_py.quant_methods.moe_quant_key import (
+            moe_checkpoint_method_key,
+        )
+
+        w4 = CompressedW4A8Int4PerChannelQuantConfig(
+            bits=4, group_size=32, is_quanted=True
+        )
+        self.assertEqual(
+            moe_checkpoint_method_key(w4), "W4A8_INT4_PER_CHANNEL_COMPRESSED"
+        )
+        for encoded in (True, False):
+            for quant, group, key in (
+                (Fp8PerTensorQuantConfig, 0, "fp8"),
+                (Fp8BlockWiseQuantConfig, 128, "fp8_block"),
+            ):
+                cfg = quant(bits=8, group_size=group, is_quanted=encoded)
+                self.assertEqual(
+                    moe_checkpoint_method_key(cfg), key if encoded else key + "_online"
+                )
+
     def test_shared_ffn_and_correction_router(self):
         from rtp_llm.models_py.new_models.deepseek_v3.moe import (
             DeepSeekV32MoEBlock,
