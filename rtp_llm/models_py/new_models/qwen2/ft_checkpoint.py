@@ -36,8 +36,8 @@ def load_dense_ft_checkpoint(model, checkpoint):
 
     fp8_methods = (Fp8LinearMethod, Fp8PerChannelLinearMethod, Fp8BlockLinearMethod)
 
-    if type(model).__name__ not in ("Qwen2ForCausalLM", "LlamaForCausalLM"):
-        raise ValueError("FT adapter is only validated for dense Qwen2/Llama")
+    if type(model).__name__ not in ("Qwen2ForCausalLM", "LlamaForCausalLM", "Glm4MoeForCausalLM"):
+        raise ValueError("No FT adapter for this model's projection tree")
     swizzle_flags = set()
     for key, value in checkpoint.env_params.items():
         normalized = key.lower().replace("_", "")
@@ -66,11 +66,11 @@ def load_dense_ft_checkpoint(model, checkpoint):
 
     layers = ft_layer_bindings(model)
     for _, _, layer in layers:
+        ffn = getattr(layer.mlp, "shared_experts", None) if hasattr(layer.mlp, "experts") else layer.mlp
         for linear in (
             layer.self_attn.qkv_proj,
             layer.self_attn.o_proj,
-            layer.mlp.gate_up_proj,
-            layer.mlp.down_proj,
+            *((ffn.gate_up_proj, ffn.down_proj) if ffn is not None else ()),
         ):
             if not isinstance(
                 linear.quant_method, (UnquantizedLinearMethod, *fp8_methods)
@@ -366,6 +366,25 @@ def load_dense_ft_checkpoint(model, checkpoint):
                     ).reshape(shape),
                 )
             )
+        for qk in ("q", "k"):
+            if getattr(layer.self_attn, qk + "_norm", None) is not None:
+                bindings.append(RuntimeTensorBinding(
+                    (src + "self_attention_weights." + qk + "_layernorm.gamma",),
+                    dst + "self_attn." + qk + "_norm.weight", _identity))
+        ffn, ffn_target = layer.mlp, "mlp."
+        if hasattr(layer.mlp, "experts"):
+            from rtp_llm.models_py.quant_methods.block_fp8_ft import block_moe_ft_bindings
+
+            bindings.extend(block_moe_ft_bindings(layer.mlp.experts, src, dst + "mlp.experts", checkpoint, layer_id))
+            bindings.append(RuntimeTensorBinding(
+                (src + "partial_moe_weights.gate.kernel",), dst + "mlp.gate.weight", _transpose))
+            if getattr(layer.mlp.gate, "e_score_correction_bias", None) is not None:
+                bindings.append(RuntimeTensorBinding(
+                    (src + "partial_moe_weights.e_score_correction_bias",),
+                    dst + "mlp.gate.e_score_correction_bias", _identity))
+            ffn, ffn_target = layer.mlp.shared_experts, "mlp.shared_experts."
+        if ffn is None:
+            continue
         down_names = (src + "ffn_weights.intermediate_weight2.kernel",)
         gate_names = (
             (src + "ffn_weights.intermediate_weight13.kernel",)
@@ -375,14 +394,14 @@ def load_dense_ft_checkpoint(model, checkpoint):
                 src + "ffn_weights.intermediate_weight3.kernel",
             )
         )
-        local_width = layer.mlp.down_proj.weight.shape[1]
-        hidden = layer.mlp.down_proj.weight.shape[0]
+        local_width = ffn.down_proj.weight.shape[1]
+        hidden = ffn.down_proj.weight.shape[0]
         for names, projection, target in (
-            (down_names, "down", "mlp.down_proj.weight"),
-            (gate_names, "gate_up", "mlp.gate_up_proj.weight"),
+            (down_names, "down", ffn_target + "down_proj.weight"),
+            (gate_names, "gate_up", ffn_target + "gate_up_proj.weight"),
         ):
             linear = (
-                layer.mlp.down_proj if projection == "down" else layer.mlp.gate_up_proj
+                ffn.down_proj if projection == "down" else ffn.gate_up_proj
             )
             if isinstance(linear.quant_method, fp8_methods):
                 if len(names) != 1:

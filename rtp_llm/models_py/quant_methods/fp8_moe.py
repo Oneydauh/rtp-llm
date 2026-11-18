@@ -848,14 +848,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if not is_ue8m0_used(layer.w13.device):
             return
 
+        from rtp_llm.models_py.quant_methods.block_fp8_ft import block_ft_runtime_pair
+
         requant_weight_ue8m0 = resolve_requant()
-        layer.w13.data, layer.w13_scale = requant_weight_ue8m0(
+        layer.w13.data, layer.w13_scale = block_ft_runtime_pair(
+            layer,
             layer.w13.data.contiguous(),
             layer.w13_scale.to(layer.w13.device, non_blocking=True).contiguous(),
+            "w13_scale", requant_weight_ue8m0,
         )
-        layer.w2.data, layer.w2_scale = requant_weight_ue8m0(
+        layer.w2.data, layer.w2_scale = block_ft_runtime_pair(
+            layer,
             layer.w2.data.contiguous(),
             layer.w2_scale.to(layer.w2.device, non_blocking=True).contiguous(),
+            "w2_scale", requant_weight_ue8m0,
         )
         logger.info(
             "[Fp8MoEMethod] requantized MoE fp8 block scales to UE8M0: "

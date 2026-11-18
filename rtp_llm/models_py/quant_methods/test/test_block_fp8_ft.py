@@ -9,7 +9,7 @@ from safetensors.torch import save_file
 
 from rtp_llm.models_py.ft_checkpoint import CheckpointTopology, FTCheckpoint
 from rtp_llm.models_py.quant_methods.block_fp8_ft import (
-    block_ft_bindings, block_ft_scale, block_ft_weight,
+    block_ft_bindings, block_ft_scale, block_ft_weight, block_moe_ft_bindings,
 )
 from rtp_llm.models_py.quant_methods.fp8 import Fp8BlockLinearMethod
 
@@ -93,6 +93,70 @@ class BlockFTTest(unittest.TestCase):
         decoded = block_ft_weight(raw,(2,3),False)
         s = block_ft_scale(torch.tensor([[4.]]),(2,3),source_dtype=raw.dtype)
         torch.testing.assert_close(decoded.float()*s, raw.reshape(2,3).float()*4,rtol=0,atol=0)
+
+    def test_expert_ft_vs_hf_routed_output(self):
+        from rtp_llm.config.quant_config import Fp8BlockWiseQuantConfig
+        from rtp_llm.models_py.layers.moe_experts import BaseMoEExperts
+        from rtp_llm.models_py.quant_methods.base import QuantizationConfig
+
+        cfg = Fp8BlockWiseQuantConfig(bits=8, group_size=128, is_quanted=True)
+        h, m, e = 128, 256, 2
+        def model():
+            tree = torch.nn.Module()
+            tree.experts = BaseMoEExperts(
+                num_experts=e, top_k=1, hidden_size=h, moe_intermediate_size=m,
+                tp_size=1,tp_rank=0,ep_size=1,ep_rank=0, params_dtype=torch.bfloat16,
+                model_config=SimpleNamespace(num_layers=1, activation_type="SiGLU", quant_config=cfg),
+                parallelism_config=SimpleNamespace(dp_size=1,dp_rank=0,world_size=1,local_world_size=1),
+                moe_config=None,quant_config=QuantizationConfig("fp8_block",cfg),layer_idx=0)
+            return tree
+        g=torch.Generator().manual_seed(121)
+        hf={}
+        for idx in range(e):
+            for proj in ("up","gate","down"):
+                shape=(h,m) if proj=="down" else (m,h)
+                key=f"{idx}.{proj}_proj."
+                hf[key+"weight"]=torch.randint(-5,6,shape,generator=g).to(torch.float8_e4m3fn)
+                hf[key+"weight_scale_inv"]=2.**torch.randint(-4,0,tuple(n//128 for n in shape),generator=g)
+        ref=model().experts
+        for key,t in hf.items():
+            ref.load_weights({key:t})
+        ref.validate_weights_loaded()
+        def routed(owner):
+            def dq(w,s):
+                return w.float()*s.repeat_interleave(128,1).repeat_interleave(128,2)
+            x=torch.arange(h).float().reshape(1,-1)/h
+            up, gate=(x@dq(owner.w13,owner.w13_scale).transpose(1,2)).chunk(2, dim=-1)
+            return (up*torch.nn.functional.silu(gate))@dq(owner.w2,owner.w2_scale).transpose(1,2)
+        reference=routed(ref)
+        for packed in (False, True):
+            ft={}
+            for name,kind,ps in (
+                ("intermediate_weight","w13",("up","gate")),
+                ("intermediate_weight2","w2",("down",)),
+            ):
+                stem="layers.0.partial_moe_weights."+name
+                ws,ss=[],[]
+                for idx in range(e):
+                    w=torch.cat([hf[f"{idx}.{p}_proj.weight"].view(torch.uint8) for p in ps]).view(torch.float8_e4m3fn)
+                    scale=torch.cat([hf[f"{idx}.{p}_proj.weight_scale_inv"] for p in ps])
+                    ws.append(w)
+                    ss.append(source_snapshot(w,scale,True)[1] if packed else scale)
+                ft[stem+".kernel"]=torch.stack([w.view(torch.uint8) for w in ws]).view(torch.float8_e4m3fn)
+                ft[stem+".weight_only_quant_scale"]=torch.stack(ss)
+            with tempfile.TemporaryDirectory() as root:
+                write_ft(root,ft)
+                for backend in ("scratch","fastsafetensors"):
+                    with self.subTest(packed=packed,backend=backend):
+                        cp=FTCheckpoint.open(root,CheckpointTopology()); cp.read_backend=backend
+                        tree=model()
+                        bindings=block_moe_ft_bindings(tree.experts,"layers.0.","experts",cp,0)
+                        cp.load_parameters(tree,bindings)
+                        tree.experts.validate_weights_loaded()
+                        for key in ("w13","w2","w13_scale","w2_scale"):
+                            torch.testing.assert_close(getattr(tree.experts,key).float(),getattr(ref,key).float(),rtol=0,atol=0)
+                        torch.testing.assert_close(routed(tree.experts),reference,rtol=0,atol=0)
+                        self.assertEqual(getattr(tree.experts,"_packed_block_fp8_ft",set()),{"w13_scale","w2_scale"} if packed else set())
 
 
 if __name__ == "__main__":

@@ -146,3 +146,77 @@ def block_ft_bindings(layer, source, scale_source, target, checkpoint):
         RuntimeTensorBinding((scale_source,), target + ".weight_scale_inv",
             decode_scale, entry(scale_source), install_scale),
     )
+
+
+def block_moe_ft_bindings(layer, source_prefix, target, checkpoint, layer_id):
+    """Read the physical rows for this owner, then restore its normal HF staging ABI.
+
+    OldLoader dumps the local execution layout verbatim and reloads it on
+    the same runtime. Untagged FN snapshots on ROCm therefore use AITER,
+    not CUDA's unshuffled layout. FNUZ and packed scales identify their
+    producer independently. A tagged snapshot can also be moved across ABIs.
+    """
+    if layer._quant_family != "fp8_per_block" or layer._fp8_moe_weight_block_size != [128, 128]:
+        raise ValueError("Expected a block-FP8 expert owner with 128x128 runtime tiles")
+    bindings = []
+    placement = layer._expert_placement
+    declared = checkpoint.index_metadata.get("ft_export_backend")
+    if declared not in (None, "cuda", "rocm"):
+        raise ValueError(f"Unknown FT expert producer ABI: {declared!r}")
+
+    def bind(key, tensor_name, convert, projections, scale, packed):
+        param = getattr(layer, tensor_name)
+        def read():
+            return (checkpoint.read_expert_rows(key, layer_id, placement),)
+        def install(values):
+            param.copy_(convert(values))
+            if scale and packed:
+                layer._packed_block_fp8_ft = getattr(layer, "_packed_block_fp8_ft", set()) | {tensor_name}
+            for slot in range(layer.num_local_experts):
+                for proj in projections:
+                    if scale:
+                        layer._loaded_aux_keys.add((slot, proj, "weight_scale_inv"))
+                    else:
+                        layer._record_projection_loaded(slot, proj)
+        return RuntimeTensorBinding((key,), target + "." + tensor_name, convert, read, install)
+
+    for w, stem, projs in (
+        ("w13", "intermediate_weight", ("up_proj", "gate_proj")),
+        ("w2", "intermediate_weight2", ("down_proj",)),
+    ):
+        prefix = source_prefix + "partial_moe_weights." + stem
+        weight_key = prefix + ".kernel"
+        scale_key = prefix + ".weight_only_quant_scale"
+        shape = tuple(getattr(layer, w).shape)
+        def dtype(key):
+            return checkpoint.read_rank_slice(key, checkpoint.topology.tp_rank, (slice(0, 1),) * 3).dtype
+        source_type, scale_type = dtype(weight_key), dtype(scale_key)
+        packed = scale_type == torch.int32
+        rocm = not packed and (
+            declared == "rocm" or source_type == torch.float8_e4m3fnuz or
+            (declared is None and torch.version.hip is not None)
+        )
+        if (declared == "rocm" and packed) or (declared == "cuda" and source_type == torch.float8_e4m3fnuz):
+            raise ValueError("Contradictory FT producer ABI and block-FP8 payload")
+        gate_up = w == "w13"
+        def convert_weight(values, s=shape, p=packed, r=rocm, g=gate_up):
+            return block_ft_weight(values[0], s, p, rocm_shuffle=r, gate_up=g)
+        def convert_scale(values, s=shape, dt=source_type, g=gate_up, r=rocm):
+            raw = values[0]
+            if not g:
+                return block_ft_scale(raw, s, source_dtype=dt)
+            # HF and old FT use separate gate/up block grids even when each
+            # local FFN width ends with a partial block.
+            half = s[-2] // 2
+            half_rows = half if raw.dtype == torch.int32 else _blocks(half)
+            if raw.shape[-2] != 2 * half_rows:
+                raise ValueError("Invalid gate/up FT expert scale grid")
+            left, right = raw.split(half_rows, dim=-2)
+            decoded = [
+                block_ft_scale(part.contiguous(), (s[0], half, s[-1]), source_dtype=dt)
+                for part in ((right, left) if r else (left, right))
+            ]
+            return torch.cat(decoded, dim=-2)
+        bindings.append(bind(weight_key, w, convert_weight, projs, False, packed))
+        bindings.append(bind(scale_key, w + "_scale", convert_scale, projs, True, packed))
+    return bindings
