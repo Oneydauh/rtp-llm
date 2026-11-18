@@ -176,6 +176,10 @@ class Qwen3_5MoeVitWeight(BaseVitWeights):
 
 
 class Qwen3_5MoeMixin(Qwen3_VLMixin):
+    _new_vision_embedding = Qwen3_5MoeImageEmbedding
+    # Exporters may nest the tower below an additional model namespace.
+    _new_vision_prefix = None
+
     def _init_multimodal(self):
         self.mm_part = Qwen3_5MoeImageEmbedding(self.mm_related_params)
         self.mm_related_params.vit_weights = Qwen3_5MoeVitWeight(

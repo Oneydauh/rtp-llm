@@ -233,6 +233,9 @@ class Qwen3VLVitWeight(BaseVitWeights):
 
 
 class Qwen3_VLMixin(Qwen2_5_VLMixin):
+    _new_vision_embedding = Qwen3_VLImageEmbedding
+    _new_vision_prefix = "model.visual."
+
     def _init_multimodal(self):
         self.mm_part = Qwen3_VLImageEmbedding(self.mm_related_params)
         self.mm_related_params.vit_weights = Qwen3VLVitWeight(

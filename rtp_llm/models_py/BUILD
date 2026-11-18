@@ -159,6 +159,25 @@ py_library(
     deps = ["//rtp_llm:torch"],
 )
 
+py_test(
+    name = "qwen_service_vision_test",
+    srcs = [
+        "new_models/qwen_service_vision.py",
+        "new_models/qwen_service_vision_test.py",
+    ],
+    main = "new_models/qwen_service_vision_test.py",
+    env = {
+        "CUDA_VISIBLE_DEVICES": "",
+        "HIP_VISIBLE_DEVICES": "",
+        "OMP_NUM_THREADS": "1",
+    },
+    deps = [
+        ":new_loader_core",
+        "//rtp_llm:fastsafetensors",
+        "//rtp_llm:transformers",
+    ],
+)
+
 # CPU-only subset of the DSv4 decode package: pure-torch modules plus the
 # package __init__ chain, without the CUDA/testlib closure. The lazily
 # imported paged/pool helpers (pool_slot_mapping, _pool_triton) are part of
