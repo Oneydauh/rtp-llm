@@ -4,18 +4,21 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
 
 from rtp_llm.models.direct_checkpoint import load_owned_model
 from rtp_llm.models_py.downstream_heads import ReplicatedHandlerHeads
+from rtp_llm.models_py.fst_range_reader import iter_fst_range_tensors
 from rtp_llm.models_py.model_loader import (
     NewLoaderConfig,
     NewLoaderLoadMethod,
     NewModelLoader,
 )
 from rtp_llm.models_py.module_base import RtpModule
+from rtp_llm.models_py.read_spec import ReadSpec, unwrap_checkpoint_tensor
 from rtp_llm.models_py.registry import register_model
 from rtp_llm.models_py.weight_mapper import WeightsMapper
 
@@ -100,6 +103,57 @@ def service(path, method, model_type="_service_direct_leaf"):
 
 
 class DirectServingBoundaryTest(unittest.TestCase):
+    def test_forced_cpu_stages_with_native_fst_and_never_retries(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "model.safetensors")
+            source = torch.tensor([[2.0, 4.0], [-1.0, 3.0]])
+            save_file({"weight_param": source}, path)
+            value = service(root, "fastsafetensors")
+            value.force_cpu_load_weights = True
+            with patch.object(
+                NewModelLoader,
+                "_fastsafetensors_weights_iterator",
+                side_effect=AssertionError("parallel FST used"),
+            ), patch(
+                "rtp_llm.models_py.weight_mapper.get_all_weights",
+                side_effect=AssertionError("scratch used"),
+            ):
+                load_owned_model(value)
+                self.assertEqual(
+                    value.model_weights_loader.loaded_method,
+                    NewLoaderLoadMethod.FASTSAFETENSORS,
+                )
+                torch.testing.assert_close(value.py_model.weight_param, source)
+                failed = service(root, "fastsafetensors")
+                failed.force_cpu_load_weights = True
+                with patch(
+                    "rtp_llm.models_py.fst_range_reader.native_cpu_range_api",
+                    side_effect=ImportError("reader missing"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "reader missing"):
+                        load_owned_model(failed)
+                self.assertIsNone(failed.py_model)
+
+    def test_native_cpu_staging_reads_pruned_vocab_rows_including_empty_rank(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "model.safetensors")
+            source = torch.arange(36, dtype=torch.float32).reshape(9, 4)
+            save_file({"head": source}, path)
+            for rows in ((0, 1, 4, 6, 7), ()):
+                with self.subTest(rows=rows):
+                    values = list(
+                        iter_fst_range_tensors(
+                            [path],
+                            read_spec_resolver=lambda key, shape: ReadSpec(
+                                key, key, shape, row_indices=rows
+                            ),
+                        )
+                    )
+                    self.assertEqual(len(values), 1)
+                    tensor, spec = unwrap_checkpoint_tensor(values[0][1])
+                    self.assertEqual(spec.row_indices, rows)
+                    torch.testing.assert_close(tensor, source[list(rows)])
+
     def test_full_handler_sources_survive_reader_destruction(self):
         values = {
             "model.embed_tokens.weight": torch.arange(8).reshape(4, 2).float(),

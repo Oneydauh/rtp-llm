@@ -1,4 +1,4 @@
-"""Bounded rank-local FST reads for online expert placement updates.
+"""Bounded rank-local FST reads for CPU staging and online expert updates.
 
 The normal FST parallel loader stages whole files and uses collectives. Neither
 is appropriate while inference is running. Use its native CPU range reader
@@ -138,15 +138,8 @@ def _element_spans(shape, axes) -> Iterator[Tuple[int, int]]:
     yield from visit(0, 0)
 
 
-def iter_fst_range_tensors(
-    files, *, name_filter=None, slice_expander=None, read_spec_resolver=None
-):
-    """Read real safetensors payload through FST C++; never silently fallback.
-
-    CPU tensors own their storage, so yielded tensors remain valid after the
-    generator is closed. Every native request completes before its fd/buffer
-    can be released. Errors abort the temporary reload, before live installation.
-    """
+def native_cpu_range_api():
+    """Resolve the actual FST symbols used by the rank-local reader."""
     from fastsafetensors import cpp
     from fastsafetensors.common import SafeTensorsMetadata
     from fastsafetensors.frameworks._torch import TorchOp, dtype_convert
@@ -155,23 +148,37 @@ def iter_fst_range_tensors(
         callable(getattr(cpp, symbol, None))
         for symbol in ("nogds_file_reader", "gds_device_buffer")
     ):
-        raise RuntimeError("Dynamic EPLB requires FST native CPU range reader APIs")
+        raise RuntimeError("FST is missing its native CPU range reader APIs")
+    return cpp, SafeTensorsMetadata, TorchOp, dtype_convert
+
+
+def iter_fst_range_tensors(
+    files, *, name_filter=None, slice_expander=None, read_spec_resolver=None
+):
+    """Read via FST C++; CPU tensors own storage beyond the reader lifetime."""
+    cpp, SafeTensorsMetadata, TorchOp, dtype_convert = native_cpu_range_api()
     # use_mmap=False permits arbitrary file offsets. CPU mode avoids pinned
     # CUDA allocation and current-device state in the reader's worker threads.
     reader = cpp.nogds_file_reader(False, 1024, 1, False)
     framework = TorchOp()
 
     def read(fd, metadata, frame, spec):
-        # Vocabulary gathering is not an MoE reload operation. Refuse it
-        # explicitly instead of interpreting a gather ReadSpec as a full read.
-        if getattr(spec, "row_indices", None) is not None:
-            raise ValueError(
-                "Dynamic EPLB FST ranges do not support vocabulary row gathers"
-            )
         shape = tuple(frame.shape)
         if spec.source_shape != shape:
             raise ValueError(f"ReadSpec shape mismatch for {spec.source_name!r}")
-        if getattr(spec, "segments", None) is not None:
+        if spec.row_indices is not None:
+            row_size = math.prod(shape[1:])
+            output_shape = (len(spec.row_indices), *shape[1:])
+            # Collapse adjacent vocabulary rows into one native read. Empty
+            # rank selections are legal and must not read unrelated rows.
+            runs = []
+            for row in spec.row_indices:
+                if runs and runs[-1][1] == row:
+                    runs[-1] = (runs[-1][0], row + 1)
+                else:
+                    runs.append((row, row + 1))
+            spans = ((lo * row_size, (hi - lo) * row_size) for lo, hi in runs)
+        elif spec.segments is not None:
             # ReadSpec validates exclusivity and ordered nonoverlapping rows.
             output_shape = (
                 sum(end - start for start, end in spec.segments),

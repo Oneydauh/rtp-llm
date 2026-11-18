@@ -115,6 +115,7 @@ def load_owned_model(service):
         fmha_config=service.fmha_config,
         py_hw_kernel_config=service.hw_kernel_config,
         max_generate_batch_size=service.max_generate_batch_size,
+        force_cpu_load_weights=getattr(service, "force_cpu_load_weights", False),
         custom_weight_mappings=custom_weight_mappings(service.custom_module),
     )
     loader = NewModelLoader(

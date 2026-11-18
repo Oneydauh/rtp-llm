@@ -366,6 +366,9 @@ class NewLoaderConfig:
     # close and adds CPU range I/O. Do not enable by default without proving
     # the installed FST's early-release semantics and GPU peak behavior.
     experimental_fst_segmented_reads: bool = False
+    # Stage checkpoint input and conversions on CPU, independently of the
+    # eventual runtime device. GPU-only leaf postprocessing runs after migration.
+    force_cpu_load_weights: bool = False
 
     @classmethod
     def from_runtime(cls, parallelism_config, **options) -> "NewLoaderConfig":
@@ -493,6 +496,8 @@ class NewLoaderConfig:
             raise TypeError("compute_dtype must be a torch.dtype")
         if not isinstance(self.keep_mla_checkpoint_weights, bool):
             raise TypeError("keep_mla_checkpoint_weights must be a bool")
+        if not isinstance(self.force_cpu_load_weights, bool):
+            raise TypeError("force_cpu_load_weights must be a bool")
         if not isinstance(self.experimental_fst_segmented_reads, bool):
             raise TypeError("experimental_fst_segmented_reads must be a bool")
         if not isinstance(self.custom_weight_mappings, tuple):
@@ -1696,6 +1701,26 @@ class NewModelLoader:
                 f"{type(model).__name__} does not support rank-local consolidated "
                 "checkpoints"
             )
+        if self.load_config.force_cpu_load_weights:
+            if automatic:
+                # AUTO chooses direct FST for accelerator staging only.
+                return (
+                    "forced CPU staging uses scratch unless FST is explicitly requested"
+                )
+            from rtp_llm.models_py.fst_range_reader import native_cpu_range_api
+
+            try:
+                native_cpu_range_api()
+                duplicates, _ = self._safetensor_metadata_summary(
+                    self._resolved_model_path(),
+                    checkpoint_files,
+                    self._safetensor_catalog(),
+                )
+            except (ImportError, OSError, RuntimeError, ValueError) as exc:
+                return f"cannot stage checkpoint with the native FST CPU reader: {exc}"
+            if duplicates:
+                return f"checkpoint tensor names are duplicated: {duplicates[:10]}"
+            return None
         staged_modules = self._staged_device_modules(model)
         try:
             self._validate_staged_device_modules(
@@ -2270,7 +2295,11 @@ class NewModelLoader:
         started = time.time()
         staged_coordinator = None
         coordinator_modules: List[RtpModule] = []
-        if method == NewLoaderLoadMethod.FASTSAFETENSORS:
+        accelerator_fst = (
+            method == NewLoaderLoadMethod.FASTSAFETENSORS
+            and not self.load_config.force_cpu_load_weights
+        )
+        if accelerator_fst:
             staged_modules = self._staged_device_modules(model)
             self._validate_staged_device_modules(
                 model, staged_modules, require_load_complete=True
@@ -2291,13 +2320,25 @@ class NewModelLoader:
                 ]
                 for module in coordinator_modules:
                     module._rtp_staged_load_coordinator = staged_coordinator
-        if method == NewLoaderLoadMethod.FASTSAFETENSORS:
+        if accelerator_fst:
             weights = self._fastsafetensors_weights_iterator(
                 selected_files,
                 self.load_config.device,
                 base_filter,
                 base_expander,
                 base_resolver,
+            )
+        elif method == NewLoaderLoadMethod.FASTSAFETENSORS:
+            from rtp_llm.models_py.fst_range_reader import iter_fst_range_tensors
+
+            logger.info(
+                "NewLoader: native FST CPU staging, runtime=%s", self.load_config.device
+            )
+            weights = iter_fst_range_tensors(
+                selected_files,
+                name_filter=base_filter,
+                slice_expander=base_expander,
+                read_spec_resolver=base_resolver,
             )
         else:
             weights = weight_mapper.get_all_weights(
@@ -2337,7 +2378,7 @@ class NewModelLoader:
             time.time() - started,
         )
 
-        if method == NewLoaderLoadMethod.SCRATCH:
+        if not accelerator_fst:
             self._migrate_staged_modules(model, self.load_config.device)
         validate_borrowed_parameters(model, self.load_config.device)
         model.to(self.load_config.device)
