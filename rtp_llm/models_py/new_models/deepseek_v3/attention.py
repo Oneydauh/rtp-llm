@@ -13,8 +13,10 @@ Key design decisions:
     separate submodule built by the DecoderLayer when is_sparse is True.
 """
 
+from __future__ import annotations
+
 import math
-from typing import Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -26,8 +28,6 @@ from rtp_llm.models_py.layers.linear import (
 )
 from rtp_llm.models_py.layers.norm import RMSNorm
 from rtp_llm.models_py.module_base import RtpModule
-from rtp_llm.models_py.modules.factory.attention.attn_factory import MlaImplBase
-from rtp_llm.models_py.modules.hybrid.mla_attention import MlaAttention
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 from rtp_llm.models_py.quant_methods.fp8 import (
     _resolve_fp8_gemm_nt,
@@ -35,8 +35,10 @@ from rtp_llm.models_py.quant_methods.fp8 import (
     _resolve_sgl_per_token_group_quant,
     is_deep_gemm_e8m0_used,
 )
-from rtp_llm.ops.compute_ops import LayerKVCache
-from rtp_llm.utils.model_weight import W
+
+if TYPE_CHECKING:
+    from rtp_llm.models_py.modules.factory.attention.attn_factory import MlaImplBase
+    from rtp_llm.ops.compute_ops import LayerKVCache
 
 
 class _CudaRuntimeFusedFp8Linear(nn.Module):
@@ -399,6 +401,22 @@ class DeepSeekV32MlaAttention(RtpModule):
         self.register_buffer("_vc_w", None, persistent=False)
         self.indexer: Optional[nn.Module] = None
 
+    def _projection_name(self, name: str) -> str:
+        if self.q_lora_rank == 0 and name.startswith("q_proj."):
+            return "q_a_proj." + name[len("q_proj.") :]
+        return name
+
+    def checkpoint_read_spec(self, name, shape):
+        # This module owns a custom load_weights hook, so NewModelLoader stops
+        # traversal here. Delegate to the actual leaf with the same alias the
+        # writer uses (V2-Lite q_proj is TP-sharded, unlike replicated q_a).
+        name = self._projection_name(name)
+        first, sep, rest = name.partition(".")
+        child = self._modules.get(first)
+        if sep and isinstance(child, RtpModule):
+            return child.resolve_checkpoint_read_spec(rest, shape)
+        return None
+
     def load_weights(self, weights):
         if self._checkpoint_weights_released:
             raise RuntimeError(
@@ -407,14 +425,7 @@ class DeepSeekV32MlaAttention(RtpModule):
             )
         if self.q_lora_rank == 0:
             items = weights.items() if isinstance(weights, dict) else weights
-            weights = {
-                (
-                    "q_a_proj." + name[len("q_proj.") :]
-                    if name.startswith("q_proj.")
-                    else name
-                ): tensor
-                for name, tensor in items
-            }
+            weights = ((self._projection_name(name), tensor) for name, tensor in items)
         return super().load_weights(weights)
 
     def process_weights_after_loading(self):
@@ -534,6 +545,8 @@ class DeepSeekV32MlaAttention(RtpModule):
 
     def _build_mla_kernel_weights(self) -> Dict[str, torch.Tensor]:
         """Expose only the kv_b/kc/vc tensors consumed by MLA factories."""
+        from rtp_llm.utils.model_weight import W
+
         if self._fused_qkv_a_w is None:
             raise RuntimeError(
                 "process_weights_after_loading() must be called before "
@@ -609,6 +622,8 @@ class DeepSeekV32MlaAttention(RtpModule):
         (indexer not attached) so fmha_impl.forward gets a None and dense
         backends short-circuit; sparse backends require non-None.
         """
+        from rtp_llm.models_py.modules.hybrid.mla_attention import MlaAttention
+
         return MlaAttention._run_sparse_indexer(
             self, hidden_states, q_c, q_view, kv_cache, fmha_impl
         )
@@ -670,6 +685,8 @@ class DeepSeekV32MlaAttention(RtpModule):
 
         # Sparse Indexer (DSA) — runs only when self.indexer is attached
         # (DecoderLayer sets self.indexer when is_sparse=True).
+        from rtp_llm.models_py.modules.hybrid.mla_attention import MlaAttention
+
         default_impl, default_cache, indexer_impl, indexer_cache = (
             MlaAttention._resolve_layer_routes(self, fmha_impl, kv_cache)
         )
