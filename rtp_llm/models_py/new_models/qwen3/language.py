@@ -28,6 +28,7 @@ from rtp_llm.models_py.new_models.model_base import (
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 from rtp_llm.models_py.read_spec import unwrap_checkpoint_tensor
 from rtp_llm.models_py.weight_mapper import WeightsMapper
+from rtp_llm.ops import TaskType
 from rtp_llm.ops.compute_ops import (
     LayerKVCache,
     PyModelInputs,
@@ -460,7 +461,7 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
         return True
 
     def checkpoint_weight_name_filter(self):
-        if not self._pipeline_partitioned:
+        if not self._pipeline_partitioned and self.lm_head is not None:
             return None
 
         def owns(name):
@@ -474,8 +475,12 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
                 return self.embed_tokens is not None or (
                     self.lm_head is not None and self.tie_word_embeddings
                 )
-            if mapped.startswith("lm_head.") or mapped.startswith("norm."):
+            if mapped == "lm_head.weight" or (
+                self._pipeline_partitioned and mapped.startswith("lm_head.")
+            ):
                 return self.lm_head is not None
+            if mapped.startswith("norm."):
+                return self.norm is not None
             return True  # Unknown names remain subject to strict dispatch validation.
 
         return owns
@@ -669,6 +674,13 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
             if owns_head
             else None
         )
+        # Embedding/classification/reranking consumes normalized hidden states.
+        # A handler may independently own the raw full LM projection.
+        task_type = (
+            model_config.get("task_type", TaskType.LANGUAGE_MODEL)
+            if isinstance(model_config, dict)
+            else getattr(model_config, "task_type", TaskType.LANGUAGE_MODEL)
+        )
         self.lm_head = (
             ParallelLMHead(
                 vocab_size=cfg["vocab_size"],
@@ -678,7 +690,7 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
                 params_dtype=cfg["lm_head_params_dtype"],
                 **output_vocab_head_kwargs(model_config),
             )
-            if owns_head
+            if owns_head and task_type == TaskType.LANGUAGE_MODEL
             else None
         )
         if (
@@ -702,8 +714,9 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
         result = self.handler_heads.exports()
         if self.embed_tokens is not None:
             result["embedding"] = self.embed_tokens.weight
-        if self.lm_head is not None:
+        if self.norm is not None:
             result["final_layernorm.gamma"] = self.norm.weight
+        if self.lm_head is not None:
             result["lm_head"] = self.lm_head.weight
         return result
 

@@ -64,6 +64,68 @@ def checkpoint():
 
 
 class MainPPCheckpointTest(unittest.TestCase):
+    def test_non_generation_heads_are_handler_owned_and_norm_is_preserved(self):
+        from rtp_llm.ops import TaskType
+
+        pc = SimpleNamespace(
+            tp_size=1,
+            tp_rank=0,
+            ep_size=1,
+            ep_rank=0,
+            pp_size=1,
+            pp_rank=0,
+            dp_size=1,
+            dp_rank=0,
+        )
+        for method in ("scratch", "fastsafetensors"):
+            for explicit_head, needs_head in (
+                (False, False),
+                (True, False),
+                (True, True),
+                (False, True),
+            ):
+                with self.subTest(
+                    method=method, explicit_head=explicit_head, needs_head=needs_head
+                ), tempfile.TemporaryDirectory() as root:
+                    cfg = model_config()
+                    cfg.task_type = (
+                        TaskType.RERANKER if needs_head else TaskType.DENSE_EMBEDDING
+                    )
+                    cfg.tie_word_embeddings = False
+                    data = checkpoint()
+                    if explicit_head:
+                        data["lm_head.weight"] = data["model.embed_tokens.weight"] + 2
+                    save_file(data, os.path.join(root, "model.safetensors"))
+                    load = NewLoaderConfig(
+                        device="cpu",
+                        compute_dtype=torch.float32,
+                        load_method=method,
+                        parallelism_config=pc,
+                        quant_config=QuantizationConfig("none"),
+                        custom_weight_mappings=(
+                            (("__custom__.lm_head.weight", "lm_head.weight"),)
+                            if needs_head
+                            else ()
+                        ),
+                    )
+                    loader = NewModelLoader(cfg, load, model_path=root)
+                    if needs_head and not explicit_head:
+                        with self.assertRaisesRegex(RuntimeError, "Missing downstream"):
+                            loader.load()
+                        continue
+                    model = loader.load()
+                    self.assertIsNone(model.lm_head)
+                    exports = model.runtime_weight_view()
+                    self.assertIs(exports["final_layernorm.gamma"], model.norm.weight)
+                    torch.testing.assert_close(
+                        model.norm.weight, data["model.norm.weight"]
+                    )
+                    self.assertNotIn("lm_head", exports)
+                    if needs_head:
+                        torch.testing.assert_close(
+                            exports["__custom__.lm_head.weight"], data["lm_head.weight"]
+                        )
+
     def test_resolved_native_prefill_cp_stage_loads_replicas_and_sharded_head(self):
         from rtp_llm.config.server_config_setup import set_parallelism_config
         from rtp_llm.ops import CPRotateMethod, ParallelismConfig
