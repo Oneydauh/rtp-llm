@@ -64,6 +64,45 @@ def checkpoint():
 
 
 class MainPPCheckpointTest(unittest.TestCase):
+    def test_resolved_native_prefill_cp_stage_loads_replicas_and_sharded_head(self):
+        from rtp_llm.config.server_config_setup import set_parallelism_config
+        from rtp_llm.ops import CPRotateMethod, ParallelismConfig
+
+        values = checkpoint()
+        with tempfile.TemporaryDirectory() as folder:
+            save_file(values, os.path.join(folder, "model.safetensors"))
+            for physical_rank in range(4):
+                pc = ParallelismConfig()
+                pc.tp_size, pc.pp_size, pc.dp_size, pc.ep_size = 2, 2, 1, 0
+                pc.world_size, pc.local_world_size = 4, 4
+                pc.pp_stage_layer_counts = [1, 2]
+                pc.prefill_cp_config.method = CPRotateMethod.ALL_GATHER
+                set_parallelism_config(pc, world_rank=physical_rank)
+                load = NewLoaderConfig.from_runtime(
+                    pc,
+                    device="cpu",
+                    load_method="scratch",
+                    compute_dtype=torch.float32,
+                    quant_config=QuantizationConfig("none"),
+                )
+                model = NewModelLoader(model_config(), load, model_path=folder).load()
+                ids = ["0"] if pc.pp_rank == 0 else ["1", "2"]
+                self.assertEqual(list(model.layers), ids)
+                for layer_id in ids:
+                    layer = model.layers[layer_id]
+                    self.assertEqual(layer.self_attn.tp_size, 1)
+                    self.assertEqual(layer.mlp.tp_size, 1)
+                    torch.testing.assert_close(
+                        layer.mlp.down_proj.weight,
+                        values[f"model.layers.{layer_id}.mlp.down_proj.weight"],
+                    )
+                if pc.pp_rank == 1:
+                    self.assertIsNone(model.embed_tokens)
+                    torch.testing.assert_close(
+                        model.lm_head.weight,
+                        values["model.embed_tokens.weight"].chunk(2)[pc.tp_rank],
+                    )
+
     def test_pp1_keeps_full_owner_and_main_capture_capability(self):
         parallel = SimpleNamespace(
             tp_size=1,

@@ -113,6 +113,21 @@ py_test(
     deps = [":new_weight_loader", "//rtp_llm:models"],
 )
 
+py_test(
+    name = "main_native_pp_checkpoint_test",
+    srcs = ["new_models/qwen3/main_pp_checkpoint_test.py"],
+    main = "new_models/qwen3/main_pp_checkpoint_test.py",
+    env = {
+        "CUDA_VISIBLE_DEVICES": "",
+        "HIP_VISIBLE_DEVICES": "",
+        "ROCR_VISIBLE_DEVICES": "",
+    },
+    deps = [
+        ":new_weight_loader",
+        "//rtp_llm:transformers",
+    ],
+)
+
 py_library(
     name = "utils",
     srcs = glob([
