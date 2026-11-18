@@ -120,3 +120,8 @@ register_lazy_model(
     "rtp_llm.models_py.new_models.glm4_moe.language",
     "Glm4MoeForCausalLM",
 )
+register_lazy_model(
+    "qwen_2",
+    "rtp_llm.models_py.new_models.qwen2",
+    "Qwen2ForCausalLM",
+)

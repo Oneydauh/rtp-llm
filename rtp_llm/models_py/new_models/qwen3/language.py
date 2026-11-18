@@ -431,6 +431,12 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
 
     supports_checkpoint_weight_updates = True
 
+    _decoder_layer = Qwen3DecoderLayer
+    _dense_config = staticmethod(_extract_config_values)
+
+    def _decoder_kwargs(self, parallelism_config):
+        return {}
+
     WEIGHTS_MAPPER = WeightsMapper(
         prefix_mapping={"model.": ""},
     )
@@ -440,7 +446,7 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
             return None
 
         def owns(name):
-            mapped = name.removeprefix("model.")
+            mapped = self.WEIGHTS_MAPPER.map_name(name)
             if mapped.startswith("layers."):
                 index = mapped.split(".", 2)[1]
                 return not index.isdigit() or int(index) in self._owned_layer_ids
@@ -532,7 +538,7 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
             py_hw_kernel_config=py_hw_kernel_config,
         )
 
-        cfg = _extract_config_values(model_config, load_config)
+        cfg = self._dense_config(model_config, load_config)
         _validate_supported_parallelism(parallelism_config)
         pp_size = int(getattr(parallelism_config, "pp_size", 1))
         is_draft = bool(
@@ -574,7 +580,7 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
 
         self.embed_tokens = (
             VocabParallelEmbedding(
-                vocab_size=cfg["vocab_size"],
+                vocab_size=cfg.get("input_vocab_size", cfg["vocab_size"]),
                 embedding_dim=cfg["hidden_size"],
                 allow_vocab_padding=True,
                 tp_size=cfg["attn_tp_size"],
@@ -585,7 +591,7 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
             else None
         )
         owned_layers = {
-            str(i): Qwen3DecoderLayer(
+            str(i): self._decoder_layer(
                 hidden_size=cfg["hidden_size"],
                 num_heads=cfg["num_heads"],
                 num_kv_heads=cfg["num_kv_heads"],
@@ -600,6 +606,7 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
                 params_dtype=cfg["params_dtype"],
                 rms_norm_eps=cfg["rms_norm_eps"],
                 prefix=f"layers.{i}",
+                **self._decoder_kwargs(parallelism_config),
             )
             for i in self._owned_layer_ids
         }
@@ -655,10 +662,12 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
             result["lm_head"] = self.lm_head.weight
         return result
 
+    def _input_embeddings(self, inputs):
+        return self.embed_tokens(inputs.input_ids)
+
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
-        input_ids = inputs.input_ids
         hidden_states = (
-            self.embed_tokens(input_ids)
+            self._input_embeddings(inputs)
             if self.embed_tokens is not None
             else inputs.pp_intermediates["hidden_states"]
         )
