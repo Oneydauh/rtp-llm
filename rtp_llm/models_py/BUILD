@@ -1,6 +1,73 @@
 load("@arch_config//:arch_select.bzl", "requirement", "triton_deps")
 load("@local_config_cuda//cuda:build_defs.bzl", "cuda_default_copts_without_arch")
 
+# Portable checkpoint protocol. Keep this target independent of the native
+# inference library so real CPU checkpoint regressions need no fake ABI.
+py_library(
+    name = "new_loader_core",
+    srcs = [
+        "__init__.py",
+        "borrowed_parameters.py",
+        "expert_placement.py",
+        "fastsafetensors_read_spec.py",
+        "finetune_overlay.py",
+        "fst_range_reader.py",
+        "ft_checkpoint.py",
+        "lora_checkpoint.py",
+        "meta_checkpoint.py",
+        "model_loader.py",
+        "module_base.py",
+        "read_spec.py",
+        "registry.py",
+        "runtime_weight_update.py",
+        "weight_mapper.py",
+    ],
+    deps = [
+        "//rtp_llm:safetensors",
+        "//rtp_llm:torch",
+        "//rtp_llm/models_py/distributed:rank_layout",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "main_core_checkpoint_test",
+    srcs = ["main_core_checkpoint_test.py"],
+    env = {
+        "CUDA_VISIBLE_DEVICES": "",
+        "HIP_VISIBLE_DEVICES": "",
+        "ROCR_VISIBLE_DEVICES": "",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+    },
+    deps = [":new_loader_core"],
+)
+
+# Direct parameter owners use main's existing runtime models/helpers, never a
+# backported scheduler/cache/PP engine. Production routing is integrated later.
+py_library(
+    name = "new_weight_loader",
+    srcs = glob([
+        "layers/*.py",
+        "new_models/*.py",
+        "new_models/**/*.py",
+        "quant_methods/*.py",
+    ], exclude = [
+        "**/test/**",
+        "**/tests/**",
+        "**/*_test.py",
+        "**/test_*.py",
+    ]),
+    deps = [
+        ":models",
+        ":new_loader_core",
+        "//rtp_llm:fastsafetensors",
+        "//rtp_llm:ops",
+        "//rtp_llm/models_py/distributed:collective_torch",
+    ],
+    visibility = ["//visibility:public"],
+)
+
 py_library(
     name = "utils",
     srcs = glob([

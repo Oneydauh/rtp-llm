@@ -25,6 +25,9 @@ Focused adaptations
   must supply actual values to preserve decode-cascade configuration.
   Existing 603a79d Qwen3 owner uses main GptModelBase with a local RtpModule
   mixin, main layer_ids/capture context, and main PP tensor boundaries.
+  Follow-up adds separate Bazel new_loader_core, main_core_checkpoint_test and
+  new_weight_loader targets, reusing main :models runtime dependencies. Targets
+  are declared but Bazel analysis/runfiles execution has not been performed.
 
 Verification actually run in user's 133 container
   Python 3.10, Torch 2.8.0+cu129 from existing user Bazel external tree.
@@ -48,7 +51,7 @@ Not yet verified / not yet integrated
   No GPU, NCCL, full PPExecutor, golden smoke, CI or performance result.
   No claim of strict NewFST success: transport helpers are present but their
   main-carrier native FST backend path still needs dedicated execution.
-  BaseModel production route, BUILD/runfiles integration and all non-Qwen3
+  BaseModel production route, Bazel/runfiles validation and all non-Qwen3
   owners are still pending. The production gate was not opened.
   Quant backends beyond none are intentionally not imported in this initial
   dependency checkpoint; their owning agents will port their finalized files.
