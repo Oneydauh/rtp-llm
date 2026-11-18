@@ -11,6 +11,15 @@
 
 namespace rtp_llm {
 
+TEST(PpuKVPoolZeroTest, RejectsEmptyPoolAtThePublicBoundary) {
+    MemoryLayoutConfig cfg;
+    cfg.dtype                  = TYPE_FP16;
+    auto                 empty = torch::empty({0}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+    torch::Tensor        scale;
+    MemoryLayoutStrategy strategy;
+    EXPECT_THROW(strategy.init(cfg, empty, scale, empty.data_ptr()), RTPException);
+}
+
 TEST(PpuKVPoolZeroTest, ClearsOnlyTheWarmupViewOnTheCurrentStream) {
     const auto                       stream = c10::cuda::getStreamFromPool();
     const c10::cuda::CUDAStreamGuard guard(stream);
