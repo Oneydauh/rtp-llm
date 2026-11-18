@@ -171,6 +171,17 @@ py_test(
     deps = [":new_weight_loader", "//rtp_llm:models"],
 )
 
+py_test(
+    name = "serving_route_deepseek_test",
+    srcs = [
+        "serving_route_checkpoint_test.py",
+        "serving_route_deepseek_test.py",
+    ],
+    main = "serving_route_deepseek_test.py",
+    env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1"},
+    deps = [":new_weight_loader", "//rtp_llm:models"],
+)
+
 py_library(
     name = "utils",
     srcs = glob([

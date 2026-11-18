@@ -130,3 +130,12 @@ register_lazy_model(
     "rtp_llm.models_py.new_models.qwen2",
     "Qwen2ForCausalLM",
 )
+
+# Both use main's DeepSeekV2 config parser and GenericMoeModel MLA runtime.
+# GLM-4.7-Flash uses the compressed-Q branch; V2-Lite uses direct Q.
+for _model_type in ("deepseek2", "glm4_moe_lite"):
+    register_lazy_model(
+        _model_type,
+        "rtp_llm.models_py.new_models.deepseek_v3.language",
+        "DeepSeekV32ForCausalLM",
+    )
