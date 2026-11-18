@@ -155,8 +155,6 @@ def _extract_config_values(
         ("qk_rope_head_dim", attn_config.rope_head_dim, raw["qk_rope_head_dim"]),
         ("v_head_dim", attn_config.v_head_dim, raw["v_head_dim"]),
     ):
-        if name == "rms_norm_eps" and math.isclose(actual, expected, rel_tol=1e-7):
-            continue
         if actual != expected:
             topology_mismatches.append(
                 f"{name}=ModelConfig({actual!r})/config.json({expected!r})"
@@ -296,8 +294,8 @@ def _extract_config_values(
     if not math.isclose(
         float(model_config.routed_scaling_factor),
         routed_scaling_factor,
-        rel_tol=1e-7,
-        abs_tol=0.0,
+        rel_tol=0.0,
+        abs_tol=1e-12,
     ):
         routing_mismatches.append(
             "routed_scaling_factor=ModelConfig"
@@ -309,8 +307,6 @@ def _extract_config_values(
             "Kimi routing config mismatch: " + ", ".join(routing_mismatches)
         )
 
-    # Consume the actual C++ FP32 runtime scalar, after checking the HF value.
-    routed_scaling_factor = float(model_config.routed_scaling_factor)
     attn_tp_size, attn_tp_rank = _partition(
         load_config.attn_tp_size, load_config.attn_tp_rank, "attn_tp"
     )
