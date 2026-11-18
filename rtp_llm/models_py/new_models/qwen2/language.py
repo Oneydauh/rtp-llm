@@ -99,7 +99,10 @@ class Qwen2Attention(RtpModule):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
             bias=qkv_bias,
-            bias_as_matrix=qkv_bias_as_matrix,
+            # Splitting the concatenated Q/K/V biases leaves a [1, N] row
+            # on every attention TP rank. F.linear may select a different
+            # CUDA bias epilogue for [N]; the two can round differently.
+            bias_as_matrix=qkv_bias_as_matrix or tp_size > 1,
             params_dtype=params_dtype,
         )
         self.o_proj = RowParallelLinear(
@@ -412,12 +415,16 @@ class Qwen2ForCausalLM(Qwen3ForCausalLM):
             model_config, load_config, allow_context_parallel=True
         )
 
-    def _decoder_kwargs(self, parallelism_config):
+    @classmethod
+    def _decoder_kwargs(cls, parallelism_config):
         dp_size = getattr(parallelism_config, "dp_size", 1)
         if isinstance(dp_size, bool) or not isinstance(dp_size, int) or dp_size <= 0:
             raise ValueError(f"DP size must be a positive integer, got {dp_size!r}")
-        # Match the legacy DP assembly's [1, N] bias and its BF16 add path.
-        return dict(qkv_bias=self.QKV_BIAS, qkv_bias_as_matrix=dp_size > 1)
+        # DP/EP also run the split when attention weights are replicated.
+        ep_size = getattr(parallelism_config, "ep_size", 1)
+        return dict(
+            qkv_bias=cls.QKV_BIAS, qkv_bias_as_matrix=dp_size > 1 or ep_size > 1
+        )
 
     def load_ft_checkpoint(self, checkpoint):
         from rtp_llm.models_py.new_models.qwen2.ft_checkpoint import (

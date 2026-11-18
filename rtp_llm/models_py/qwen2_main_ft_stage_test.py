@@ -3,6 +3,7 @@
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -36,6 +37,49 @@ def produce_records(rank):
 
 
 class MainFTStageTest(unittest.TestCase):
+    def test_qkv_operator_bias_rank_follows_attention_partition(self):
+        from rtp_llm.models_py.new_models.qwen2.language import (
+            Qwen2Attention,
+            Qwen2ForCausalLM,
+        )
+
+        tensors = {}
+        for name, rows in (("q_proj", 4), ("k_proj", 2), ("v_proj", 2)):
+            tensors[f"{name}.weight"] = torch.eye(rows, 4)
+            tensors[f"{name}.bias"] = torch.arange(rows, dtype=torch.float32)
+        for tp, dp, ep in ((1, 1, 1), (2, 1, 1), (1, 2, 1), (1, 1, 2)):
+            kwargs = Qwen2ForCausalLM._decoder_kwargs(
+                SimpleNamespace(dp_size=dp, ep_size=ep)
+            )
+            for rank in range(tp):
+                with self.subTest(tp=tp, rank=rank, dp=dp, ep=ep):
+                    proj = Qwen2Attention(
+                        4,
+                        2,
+                        1,
+                        2,
+                        tp_size=tp,
+                        tp_rank=rank,
+                        params_dtype=torch.float32,
+                        **kwargs,
+                    ).qkv_proj
+                    proj.load_weights(tensors)
+                    x = torch.eye(4)
+                    with patch.object(
+                        torch.nn.functional, "linear", wraps=torch.nn.functional.linear
+                    ) as gemm:
+                        proj(x)
+                    bias = torch.cat(
+                        [
+                            tensors["q_proj.bias"].chunk(tp)[rank],
+                            tensors["k_proj.bias"],
+                            tensors["v_proj.bias"],
+                        ]
+                    )
+                    if max(tp, dp, ep) > 1:
+                        bias = bias.unsqueeze(0)
+                    torch.testing.assert_close(gemm.call_args.args[2], bias)
+
     def test_main_writer_to_qwen2_stage_owners(self):
         # Exercise main's actual serialization and indexing with deterministic
         # already-converted records, not a mock of FT or a full HF conversion.
@@ -124,6 +168,27 @@ class MainFTStageTest(unittest.TestCase):
                             torch.testing.assert_close(
                                 module.self_attn.qkv_proj.weight,
                                 record["self_attention_weights.query_weight.kernel"].T,
+                            )
+                            qkv_proj = module.self_attn.qkv_proj
+                            x = torch.full((3, 4), 0.5)
+                            reference_bias = record[
+                                "self_attention_weights.query_weight.bias"
+                            ]
+                            with patch.object(
+                                torch.nn.functional,
+                                "linear",
+                                wraps=torch.nn.functional.linear,
+                            ) as gemm:
+                                projection = qkv_proj(x)
+                            # Check the actual operator argument, not a flag:
+                            # the vector and matrix forms can agree on CPU.
+                            actual_bias = gemm.call_args.args[2]
+                            torch.testing.assert_close(actual_bias, reference_bias)
+                            torch.testing.assert_close(
+                                projection,
+                                torch.nn.functional.linear(
+                                    x, qkv_proj.weight, reference_bias
+                                ),
                             )
                         # A non-generating consumer of this exact generation
                         # archive needs the final norm, but not its LM projection.
