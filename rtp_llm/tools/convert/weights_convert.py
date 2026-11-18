@@ -33,6 +33,7 @@ from rtp_llm.tools.api.model_basic_info_analyzer import (
     parse_ft_model_type,
     parse_model_basic_info,
 )
+from rtp_llm.tools.convert.ft_export_job import create_ft_export_job
 from rtp_llm.tools.convert.weights_convert_utils import (
     apply_layer_override_and_post_build,
 )
@@ -275,7 +276,10 @@ class WeightConverter:
         moe_config = MoeConfig()
         vit_config = VitConfig()
 
-        model = self.model_cls.from_config(
+        # Construct only the config/tokenizer wrapper. from_config() loads the
+        # entire serving model, which the external FT writer neither consumes
+        # nor needs, and can require a GPU just to convert an artifact.
+        model = self.model_cls(
             model_config=model_config,
             parallelism_config=parallelism_config,
             hw_kernel_config=hw_kernel_config,
@@ -286,14 +290,13 @@ class WeightConverter:
             max_generate_batch_size=0,
             vit_config=vit_config,
             merge_lora=False,
-            skip_python_model=True,
         )
-        loader = model.create_model_loader()
+        writer = create_ft_export_job(model)
         device_str = f"cuda:{parallelism_config.local_rank}"
         max_retry_times = 3
         for i in range(max_retry_times):
             try:
-                loader.dump_weight_as_ft_style(device_str, output_dir_base)
+                writer.dump_weight_as_ft_style(device_str, output_dir_base)
                 logging.info(f"dump rank:[{world_rank}] done")
                 break
             except Exception as e:
@@ -304,7 +307,7 @@ class WeightConverter:
                     logging.error(
                         f"dump rank:[{world_rank}] retry {i} times, but still failed"
                     )
-                    raise RuntimeError(f"Failed after 10 retries: {str(e)}") from e
+                    raise RuntimeError(f"FT export failed after {max_retry_times} attempts") from e
                 continue
         logging.info(f"convert model rank:{world_rank} done")
 

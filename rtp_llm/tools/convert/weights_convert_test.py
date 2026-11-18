@@ -112,6 +112,7 @@ class WeightsConvertParallelismTest(unittest.TestCase):
                 ),
                 patch.object(weights_convert, "build_model_config"),
                 patch.object(weights_convert, "apply_layer_override_and_post_build"),
+                patch.object(weights_convert, "create_ft_export_job") as create_job,
             ):
                 self.assertEqual(converter.convert("/converted"), 0)
                 self.assertNotIn("WORLD_SIZE", os.environ)
@@ -119,7 +120,7 @@ class WeightsConvertParallelismTest(unittest.TestCase):
                 world_size = tp_size * dp_size
                 configs = [
                     call.kwargs["parallelism_config"]
-                    for call in converter.model_cls.from_config.call_args_list
+                    for call in converter.model_cls.call_args_list
                 ]
                 self.assertEqual(
                     [(c.world_size, c.tp_rank, c.dp_rank, c.ep_rank) for c in configs],
@@ -128,9 +129,14 @@ class WeightsConvertParallelismTest(unittest.TestCase):
                         for rank in range(world_size)
                     ],
                 )
-                model = converter.model_cls.from_config.return_value
-                loader = model.create_model_loader.return_value
-                self.assertEqual(loader.dump_weight_as_ft_style.call_count, world_size)
+                self.assertEqual(create_job.call_count, world_size)
+                for call in create_job.call_args_list:
+                    self.assertIs(call.args[0], converter.model_cls.return_value)
+                converter.model_cls.from_config.assert_not_called()
+                converter.model_cls.return_value.load.assert_not_called()
+                self.assertEqual(
+                    create_job.return_value.dump_weight_as_ft_style.call_count, world_size
+                )
                 save_converted.assert_called_once_with("/model", "/converted")
 
 
