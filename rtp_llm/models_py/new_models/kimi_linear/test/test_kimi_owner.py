@@ -3,12 +3,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from safetensors.torch import save_file
 
 from rtp_llm.models.kimi_linear.kimi_linear import KimiLinear
-from rtp_llm.models_py.model_loader import NewLoaderConfig, NewLoaderLoadMethod, NewModelLoader
+from rtp_llm.models.direct_checkpoint import load_owned_model
+from rtp_llm.models_py.model_loader import NewLoaderLoadMethod
 from rtp_llm.models_py.model_desc.kimi_linear import KimiLinearModel
 from rtp_llm.models_py.new_models.kimi_linear.language import KimiLinearForCausalLM
 from rtp_llm.ops import DataType, ParallelismConfig
@@ -106,11 +108,6 @@ def _checkpoint_weights():
     return weights
 
 
-class KimiOwnerLoader(NewModelLoader):
-    def _create_model(self):
-        return KimiLinearForCausalLM(self.model_config, self.load_config)
-
-
 class KimiModelCheckpointTest(unittest.TestCase):
     def test_entire_typed_model(self):
         with tempfile.TemporaryDirectory() as root:
@@ -123,17 +120,22 @@ class KimiModelCheckpointTest(unittest.TestCase):
             config.model_type = "kimi_linear"
             config.max_seq_len = 128
             config.enable_fp32_lm_head = False
+            config.data_type, config.lora_infos = "fp32", {}
             config.linear_attention_config.ssm_state_dtype = DataType.TYPE_FP32
             config.linear_attention_config.conv_state_dtype = DataType.TYPE_FP32
             for method in (NewLoaderLoadMethod.SCRATCH, NewLoaderLoadMethod.FASTSAFETENSORS):
                 with self.subTest(method=method):
-                    loader = KimiOwnerLoader(config, NewLoaderConfig(
-                        compute_dtype=torch.float32, device="cpu", load_method=method,
-                        parallelism_config=ParallelismConfig(),
-                    ), model_path=root)
-                    model = loader.load()
+                    service = SimpleNamespace(
+                        model_config=config, _weight_alias_names=(), _weight_alias_owner=None,
+                        _get_device_str=lambda: "cpu", parallelism_config=ParallelismConfig(),
+                        hw_kernel_config=None, moe_config=None, fmha_config=None,
+                        max_generate_batch_size=1, load_method=method, custom_module=None,
+                    )
+                    load_owned_model(service)
+                    model = service.py_model
+                    self.assertIsInstance(model, KimiLinearForCausalLM)
                     self.assertIsInstance(model, KimiLinearModel)
-                    self.assertEqual(loader.loaded_method, method)
+                    self.assertEqual(service.model_weights_loader.loaded_method, method)
                     kda, mla = model.layers
                     self.assertTrue(kda.is_linear)
                     self.assertFalse(mla.is_linear)

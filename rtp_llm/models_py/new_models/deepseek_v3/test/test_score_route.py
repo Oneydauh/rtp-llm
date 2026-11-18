@@ -112,6 +112,10 @@ class ScoreRouteTest(unittest.TestCase):
                 save_file(data, str(Path(root) / "model.safetensors"))
                 config = DeepSeekV2._create_config(root)
                 config.model_type, config.ckpt_path, config.max_seq_len = tag, root, 128
+                # Main fills attention page geometry after parsing HF config.
+                config.attn_config.tokens_per_block = 64
+                config.attn_config.kernel_tokens_per_block = 64
+                DeepSeekV2._post_build_model_config(config)
                 config.data_type, config.enable_fp32_lm_head, config.lora_infos = "bf16", False, {}
                 for method in ("scratch", "fastsafetensors"):
                     with self.subTest(model=tag, method=method):
@@ -135,6 +139,13 @@ class ScoreRouteTest(unittest.TestCase):
                             torch.testing.assert_close(
                                 idx.weights_proj.weight, data["model.layers.1.self_attn.indexer.weights_proj.weight"],
                             )
+                            model.to(dtype=torch.bfloat16)
+                            x = torch.ones(1, 32, dtype=torch.bfloat16)
+                            scales = torch.ones(1, 2, 1)
+                            expected = torch.nn.functional.linear(
+                                x.float(), data["model.layers.1.self_attn.indexer.weights_proj.weight"]
+                            ).unsqueeze(-1) * (idx.softmax_scale * idx.weights_scale)
+                            torch.testing.assert_close(idx._get_logits_head_gate(x, scales), expected)
                         else:
                             self.assertIsNone(model.layers[1].indexer)
 

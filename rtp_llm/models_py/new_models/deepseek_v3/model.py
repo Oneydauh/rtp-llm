@@ -15,9 +15,7 @@ Orchestrates:
 from typing import Any, Optional
 
 import torch
-import torch.nn as nn
 
-from rtp_llm.models_py.layers.linear import ColumnParallelLinear
 from rtp_llm.models_py.layers.norm import RMSResNorm
 from rtp_llm.models_py.model_desc.generic_moe import DecodeLayerOutput
 from rtp_llm.models_py.module_base import RtpModule
@@ -28,11 +26,12 @@ from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 from rtp_llm.ops.compute_ops import LayerKVCache
 
 from .attention import DeepSeekV32MlaAttention
+from .indexer_parameters import SparseIndexerParameters
 from .mlp import DeepSeekV32MLP
 from .moe import DeepSeekV32MoEBlock
 
 
-class DeepSeekV32Indexer(Indexer, RtpModule):
+class DeepSeekV32Indexer(Indexer, SparseIndexerParameters):
     """Sparse Indexer for DeepSeek V3.2 DSA, new-loader style.
 
     Inherit the production Indexer forward and own the projections as
@@ -66,7 +65,10 @@ class DeepSeekV32Indexer(Indexer, RtpModule):
     ):
         # The main Indexer forward uses these direct projection parameters;
         # only its old checkpoint-driven constructor is replaced.
-        RtpModule.__init__(self)
+        SparseIndexerParameters.__init__(
+            self, index_n_heads, index_head_dim, hidden_size, q_lora_rank,
+            layernorm_eps, quant_config, params_dtype, prefix,
+        )
         self.layer_idx = layer_idx
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
@@ -80,52 +82,6 @@ class DeepSeekV32Indexer(Indexer, RtpModule):
         self.blocksize = blocksize
         self.is_neox_style = is_neox_style
         self.parallelism_config = parallelism_config
-
-        # wq_b: q_lora_rank → index_n_heads * index_head_dim
-        self.wq_b = ColumnParallelLinear(
-            input_size=q_lora_rank,
-            output_size=index_n_heads * index_head_dim,
-            tp_size=1,
-            tp_rank=0,
-            quant_config=quant_config,
-            prefix=f"{prefix}.wq_b",
-            bias=False,
-            params_dtype=params_dtype,
-        )
-        # wk: hidden_size → index_head_dim. The HF Indexer is MQA-style for
-        # the key path: a single shared k vector of size `index_head_dim`,
-        # not n_heads independent keys. ckpt shape is [head_dim, hidden].
-        self.wk = ColumnParallelLinear(
-            input_size=hidden_size,
-            output_size=index_head_dim,
-            tp_size=1,
-            tp_rank=0,
-            quant_config=quant_config,
-            prefix=f"{prefix}.wk",
-            bias=False,
-            params_dtype=params_dtype,
-        )
-        # HF Indexer applies k_norm per-head over `index_head_dim`, not over
-        # the full `index_n_heads * index_head_dim` flat feature. The ckpt
-        # bias/weight tensors are sized `index_head_dim`.
-        self.k_norm = nn.LayerNorm(
-            index_head_dim,
-            eps=layernorm_eps,
-            elementwise_affine=True,
-            bias=True,
-            dtype=params_dtype,
-        )
-        # weights_proj: hidden_size → index_n_heads
-        self.weights_proj = ColumnParallelLinear(
-            input_size=hidden_size,
-            output_size=index_n_heads,
-            tp_size=1,
-            tp_rank=0,
-            quant_config=None,
-            prefix=f"{prefix}.weights_proj",
-            bias=False,
-            params_dtype=torch.float32,
-        )
 
         self.indexer_op = IndexerOp(
             index_n_heads=index_n_heads,
