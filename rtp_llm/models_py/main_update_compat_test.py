@@ -122,6 +122,12 @@ class MainUpdateCompatTest(unittest.TestCase):
                 pointers, {n: t.data_ptr() for n, t in model.named_parameters()}
             )
             self.assertEqual(manager.version, 3)
+            # Existing clients may address an exported global directly. Resolve
+            # it back to the same parameter without legacy descriptors.
+            self.send(manager, "embedding", qkv + 1)
+            torch.testing.assert_close(
+                model.embed_tokens.weight, (qkv + 1)[rank * 4 : rank * 4 + 4]
+            )
 
     def test_foreign_pp_noop_malformed_fails_no_partial_write(self):
         model, loader = self.load()

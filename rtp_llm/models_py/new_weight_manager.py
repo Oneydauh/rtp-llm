@@ -140,6 +140,21 @@ class NewLoaderWeightManager:
                 if not self._local_request(canonical):
                     continue
                 mapped = self._loader._mapped_checkpoint_name(self._model, canonical)
+                if canonical in self._runtime_contract:
+                    # Old RPC clients may pass a published global view name.
+                    # Resolve it by the tensor already exported by this model;
+                    # do not introduce a parallel name→parameter registry.
+                    _, signature = self._runtime_contract[canonical]
+                    paths = [
+                        p
+                        for p, (_, v) in self._parameter_contract.items()
+                        if v == signature
+                    ]
+                    if len(paths) != 1:
+                        raise ValueError(
+                            f"Published global {canonical!r} has no unique parameter owner"
+                        )
+                    mapped = paths[0]
                 if mapped == "lm_head.weight" and tied_output:
                     raise ValueError(
                         "Tied LM head is a non-owning alias; update model.embed_tokens.weight"
