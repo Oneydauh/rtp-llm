@@ -46,6 +46,8 @@ def _copy_checked(target: torch.Tensor, source: torch.Tensor, label: str) -> Non
 
 
 class LinearBase(RtpModule):
+    # The module owns both checkpoint sharding and its executor representation.
+    supports_independent_weight_updates = True
 
     def __init__(
         self,

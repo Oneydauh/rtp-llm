@@ -6,9 +6,9 @@ Incoming names and tensors use global HF checkpoint layout; leaf loaders own
 TP slicing and fusion. Each RPC validates/stages before changing live tensors.
 """
 
-from contextlib import nullcontext
 import re
 import threading
+from contextlib import nullcontext
 from dataclasses import replace
 
 import torch
@@ -110,7 +110,11 @@ class NewLoaderWeightManager:
     def update_tensors(self, weights: dict[str, torch.Tensor]) -> None:
         if not isinstance(weights, dict) or not weights:
             raise ValueError("Online updates require a non-empty tensor mapping")
-        guard = self._adapters.base_update_guard() if self._adapters is not None else nullcontext()
+        guard = (
+            self._adapters.base_update_guard()
+            if self._adapters is not None
+            else nullcontext()
+        )
         with self._lock, guard:
             self._validate_contract()
             devices = {
@@ -166,11 +170,30 @@ class NewLoaderWeightManager:
                     raise NotImplementedError(
                         f"No online checkpoint update contract for {name!r}"
                     )
+                # The serving RPC never silently casts an ordinary parameter.
+                # A fused shard (q_proj.weight, etc.) still targets the same
+                # parameter dtype. Quantization units own their source dtypes.
+                param = target.module._parameters.get(target.name.rsplit(".", 1)[-1])
+                quant = getattr(
+                    getattr(target.module, "quant_config", None), "quant_type", "none"
+                )
+                if (
+                    param is not None
+                    and quant == "none"
+                    and tensor.dtype != param.dtype
+                ):
+                    raise TypeError(
+                        f"Update for {name!r} requires {param.dtype}, got {tensor.dtype}"
+                    )
                 group = groups.setdefault(target.module, {})
                 if target.name in group:
                     raise ValueError(f"Duplicate mapped checkpoint tensor {mapped!r}")
                 group[target.name] = tensor.detach().to(device="cpu", copy=True)
-                if mapped == "embed_tokens.weight" and tied_output and output_head is not None:
+                if (
+                    mapped == "embed_tokens.weight"
+                    and tied_output
+                    and output_head is not None
+                ):
                     groups.setdefault(self._model.lm_head, {})["weight"] = group[
                         target.name
                     ]
@@ -190,7 +213,7 @@ class NewLoaderWeightManager:
                 ):
                     raise NotImplementedError(
                         f"{module_name} has no independent online update contract; "
-                        "only ordinary embedding, normalization and head owners are enabled"
+                        "only parameter owners with an explicit conversion contract are enabled"
                     )
                 borrowed = getattr(module, "_rtp_borrowed_parameter_names", frozenset())
                 if borrowed:
@@ -213,8 +236,14 @@ class NewLoaderWeightManager:
             updates = []
             for module, incoming in groups.items():
                 module_name = module_names[module]
-                if module is output_head and tied_output and set(incoming) == {"weight"}:
-                    source = module._prepare_checkpoint_weight(incoming["weight"], None, tied=True)
+                if (
+                    module is output_head
+                    and tied_output
+                    and set(incoming) == {"weight"}
+                ):
+                    source = module._prepare_checkpoint_weight(
+                        incoming["weight"], None, tied=True
+                    )
                     leaf_updates = [TensorUpdate("weight", module.weight, source)]
                 else:
                     leaf_updates = module.prepare_weight_updates(incoming)
@@ -224,8 +253,12 @@ class NewLoaderWeightManager:
                     )
                 for update in leaf_updates:
                     target_tensor = module._parameters[update.name]
-                    if getattr(target_tensor, "_rtp_requires_restart_for_update", False):
-                        raise PermissionError(f"Parameter {module_name}.{update.name} requires restart to update")
+                    if getattr(
+                        target_tensor, "_rtp_requires_restart_for_update", False
+                    ):
+                        raise PermissionError(
+                            f"Parameter {module_name}.{update.name} requires restart to update"
+                        )
                     source = update.source
                     if module is output_head and update.name == "weight":
                         if getattr(self._model, "normalize_lm_head_weight", False):
@@ -255,7 +288,12 @@ class NewLoaderWeightManager:
         owns = select() if callable(select) else None
         # Use stage filtering only for known layer/global ownership, not to
         # silently accept arbitrary unknown names rejected by a model's filter.
-        if layer or name in ("model.embed_tokens.weight", "model.norm.weight", "model.norm.bias", "lm_head.weight"):
+        if layer or name in (
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "model.norm.bias",
+            "lm_head.weight",
+        ):
             return owns is None or owns(name)
         return True
 
@@ -284,9 +322,14 @@ class NewLoaderWeightManager:
         # The existing RPC's full fused/linear matrices are in GEMM [in,out]
         # order (including square O projections); shape heuristics silently
         # transpose the wrong values. Local update_tensors uses HF [out,in].
-        if tensor.ndim == 2 and name.endswith((
-            ".self_attn.qkv_proj.weight", ".self_attn.o_proj.weight",
-            ".mlp.gate_proj.weight", ".mlp.up_proj.weight", ".mlp.down_proj.weight",
-        )):
+        if tensor.ndim == 2 and name.endswith(
+            (
+                ".self_attn.qkv_proj.weight",
+                ".self_attn.o_proj.weight",
+                ".mlp.gate_proj.weight",
+                ".mlp.up_proj.weight",
+                ".mlp.down_proj.weight",
+            )
+        ):
             tensor = tensor.t()
         self.update_tensors({name: tensor})

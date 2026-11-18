@@ -1378,12 +1378,14 @@ void LocalRpcServer::reportCacheStatusTime(int64_t request_begin_time_us) {
 
 grpc::Status LocalRpcServer::SetPause(grpc::ServerContext* context, const EmptyPB* request, EmptyPB* response) {
     RTP_LLM_LOG_DEBUG("receive cacheStatus rpc request from client: %s", context->peer().c_str());
+    std::lock_guard<std::mutex> lock(update_lifecycle_mutex_);
     engine_->pause();
     return grpc::Status::OK;
 }
 
 grpc::Status LocalRpcServer::SetRestart(grpc::ServerContext* context, const EmptyPB* request, EmptyPB* response) {
     RTP_LLM_LOG_DEBUG("receive cacheStatus rpc request from client: %s,", context->peer().c_str());
+    std::lock_guard<std::mutex> lock(update_lifecycle_mutex_);
     engine_->restart();
     return grpc::Status::OK;
 }
@@ -1391,6 +1393,7 @@ grpc::Status LocalRpcServer::SetRestart(grpc::ServerContext* context, const Empt
 grpc::Status
 LocalRpcServer::UpdateWeights(grpc::ServerContext* context, const UpdateWeightsRequestPB* request, EmptyPB* response) {
     RTP_LLM_LOG_DEBUG("Receive update weights request from: %s", context->peer().c_str());
+    std::lock_guard<std::mutex> lock(update_lifecycle_mutex_);
     // Keep the GIL for the complete Python exception lifetime, including the
     // destruction of py::error_already_set after its catch handler returns.
     py::gil_scoped_acquire acquire;
