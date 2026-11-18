@@ -248,6 +248,8 @@ class ModelFactory:
                     alias_names,
                     aliased_local_bytes / (1024**3),
                 )
+            if propose_model_config.model_type == "qwen_3_moe_eagle3":
+                ModelFactory._bind_eagle3_target(target_model, gpt_model)
             logging.info(f"create propose model {engine_config.sp_config.type}")
             return ProposeModel(sp_type, gen_num_per_circle, gpt_model)
         elif sp_type == SpeculativeType.DETERMINISTIC:
@@ -470,18 +472,22 @@ class ModelFactory:
         if not sp_config.checkpoint_path:
             return None
 
-        # Current learned-draft SP engine supports MTP, EAGLE and DSpARK.
+        if (sp_config.type == SpeculativeType.EAGLE3) != (
+            sp_config.model_type == "qwen_3_moe_eagle3"
+        ):
+            raise ValueError("qwen_3_moe_eagle3 requires sp_type=eagle3")
         if sp_config.type not in [
             SpeculativeType.MTP,
             SpeculativeType.EAGLE,
+            SpeculativeType.EAGLE3,
             SpeculativeType.DSPARK,
         ]:
             logging.error(
-                "Speculative engine only supports MTP, EAGLE and DSpARK, but got %s",
+                "Speculative engine only supports MTP, EAGLE, EAGLE3 and DSpARK, but got %s",
                 sp_config.type.name,
             )
             raise ValueError(
-                "Speculative engine only supports MTP, EAGLE and DSpARK, but got %s"
+                "Speculative engine only supports MTP, EAGLE, EAGLE3 and DSpARK, but got %s"
                 % sp_config.type.name
             )
 
@@ -527,8 +533,46 @@ class ModelFactory:
             ModelFactory._setup_dspark_configs(
                 sp_config, model_config, propose_model_config
             )
+        if sp_config.type == SpeculativeType.EAGLE3:
+            ModelFactory._setup_eagle3_configs(
+                model_config, propose_model_config, engine_config.parallelism_config
+            )
 
         return propose_model_config
+
+    @staticmethod
+    def _bind_eagle3_target(target, draft):
+        import weakref
+
+        if target is None or tuple(target.py_model._mtp_aux_capture_layer_ids) != tuple(
+            sorted(draft.py_model.capture_ids)
+        ):
+            raise ValueError(
+                "EAGLE3 requires an initialized target with matching capture layers"
+            )
+        # The draft already holds the target for its vocabulary loans. Do not
+        # register the draft block in the target or introduce a strong cycle.
+        target.py_model._eagle3_capture_projection = weakref.WeakMethod(
+            draft.py_model.project_target_hidden
+        )
+
+    @staticmethod
+    def _setup_eagle3_configs(target, draft, parallel):
+        ids = tuple(draft.capture_aux_hidden_layer_ids)
+        if target.model_type != "qwen_3_moe":
+            raise ValueError("qwen_3_moe_eagle3 requires a Qwen3 MoE target")
+        if (target.hidden_size, target.vocab_size) != (
+            draft.hidden_size,
+            draft.vocab_size,
+        ):
+            raise ValueError("EAGLE3 target and draft hidden/vocabulary sizes differ")
+        if getattr(parallel, "pp_size", 1) != 1:
+            raise ValueError(
+                "EAGLE3 target vocabulary loans require co-located input/output stages"
+            )
+        if len(ids) != 3 or min(ids) < 0 or max(ids) >= target.num_layers:
+            raise ValueError("EAGLE3 capture layer outside target decoder")
+        target.capture_aux_hidden_layer_ids = sorted(ids)
 
     @staticmethod
     def _setup_dspark_configs(

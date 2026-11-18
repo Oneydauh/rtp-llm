@@ -38,7 +38,11 @@ class HandlerCheckpoint(RtpModule):
             self.WEIGHTS_MAPPER,
             2,
             load_config.compute_dtype,
+            projection_sources=getattr(config, "projection_sources", ()),
         )
+
+    def runtime_weight_view(self):
+        return self.heads.exports()
 
     def load_weights(self, weights):
         for name, tensor in self.WEIGHTS_MAPPER.apply(weights):
@@ -108,6 +112,80 @@ def service(path, method, model_type="_service_direct_leaf"):
 
 
 class DirectServingBoundaryTest(unittest.TestCase):
+    def test_extension_projection_retains_independent_dtype_and_pair(self):
+        from rtp_llm.model_loader.weight_module import CustomAtomicWeight
+        from rtp_llm.models.downstream_modules.custom_module import (
+            CustomHandler,
+            CustomModule,
+        )
+        from rtp_llm.utils.model_weight import CkptWeightInfo
+
+        class Projection(CustomHandler):
+            def custom_weight_info(self):
+                return [
+                    CustomAtomicWeight(
+                        "__custom__." + key, [CkptWeightInfo(key)], data_type=dtype
+                    )
+                    for key, dtype in (
+                        ("score.weight", torch.bfloat16),
+                        ("score.bias", torch.float32),
+                    )
+                ]
+
+            def init(self, params):
+                self.weights = params
+
+        weight = torch.tensor([[1.0, 2.0], [-3.0, 4.0]])
+        # Explicit fp32 bias must not be rounded through the bf16 model dtype.
+        bias = torch.tensor([1.001, 2.003])
+        for method in ("scratch", "fastsafetensors"):
+            with self.subTest(method=method), tempfile.TemporaryDirectory() as root:
+                path = os.path.join(root, "model.safetensors")
+
+                def new_service():
+                    value = service(root, method, "_service_direct_handler")
+                    value.model_config.compute_dtype = torch.bfloat16
+                    value.model_config.projection_sources = (
+                        "score.weight",
+                        "score.bias",
+                    )
+                    value.custom_module = CustomModule(value.model_config, None)
+                    value.custom_module.handler = Projection(value.model_config)
+                    return value
+
+                save_file({"score.weight": weight, "score.bias": bias}, path)
+                value = new_service()
+                load_owned_model(value)
+                params = value.custom_module.handler.weights
+                self.assertEqual(value.model_weights_loader.loaded_method.value, method)
+                torch.testing.assert_close(params["score.weight"], weight.bfloat16())
+                torch.testing.assert_close(params["score.bias"], bias, rtol=0, atol=0)
+                self.assertIs(
+                    params["score.bias"],
+                    value.weight.get_global_weight("__custom__.score.bias"),
+                )
+                for source, message in (
+                    ({"score.weight": weight}, "Missing downstream"),
+                    (
+                        {"score.weight": weight, "score.bias": torch.ones(3)},
+                        "label counts",
+                    ),
+                ):
+                    save_file(source, path)
+                    failed = new_service()
+                    with self.assertRaisesRegex((ValueError, RuntimeError), message):
+                        load_owned_model(failed)
+                    self.assertIsNone(failed.weight)
+                    self.assertIsNone(failed.py_model)
+
+                invalid = new_service()
+                records = invalid.custom_module.handler.custom_weight_info()
+                records[0].process_fun = lambda inputs: inputs[0].T
+                invalid.custom_module.handler.custom_weight_info = lambda: records
+                with self.assertRaisesRegex(ValueError, "Unsupported custom"):
+                    load_owned_model(invalid)
+                self.assertIsNone(invalid.py_model)
+
     def test_offline_conversion_keeps_owner_without_publishing_runtime(self):
         for method in ("scratch", "fastsafetensors"):
             with self.subTest(method=method), tempfile.TemporaryDirectory() as root:

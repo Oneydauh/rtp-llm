@@ -131,6 +131,7 @@ test_suite(
         ":smoke_pp_ci",
         ":smoke_h20_kimi_linear",
         ":smoke_h20_grammar_heavy",
+        ":qwen3_235b_full_vocab_eagle3",
         ":smoke_cuda_remote_cache",
         ":smoke_h20_jit_remote_cache",
         ":smoke_rocm_basic",
@@ -150,6 +151,14 @@ test_suite(
         ":smoke_ppu_qwen35_basic",
         ":smoke_ppu_qwen35_func",
     ],
+)
+
+custom_smoke_test(
+    name = "qwen3_235b_full_vocab_eagle3",
+    main = "qwen3_moe_eagle3_contract_test.py",
+    smoke_args = "--tp_size 8 --ep_size 8 --world_size 8 --act_type BF16 --load_method fastsafetensors --max_seq_len 2048 --seq_size_per_block 128 --enable_cuda_graph 0 --reuse_cache 0",
+    gpu_type = ["H20"],
+    data = ["//rtp_llm:sdk", ":smoke_framework_srcs"],
 )
 
 # Supply QWEN4_EXP_CHECKPOINT for an expert-only ModelOpt NVFP4 checkpoint.

@@ -389,6 +389,11 @@ void ExpertBalancer::finishPlan(bool committed) {
         if (load_flags_.sync(eplb_group_size_, parallel_mode_) != LoadFlags::SyncStatus::READY) {
             throw std::runtime_error("EPLB finalization diverged; cannot resume inference");
         }
+        if (test_mode_ && is_eplb_group_root_) {
+            // Emitted only after every stage member acknowledged the generation.
+            RTP_LLM_LOG_INFO("[NewLoader EPLB] stage_finalize committed=%d layer=%d ranks=%zu",
+                             static_cast<int>(committed), layer, static_cast<size_t>(eplb_group_size_));
+        }
         executor_collector_.update_weights_qps = committed;
         executor_collector_.update_layer_id    = layer;
     }

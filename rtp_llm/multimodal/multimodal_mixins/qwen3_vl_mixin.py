@@ -9,7 +9,7 @@ from PIL import Image
 from transformers import (
     AutoProcessor,
     Qwen2VLImageProcessor,
-    Qwen3VLConfig,
+    AutoConfig,
     Qwen3VLVisionModel,
 )
 
@@ -59,7 +59,9 @@ class Qwen3_VLImageEmbedding(Qwen2_5_VLImageEmbedding):
         self.mm_processor.image_processor = Qwen2VLImageProcessor.from_pretrained(
             mm_related_params.config["ckpt_path"]
         )
-        config_hf = Qwen3VLConfig.from_pretrained(mm_related_params.config["ckpt_path"])
+        # The dense composite config silently substitutes default tower dimensions
+        # for a Qwen3-VL-MoE checkpoint. Resolve both registered config types.
+        config_hf = AutoConfig.from_pretrained(mm_related_params.config["ckpt_path"])
         config_hf.vision_config._attn_implementation = default_attn_impl
         self.visual = Qwen3VLVisionModel._from_config(config_hf.vision_config)
         self.spatial_merge_size = self.visual.spatial_merge_size

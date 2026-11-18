@@ -225,6 +225,12 @@ py_test(
 )
 
 py_test(
+    name = "deepseek_v41_newloader_test",
+    srcs = ["deepseek_v41_newloader_test.py"],
+    deps = ["//rtp_llm:testlib", "//rtp_llm/models_py:new_loader_core"],
+)
+
+py_test(
     name = "deepseek_vision_test",
     srcs = ["deepseek_vision_test.py"],
     deps = ["//rtp_llm:testlib"],

@@ -399,6 +399,8 @@ class QuantizationConfig:
                 from rtp_llm.models_py.quant_methods import fp4  # noqa: F401
             elif self.quant_type == "W8A8_INT8_PER_CHANNEL_COMPRESSED":
                 from rtp_llm.models_py.quant_methods import w8a8_int8  # noqa: F401
+            elif self.quant_type in ("awq", "gptq"):
+                from rtp_llm.models_py.quant_methods import groupwise  # noqa: F401
 
         method_cls = _LINEAR_METHOD_REGISTRY.get(self.quant_type)
         if method_cls is None:
@@ -449,6 +451,8 @@ class QuantizationConfig:
                 from rtp_llm.models_py.quant_methods import w8a8_int8_moe  # noqa: F401
             elif self.quant_type in ("mxfp4_quark", "QuarkMXFP4"):
                 from rtp_llm.models_py.quant_methods import mxfp4_moe  # noqa: F401
+            elif self.quant_type in ("awq", "gptq"):
+                from rtp_llm.models_py.quant_methods import groupwise_moe  # noqa: F401
 
         method_cls = _MOE_METHOD_REGISTRY.get(self.quant_type)
         if method_cls is None:

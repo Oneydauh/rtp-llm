@@ -5,7 +5,7 @@ import platform
 import re
 import time
 from itertools import chain
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 
 import rtp_llm.models_py.weight_mapper as weight_mapper
+from rtp_llm.models_py.downstream_heads import unpack_handler_mapping
 from rtp_llm.models_py.borrowed_parameters import (
     FixedHostCheckpointStorage,
     bind_borrowed_parameters,
@@ -110,6 +111,7 @@ class _ExpertRangeFilter:
         self._parallelism_config = parallelism_config
         self._placement_overrides = dict(placement_overrides or {})
         self._placement_cache: Dict[int, ExpertPlacement] = {}
+        self.checkpoint_to_runtime_layer = None
 
     @staticmethod
     def _layer_index(name: str) -> int:
@@ -120,6 +122,8 @@ class _ExpertRangeFilter:
         if self._model_config is None:
             return None
         layer_index = self._layer_index(name)
+        if self.checkpoint_to_runtime_layer is not None:
+            layer_index = self.checkpoint_to_runtime_layer(layer_index)
         override = self._placement_overrides.get(layer_index)
         if override is not None:
             return override
@@ -363,7 +367,7 @@ class NewLoaderConfig:
     lm_head_tp_size: Optional[int] = None
     lm_head_tp_rank: Optional[int] = None
     keep_mla_checkpoint_weights: bool = False
-    custom_weight_mappings: Tuple[Tuple[str, str], ...] = ()
+    custom_weight_mappings: Tuple[Tuple[str, str] | Tuple[str, str, torch.dtype], ...] = ()
     # Experimental consumer bypass retains source file staging until batch
     # close and adds CPU range I/O. Do not enable by default without proving
     # the installed FST's early-release semantics and GPU peak behavior.
@@ -371,6 +375,8 @@ class NewLoaderConfig:
     # Stage checkpoint input and conversions on CPU, independently of the
     # eventual runtime device. GPU-only leaf postprocessing runs after migration.
     force_cpu_load_weights: bool = False
+    # Opaque owner-validated coupled tensor references (e.g. scaled vocabulary).
+    prepared_runtime_loan: Any = field(default=None, repr=False, compare=False)
 
     @classmethod
     def from_runtime(cls, parallelism_config, **options) -> "NewLoaderConfig":
@@ -507,12 +513,7 @@ class NewLoaderConfig:
         runtime_names = set()
         checkpoint_names = set()
         for mapping in self.custom_weight_mappings:
-            if not isinstance(mapping, tuple) or len(mapping) != 2:
-                raise TypeError(
-                    "custom_weight_mappings entries must be "
-                    "(runtime_name, checkpoint_name) tuples"
-                )
-            runtime_name, checkpoint_name = mapping
+            runtime_name, checkpoint_name, _ = unpack_handler_mapping(mapping)
             if not isinstance(runtime_name, str) or not runtime_name:
                 raise TypeError("custom runtime weight names must be non-empty strings")
             if not runtime_name.startswith(_CUSTOM_WEIGHT_PREFIX):
@@ -708,6 +709,7 @@ class NewModelLoader:
             self.load_config.parallelism_config,
             placement_overrides={layer_id: placement},
         )
+        expert_filter.checkpoint_to_runtime_layer = getattr(model, "checkpoint_to_runtime_expert_layer", None)
         checkpoint_files = self._checkpoint_files()
         overlay = self._finetune_overlay()
         overlay_has_layer = overlay is not None and any(
@@ -1050,6 +1052,11 @@ class NewModelLoader:
             raise ValueError(
                 f"Model type {model_type!r} is not registered; available={list_models()}"
             ) from exc
+        # A shared config name can have genuinely different native runtimes.
+        # Resolve per model instance; do not cache this platform/role choice.
+        resolve_runtime = getattr(model_cls, "resolve_runtime_class", None)
+        if resolve_runtime is not None:
+            model_cls = resolve_runtime(self.model_config)
         model = model_cls(self.model_config, ft_load_config or self.load_config)
         if not isinstance(model, RtpModule):
             raise TypeError(
@@ -2144,6 +2151,20 @@ class NewModelLoader:
                 module.validate_runtime_device(target_device)
 
     @staticmethod
+    def _notify_checkpoint_source(
+        model: nn.Module, method: NewLoaderLoadMethod
+    ) -> None:
+        """Publish the resolved reader for auxiliary model-owned checkpoint I/O.
+
+        This is a selection notification, not proof of a successful model load.
+        Host-owned leaves (for example V4.1 Engram) must use the actual reader,
+        not infer it from the requested AUTO policy or fall back independently.
+        """
+        notify = getattr(model, "set_checkpoint_source", None)
+        if notify is not None:
+            notify(method.value)
+
+    @staticmethod
     def _migrate_staged_modules(model: nn.Module, device: str) -> None:
         """Move and compress online-quantized leaves one at a time.
 
@@ -2197,6 +2218,8 @@ class NewModelLoader:
         )
         with torch.device("cpu"):
             model = self._create_checkpoint_model(ft_checkpoint)
+        if expert_filter is not None:
+            expert_filter.checkpoint_to_runtime_layer = getattr(model, "checkpoint_to_runtime_expert_layer", None)
         bind_borrowed_parameters(model, self.parameter_aliases, self.load_config.device)
         if ft_checkpoint is not None:
             # Format adapters own their import and return before the HF/FST
@@ -2238,6 +2261,14 @@ class NewModelLoader:
                     "Custom HF weight mappings cannot be applied to FT runtime tensors"
                 )
             self._validate_runtime_backends(model, self.load_config.device)
+            self._notify_checkpoint_source(
+                model,
+                (
+                    NewLoaderLoadMethod.FASTSAFETENSORS
+                    if ft_checkpoint.read_backend == "fastsafetensors"
+                    else NewLoaderLoadMethod.SCRATCH
+                ),
+            )
             importer(ft_checkpoint)
             self._validate_loaded_weights(model)
             model.to(self.load_config.device)
@@ -2304,6 +2335,7 @@ class NewModelLoader:
             selected_files,
             expert_filter,
         )
+        self._notify_checkpoint_source(model, method)
         logger.info(
             "NewLoader load method: requested=%s, selected=%s",
             requested_method.value,

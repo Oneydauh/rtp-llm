@@ -471,6 +471,35 @@ class DeepSeekV4Model(GptModelBase):
         idx_w = 2 * 2 * index_head_dim
         return (main_w, idx_w)
 
+    def _runtime_weight_counts(self):
+        return len(self.weight.weights), len(self.weight.global_weights)
+
+    def _runtime_weight_device(self):
+        return (
+            next(iter(self.weight.global_weights.values())).device
+            if self.weight.global_weights
+            else "cuda:0"
+        )
+
+    def _create_runtime_transformer(self):
+        prev_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.bfloat16)
+        try:
+            with torch.device("meta"):
+                self.v4 = V4Transformer(self._v4_args, mw=self.weight)
+                if self.v4.embed is not None:
+                    from rtp_llm.models_py.modules.dsv41.utils import V41Embedding
+
+                    self.v4.embed = V41Embedding(
+                        self.config, self.parallelism_config, self.v4.embed.weight
+                    )
+        finally:
+            torch.set_default_dtype(prev_dtype)
+
+    def _release_runtime_weight_source(self):
+        self._load_scoped_extra_weights(self.weight)
+        del self.weight
+
     def _initialize_commit_only(
         self, init_resource: PyModelInitResources, device_str: str
     ) -> bool:
@@ -485,26 +514,12 @@ class DeepSeekV4Model(GptModelBase):
         """
         logging.info(
             "[DeepSeekV4Model] building DSpARK commit-only transformer (layers=%d, globals=%d)",
-            len(self.weight.weights),
-            len(self.weight.global_weights),
+            *self._runtime_weight_counts(),
         )
-        prev_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(torch.bfloat16)
-        try:
-            with torch.device("meta"):
-                self.v4 = V4Transformer(self._v4_args, mw=self.weight)
-                if self.v4.embed is not None:
-                    from rtp_llm.models_py.modules.dsv41.utils import V41Embedding
-
-                    self.v4.embed = V41Embedding(
-                        self.config, self.parallelism_config, self.v4.embed.weight
-                    )
-        finally:
-            torch.set_default_dtype(prev_dtype)
+        self._create_runtime_transformer()
         for layer in self.v4.layers:
             layer.attn.init_rope_cache(device=device_str)
-        self._load_scoped_extra_weights(self.weight)
-        del self.weight
+        self._release_runtime_weight_source()
         self._bind_runtime_buffers(torch.device(device_str))
         if self._v4_args.v41_config is not None:
             from rtp_llm.models_py.modules.dsv41.dsv41_kernel_jit_warmup import (
@@ -576,11 +591,7 @@ class DeepSeekV4Model(GptModelBase):
                 else:
                     warmup_v41_prefill_jit(self, device=warmup_device)
             return True
-        device = (
-            next(iter(self.weight.global_weights.values())).device
-            if self.weight.global_weights
-            else "cuda:0"
-        )
+        device = self._runtime_weight_device()
         device_str = str(device)
         self._is_speculative = bool(init_resource.is_speculative)
         self._is_decode_role = bool(init_resource.is_decode_role)
@@ -635,28 +646,14 @@ class DeepSeekV4Model(GptModelBase):
             return self._initialize_commit_only(init_resource, device_str)
         logging.info(
             "[DeepSeekV4Model] building V4Transformer via factory (layers=%d, globals=%d) ...",
-            len(self.weight.weights),
-            len(self.weight.global_weights),
+            *self._runtime_weight_counts(),
         )
-        prev_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(torch.bfloat16)
-        try:
-            with torch.device("meta"):
-                self.v4 = V4Transformer(self._v4_args, mw=self.weight)
-                if self.v4.embed is not None:
-                    from rtp_llm.models_py.modules.dsv41.utils import V41Embedding
-
-                    self.v4.embed = V41Embedding(
-                        self.config, self.parallelism_config, self.v4.embed.weight
-                    )
-        finally:
-            torch.set_default_dtype(prev_dtype)
+        self._create_runtime_transformer()
         if self._captures_aux_hidden:
             self.v4.set_aux_hidden_capture_layer_ids(self._capture_aux_hidden_layer_ids)
         for layer in self.v4.layers:
             layer.attn.init_rope_cache(device=device_str)
-        self._load_scoped_extra_weights(self.weight)
-        del self.weight
+        self._release_runtime_weight_source()
         if torch.cuda.is_available() and device_str.startswith("cuda"):
             gpu_mem_gb = torch.cuda.memory_allocated(torch.device(device_str)) / 1024**3
             logging.info("[DeepSeekV4Model] GPU mem after load: %.1f GB", gpu_mem_gb)

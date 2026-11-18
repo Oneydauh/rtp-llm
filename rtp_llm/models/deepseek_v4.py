@@ -146,15 +146,9 @@ def _require_n_shared_experts(config_json: dict) -> int:
 
 
 def _is_ppu_flash(config):
-    if config.model_type not in ("deepseek_v4", "deepseek_v4_mtp"):
-        return False
-    from rtp_llm.device.device_type import is_ppu
+    from rtp_llm.models_py.new_models.deepseek_v4.platform import is_ppu_flash
 
-    return (
-        is_ppu()
-        and config.hidden_size == 4096
-        and config.num_layers == (1 if config.model_type == "deepseek_v4_mtp" else 43)
-    )
+    return is_ppu_flash(config)
 
 
 def configure_ppu_scheduler(config, scheduler):

@@ -3,6 +3,7 @@
 import torch
 
 from rtp_llm.config.model_config import ModelConfig
+from rtp_llm.models_py.model_desc.block_map import get_primary_attention_inputs
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
 from rtp_llm.models_py.new_models.model_base import select_fmha_impl_for_layer
 from rtp_llm.models_py.new_models.qwen3.language import (
@@ -98,6 +99,11 @@ class GqaMoeForCausalLM(Qwen3ForCausalLM):
         if fmha_impl is None:
             fmha_impl = self.prepare_fmha_impl(inputs)
         capture = self.capture_context(inputs.capture_hidden_states)
+        projector = getattr(self, "_eagle3_capture_projection", None)
+        if projector is not None:
+            self.begin_aux_hidden_capture(
+                hidden, bool(get_primary_attention_inputs(inputs).is_target_verify)
+            )
         layers = self.layers.values() if self._pipeline_partitioned else self.layers
         for local, (global_id, layer) in enumerate(zip(self._owned_layer_ids, layers)):
             hidden, residual = layer(
@@ -111,12 +117,25 @@ class GqaMoeForCausalLM(Qwen3ForCausalLM):
                 ),
             )
             capture.capture_layer(global_id, hidden, residual)
+            if projector is not None:
+                self.capture_aux_hidden(global_id, hidden, residual)
         if self.norm is None:
             materialized = hidden + residual
             out = PyModelOutputs(materialized)
             out.pp_intermediates = {"hidden_states": materialized}
             return out
-        return capture.finalize(hidden, residual)
+        out = capture.finalize(hidden, residual)
+        if projector is not None:
+            self.finish_aux_hidden_capture()
+            # Project the initial three H-wide features *once*, on the target;
+            # subsequent Eagle3 recurrent steps already have width H. This
+            # keeps graph input shape and PD draft feature storage fixed at H.
+            project = projector()
+            if project is None:
+                raise RuntimeError("EAGLE3 draft was released before its target")
+            self._mtp_target_hidden_states = project(self._mtp_target_hidden_states)
+            out.mtp_target_hidden_states = self._mtp_target_hidden_states
+        return out
 
 
 class Glm4MoeForCausalLM(GqaMoeForCausalLM):

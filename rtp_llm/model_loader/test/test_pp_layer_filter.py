@@ -48,6 +48,7 @@ def expert_stage(
     pc = pc or topology(counts, stage, ep)
     cfg = NS(
         num_layers=sum(counts),
+        moe_layer_index=moe,
         activation_type="SiGLU",
         is_mtp=False,
         moe_n_group=groups,
@@ -118,6 +119,30 @@ class PPExpertTest(unittest.TestCase):
                             owner._eplb_log2phy,
                             torch.tensor([[0, 2, -1], [1, 3, -1]], dtype=torch.int32),
                         )
+
+    def test_missing_routed_owners_cannot_publish_partial_eplb(self):
+        from rtp_llm.models_py.eplb_controller import create_stage_expert_balancer
+
+        owners, controller = expert_stage([2, 2], 0, [0, 1, 3])
+        loader = controller._loader
+        cfg = controller._model_config
+        with self.assertRaisesRegex(ValueError, r"missing=\[0, 1\]"):
+            create_stage_expert_balancer(loader, torch.nn.Module(), cfg)
+        del owners["1"]
+        with self.assertRaisesRegex(ValueError, r"missing=\[1\]"):
+            create_stage_expert_balancer(loader, owners, cfg)
+        # A genuinely dense first stage has no controller, as in PPExecutor.
+        cfg.moe_layer_index = [3]
+        self.assertIsNone(create_stage_expert_balancer(loader, torch.nn.Module(), cfg))
+        with self.assertRaisesRegex(ValueError, r"unexpected=\[0\]"):
+            create_stage_expert_balancer(loader, owners, cfg)
+        cfg.moe_layer_index = [cfg.num_layers]
+        with self.assertRaisesRegex(ValueError, "out-of-range"):
+            create_stage_expert_balancer(loader, torch.nn.Module(), cfg)
+        cfg.moe_layer_index = []
+        cfg.moe_style = 1
+        with self.assertRaisesRegex(ValueError, "no declared MoE layers"):
+            create_stage_expert_balancer(loader, torch.nn.Module(), cfg)
 
     def test_all_selection_policies_stay_on_stage(self):
         from rtp_llm.models_py.eplb_controller import _SelectLayerMethod

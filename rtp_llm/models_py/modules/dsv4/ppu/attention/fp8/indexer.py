@@ -154,6 +154,7 @@ class IndexerFP8(_BaseIndexerFP8):
         layer_weights: Optional[Dict[str, torch.Tensor]] = None,
         platform_provider=None,
         compressor_factory=None,
+        owned=None,
     ):
         """``layer_weights`` is the framework's per-layer dict
         (``ModelWeights.weights[layer_id]``), keyed by ``W.v4_*`` enum.
@@ -170,10 +171,9 @@ class IndexerFP8(_BaseIndexerFP8):
             "deep_gemm.fp8_paged_mqa_logits or the group-128 Triton fallback. "
             "Use IndexerBF16 if neither is importable."
         )
-        assert layer_weights is not None, (
-            "IndexerFP8 requires layer_weights — meta-tensor / stand-alone "
-            "construction is not supported (use the BF16 path for that)."
-        )
+        self._checkpoint_owned = False
+        if (owned is None) == (layer_weights is None):
+            raise ValueError("PPU indexer requires exactly one parameter source")
         self._platform_provider = platform_provider
         self._prefill_score_chunk_rows = _fp8_prefill_score_chunk_rows(
             getattr(platform_provider, "execution_options", None)
@@ -188,30 +188,35 @@ class IndexerFP8(_BaseIndexerFP8):
         self.softmax_scale = self.head_dim**-0.5
         self.compress_ratio = compress_ratio
 
-        from rtp_llm.models_py.modules.dsv4.ppu.attention.fp8.attention import _v4_fp8_linear
-        from rtp_llm.utils.model_weight import W
+        if owned is not None:
+            self.wq_b = owned.wq_b.bind_runtime()
+            self.weights_proj = (owned.weights_proj.weight * (self.softmax_scale * self.n_heads**-0.5)).contiguous()
+            inner_cmp_weights = None
+        else:
+            from rtp_llm.models_py.modules.dsv4.ppu.attention.fp8.attention import _v4_fp8_linear
+            from rtp_llm.utils.model_weight import W
 
-        self.wq_b = _v4_fp8_linear(
-            layer_weights[W.v4_indexer_wq_b_w],
-            layer_weights[W.v4_indexer_wq_b_s],
-            platform_provider=platform_provider,
-        )
-        # weights_proj is plain BF16. Pre-fold the runtime ``softmax_scale *
-        # n_heads^-0.5`` into the weight at load time so prefill / decode can
-        # do a single ``F.linear`` (cuBLAS GEMM) without a trailing elementwise
-        # mul. New tensor — never mutate ``layer_weights`` in place.
-        _wp_scale = self.softmax_scale * self.n_heads**-0.5
-        self.weights_proj = (
-            layer_weights[W.v4_indexer_weights_proj_w] * _wp_scale
-        ).contiguous()
+            self.wq_b = _v4_fp8_linear(
+                layer_weights[W.v4_indexer_wq_b_w],
+                layer_weights[W.v4_indexer_wq_b_s],
+                platform_provider=platform_provider,
+            )
+            # weights_proj is plain BF16. Pre-fold the runtime ``softmax_scale *
+            # n_heads^-0.5`` into the weight at load time so prefill / decode can
+            # do a single ``F.linear`` (cuBLAS GEMM) without a trailing elementwise
+            # mul. New tensor — never mutate ``layer_weights`` in place.
+            _wp_scale = self.softmax_scale * self.n_heads**-0.5
+            self.weights_proj = (
+                layer_weights[W.v4_indexer_weights_proj_w] * _wp_scale
+            ).contiguous()
 
-        # Nested compressor: 132B layout (head_dim=128).
-        inner_cmp_weights = {
-            "ape": layer_weights[W.v4_indexer_compressor_ape],
-            "wkv": layer_weights[W.v4_indexer_compressor_wkv],
-            "wgate": layer_weights[W.v4_indexer_compressor_wgate],
-            "norm": layer_weights[W.v4_indexer_compressor_norm],
-        }
+            # Nested compressor: 132B layout (head_dim=128).
+            inner_cmp_weights = {
+                "ape": layer_weights[W.v4_indexer_compressor_ape],
+                "wkv": layer_weights[W.v4_indexer_compressor_wkv],
+                "wgate": layer_weights[W.v4_indexer_compressor_wgate],
+                "norm": layer_weights[W.v4_indexer_compressor_norm],
+            }
         self.compressor = (compressor_factory or CompressorFP8)(
             dim=dim,
             head_dim=index_head_dim,
@@ -222,6 +227,7 @@ class IndexerFP8(_BaseIndexerFP8):
             norm_eps=norm_eps,
             rotate=True,
             compressor_weights=inner_cmp_weights,
+            owned=owned.compressor if owned is not None else None,
             platform_provider=platform_provider,
         )
         self.max_batch_size = max_batch_size

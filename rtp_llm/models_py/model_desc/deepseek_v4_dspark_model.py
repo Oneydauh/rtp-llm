@@ -61,7 +61,6 @@ from rtp_llm.models_py.modules.dsv4.kv_cache_utils import (
     build_block_tables_for_tags,
     primary_attention_inputs,
 )
-from rtp_llm.models_py.modules.dsv4.utils import _v4_fp8_linear
 from rtp_llm.models_py.modules.factory.attention.common import (
     create_write_cache_store_impl,
 )
@@ -235,6 +234,10 @@ class DeepSeekV4DSparkModel(DSparkProposerMixin, DeepSeekV4Model):
         )
 
     def _load_extra_weights(self, weights: ModelWeights) -> None:
+        # This factory constructs the legacy tensor-backed linear. Direct
+        # owners already have an FP8 linear and validate its backend at load.
+        from rtp_llm.models_py.modules.dsv4.utils import _v4_fp8_linear
+
         gw = weights.global_weights
         self.main_norm = RMSNorm(
             gw[W.v4_dspark_main_norm], float(self._v4_args.norm_eps)

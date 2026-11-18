@@ -54,18 +54,6 @@ def load_owned_model(service, *, publish_runtime=True):
     config = service.model_config
     owner_cls = get_model_class(config.model_type)
     aliases = {}
-    if service._weight_alias_names:
-        source = service._weight_alias_owner
-        if source is None or source.py_model is None or source.weight is None:
-            raise RuntimeError("draft parameter loans require an already loaded target")
-        aliases = aliases_from_runtime_exports(
-            source.py_model,
-            {
-                name: source.weight.get_global_weight(name)
-                for name in service._weight_alias_names
-            },
-            owner_cls.runtime_parameter_paths,
-        )
     device = service._get_device_str()
     if (
         not publish_runtime
@@ -73,6 +61,24 @@ def load_owned_model(service, *, publish_runtime=True):
         and not torch.cuda.is_available()
     ):
         device = "cpu"
+    prepared_loan = None
+    if service._weight_alias_names:
+        source = service._weight_alias_owner
+        if source is None or source.py_model is None or source.weight is None:
+            raise RuntimeError("draft parameter loans require an already loaded target")
+        exports = {
+            name: source.weight.get_global_weight(name)
+            for name in service._weight_alias_names
+        }
+        capture = getattr(owner_cls, "capture_runtime_loan", None)
+        if capture is not None:
+            prepared_loan = capture(
+                source.py_model, source.model_config, config, exports, device
+            )
+        if prepared_loan is None:
+            aliases = aliases_from_runtime_exports(
+                source.py_model, exports, owner_cls.runtime_parameter_paths
+            )
     source_quant = config.quant_config
     quant_type = "none"
     if source_quant is not None:
@@ -87,6 +93,7 @@ def load_owned_model(service, *, publish_runtime=True):
     load_config = NewLoaderConfig.from_runtime(
         service.parallelism_config,
         device=device,
+        prepared_runtime_loan=prepared_loan,
         compute_dtype=config.compute_dtype,
         load_method=method,
         quant_config=QuantizationConfig(

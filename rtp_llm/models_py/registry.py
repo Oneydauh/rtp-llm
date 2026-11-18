@@ -111,6 +111,22 @@ def is_model_registered(model_type: str) -> bool:
 
 # Additional owners are registered only after their main-compatible port lands.
 register_lazy_model(
+    "bert",
+    "rtp_llm.models_py.new_models.bert.language",
+    "BertEncoderOwner",
+)
+register_lazy_model(
+    "deepseek_v41",
+    "rtp_llm.models_py.new_models.deepseek_v41.language",
+    "DeepSeekV41ForCausalLM",
+)
+register_lazy_model(
+    "deepseek_v41_dspark",
+    "rtp_llm.models_py.new_models.deepseek_v41_dspark.language",
+    "DeepSeekV41DSparkForCausalLM",
+)
+
+register_lazy_model(
     "qwen_3_moe",
     "rtp_llm.models_py.new_models.qwen3_moe.language",
     "Qwen3MoeForCausalLM",
@@ -130,6 +146,18 @@ register_lazy_model(
     "rtp_llm.models_py.new_models.qwen2",
     "Qwen2ForCausalLM",
 )
+register_lazy_model(
+    "qwen_2-mtp", "rtp_llm.models_py.new_models.qwen2_mtp", "Qwen2MTPForCausalLM"
+)
+
+# Distinct service types share main's vision tower, not a text-only runtime.
+for _vl_type, _vl_owner in (
+    ("qwen3_vl", "Qwen3VLForCausalLM"),
+    ("qwen3_vl_moe", "Qwen3VLMoeForCausalLM"),
+):
+    register_lazy_model(
+        _vl_type, "rtp_llm.models_py.new_models.qwen3_vl.language", _vl_owner
+    )
 
 # The owner selects direct Q, compressed Q or the sparse indexer from the
 # parsed attention config; it does not replace a sparse model with dense MLA.
@@ -141,9 +169,26 @@ for _model_type in ("deepseek2", "glm4_moe_lite", "deepseek3", "deepseek_v32", "
     )
 
 register_lazy_model(
+    "deepseek-v3-mtp",
+    "rtp_llm.models_py.new_models.deepseek_v3_mtp.language",
+    "DeepSeekV32MTPForCausalLM",
+)
+
+register_lazy_model(
     "kimi_linear",
     "rtp_llm.models_py.new_models.kimi_linear.language",
     "KimiLinearForCausalLM",
+)
+
+register_lazy_model(
+    "kimi_k25",
+    "rtp_llm.models_py.new_models.kimi_k25.language",
+    "KimiK25ForCausalLM",
+)
+register_lazy_model(
+    "kimi_k25_vision",
+    "rtp_llm.models_py.new_models.kimi_k25.vision",
+    "KimiK25ForVisionEmbedding",
 )
 
 # Use the service model_type, not the Hugging Face architecture string. Draft
@@ -159,3 +204,67 @@ for _model_type, _owner in (
     register_lazy_model(
         _model_type, "rtp_llm.models_py.new_models.qwen3_next.language", _owner
     )
+
+register_lazy_model(
+    "deepseek_v4",
+    "rtp_llm.models_py.new_models.deepseek_v4.language",
+    "DeepSeekV4ForCausalLM",
+)
+register_lazy_model(
+    "deepseek_v4_dspark",
+    "rtp_llm.models_py.new_models.deepseek_v4_dspark.language",
+    "DeepSeekV4DSparkForCausalLM",
+)
+register_lazy_model(
+    "deepseek_v4_mtp",
+    "rtp_llm.models_py.new_models.deepseek_v4.mtp",
+    "DeepSeekV4MtpForCausalLM",
+)
+
+register_lazy_model(
+    "roberta",
+    "rtp_llm.models_py.new_models.roberta.language",
+    "RobertaEncoderOwner",
+)
+
+register_lazy_model(
+    "cosyvoice_qwen",
+    "rtp_llm.models_py.new_models.cosyvoice_qwen.language",
+    "CosyVoiceQwenForCausalLM",
+)
+
+register_lazy_model(
+    "jina_bert_code",
+    "rtp_llm.models_py.new_models.jina_bert.runtime",
+    "JinaBertForEmbedding",
+)
+
+register_lazy_model(
+    "megatron_bert",
+    "rtp_llm.models_py.new_models.megatron_bert.language",
+    "MegatronBertForEmbedding",
+)
+
+register_lazy_model(
+    "qwen_3_dspark",
+    "rtp_llm.models_py.new_models.qwen3_dspark.language",
+    "Qwen3DSparkForCausalLM",
+)
+
+register_lazy_model(
+    "qwen_3_moe_eagle3",
+    "rtp_llm.models_py.new_models.qwen3_moe_eagle3.service",
+    "Qwen3MoeEagle3ForCausalLM",
+)
+
+register_lazy_model(
+    "qwen4_exp",
+    "rtp_llm.models_py.new_models.qwen4_exp.language",
+    "Qwen4ForCausalLM",
+)
+
+register_lazy_model(
+    "qwen4_exp_mtp",
+    "rtp_llm.models_py.new_models.qwen4_exp_mtp.draft_service",
+    "Qwen4ExpMTPForCausalLM",
+)

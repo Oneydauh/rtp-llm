@@ -91,6 +91,7 @@ class CompressorFP8(_BaseCompressorFP8):
         rotate: bool = False,
         compressor_weights: Optional[Dict[str, torch.Tensor]] = None,
         platform_provider=None,
+        owned=None,
     ):
         """``compressor_weights`` is a 4-key dict ``{"ape", "wkv", "wgate",
         "norm"}`` extracted by the caller from ``layer_weights[W.v4_*compressor_*]``."""
@@ -99,10 +100,9 @@ class CompressorFP8(_BaseCompressorFP8):
             f"CompressorFP8 supports head_dim in {{{KV_HEAD_DIM}, "
             f"{INDEXER_HEAD_DIM}}}; got {head_dim}"
         )
-        assert compressor_weights is not None, (
-            "CompressorFP8 requires compressor_weights — meta-tensor / "
-            "stand-alone construction is not supported (use the BF16 path)."
-        )
+        self._checkpoint_owned = False  # The parameter tree owns checkpoint validation.
+        if (owned is None) == (compressor_weights is None):
+            raise ValueError("PPU compressor requires exactly one parameter source")
         self._platform_provider = platform_provider
 
         self._bf16_fp32_linear = partial(platform_provider.run_bf16_fp32_linear, _default_bf16_fp32_linear)
@@ -135,23 +135,30 @@ class CompressorFP8(_BaseCompressorFP8):
         # projection below uses BF16 operands with FP32 accumulation/output.
         # Register ape as a non-trainable Parameter so .to(device) follows the
         # module.
-        self.ape = nn.Parameter(
-            compressor_weights["ape"].float().contiguous(), requires_grad=False
-        )
-        self.wkv = nn.Linear(dim, coff * head_dim, bias=False)
-        self.wgate = nn.Linear(dim, coff * head_dim, bias=False)
-        with torch.no_grad():
-            self.wkv.weight = nn.Parameter(
-                compressor_weights["wkv"].to(torch.bfloat16), requires_grad=False
+        if owned is not None:
+            self.ape = owned.ape
+            self.wkv = owned.wkv
+            self.wgate = owned.wgate
+            self.norm = _CompressorNorm(head_dim)
+            self.norm.weight = owned.norm.weight
+        else:
+            self.ape = nn.Parameter(
+                compressor_weights["ape"].float().contiguous(), requires_grad=False
             )
-            self.wgate.weight = nn.Parameter(
-                compressor_weights["wgate"].to(torch.bfloat16), requires_grad=False
+            self.wkv = nn.Linear(dim, coff * head_dim, bias=False)
+            self.wgate = nn.Linear(dim, coff * head_dim, bias=False)
+            with torch.no_grad():
+                self.wkv.weight = nn.Parameter(
+                    compressor_weights["wkv"].to(torch.bfloat16), requires_grad=False
+                )
+                self.wgate.weight = nn.Parameter(
+                    compressor_weights["wgate"].to(torch.bfloat16), requires_grad=False
+                )
+            self.norm = _CompressorNorm(head_dim)
+            self.norm.weight = nn.Parameter(
+                compressor_weights["norm"].to(torch.bfloat16),
+                requires_grad=False,
             )
-        self.norm = _CompressorNorm(head_dim)
-        self.norm.weight = nn.Parameter(
-            compressor_weights["norm"].to(torch.bfloat16),
-            requires_grad=False,
-        )
 
         # Fuse wkv + wgate into one bf16 weight matrix; saves one
         # GEMM launch per compressor decode call (~92/step at bs16).

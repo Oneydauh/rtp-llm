@@ -19,6 +19,7 @@ from rtp_llm.models_py.layers.linear import (
     RowParallelLinear,
 )
 from rtp_llm.models_py.layers.norm import RMSNorm
+from rtp_llm.models_py.model_desc.block_map import get_primary_attention_inputs
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
 from rtp_llm.models_py.module_base import CheckpointLoadTarget, RtpModule
 from rtp_llm.models_py.new_models.model_base import (
@@ -736,6 +737,13 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
         if fmha_impl is None:
             fmha_impl = self.prepare_fmha_impl(inputs)
         capture = self.capture_context(inputs.capture_hidden_states)
+        capture_aux = bool(self._mtp_aux_capture_layer_ids) and not self.config.is_mtp
+        if capture_aux:
+            self.begin_aux_hidden_capture(
+                hidden_states,
+                get_primary_attention_inputs(inputs).is_target_verify,
+                upstream_hidden=inputs.pp_intermediates.get("mtp_aux_hidden_states"),
+            )
         local_layers = (
             self.layers.values()
             if isinstance(self.layers, nn.ModuleDict)
@@ -748,9 +756,20 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
                 layer_fmha_impl,
                 kv_cache=self.kv_cache.get_layer_cache(i) if self.kv_cache else None,
             )
-            capture.capture_layer(self._owned_layer_ids[i], hidden_states)
+            global_id = self._owned_layer_ids[i]
+            if capture_aux and global_id in self._mtp_aux_capture_layer_id_set:
+                self.capture_aux_hidden(global_id, hidden_states)
+            capture.capture_layer(global_id, hidden_states)
+        if capture_aux:
+            self.finish_aux_hidden_capture()
         if self.norm is None:
             outputs = PyModelOutputs(hidden_states)
-            outputs.pp_intermediates = {"hidden_states": hidden_states}
+            intermediates = {"hidden_states": hidden_states}
+            if capture_aux and self._mtp_aux_capture_buffer is not None:
+                intermediates["mtp_aux_hidden_states"] = self._mtp_aux_capture_buffer
+            outputs.pp_intermediates = intermediates
             return outputs
-        return capture.finalize(hidden_states)
+        outputs = capture.finalize(hidden_states)
+        if capture_aux:
+            outputs.mtp_target_hidden_states = self._mtp_target_hidden_states
+        return outputs

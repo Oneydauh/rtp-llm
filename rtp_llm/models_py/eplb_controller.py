@@ -52,10 +52,34 @@ class _SelectLayerMethod(Enum):
 
 def create_stage_expert_balancer(loader, model, model_config):
     """Only actual routed-expert owners participate on this PP stage."""
-    if not model_config.eplb_config.enable_eplb() or not any(
-        isinstance(module, BaseMoEExperts) for module in model.modules()
-    ):
+    if not model_config.eplb_config.enable_eplb():
         return None
+
+    # The native executors schedule EPLB from the configured global layer IDs,
+    # not by discovering Python modules. Compare the two views *before* publishing
+    # the model: a missing callback otherwise falls through to legacy weights.
+    declared = set(model_config.moe_layer_index)
+    invalid = declared.difference(range(model_config.num_layers))
+    if invalid:
+        raise ValueError(f"EPLB declares out-of-range MoE layers: {sorted(invalid)}")
+    if not declared and getattr(model_config, "moe_style", 0):
+        raise ValueError("EPLB enabled for a routed model with no declared MoE layers")
+    from rtp_llm.config.layer_partition import local_layer_range
+
+    owned = local_layer_range(model_config, loader.load_config.parallelism_config)
+    expected = declared.intersection(owned)
+    actual = {
+        module.layer_idx
+        for module in model.modules()
+        if isinstance(module, BaseMoEExperts)
+    }
+    if actual != expected:
+        raise ValueError(
+            "EPLB routed-layer ownership mismatch: "
+            f"missing={sorted(expected - actual)}, unexpected={sorted(actual - expected)}"
+        )
+    if not expected:
+        return None  # Valid dense-only PP stage.
     return NewLoaderExpertBalancer(loader, model, model_config)
 
 

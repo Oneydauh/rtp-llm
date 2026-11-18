@@ -1,3 +1,17 @@
+py_library(
+    name = "mxfp4_test_fixtures",
+    srcs = ["test_mxfp4_quark.py"],
+    deps = ["//rtp_llm/models_py:new_weight_loader"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "test_mxfp4_quark",
+    srcs = ["test_mxfp4_quark.py"],
+    deps = ["//rtp_llm/models_py:new_weight_loader"],
+    env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1"},
+)
+
 py_test(
     name = "test_fp8_already_quantized",
     srcs = ["test_fp8_already_quantized.py"],
@@ -5,6 +19,35 @@ py_test(
         "//rtp_llm/models_py:new_weight_loader",
         "//rtp_llm:torch",
     ],
+)
+
+py_test(
+    name = "test_int8_ft_export",
+    srcs = ["test_int8_ft_export.py"],
+    deps = [
+        "//rtp_llm/models_py:new_weight_loader",
+        "//rtp_llm/models_py:int8_export_helpers",
+        "//rtp_llm/model_loader:loader",
+        "//rtp_llm/tools/convert:convert",
+    ],
+)
+
+py_test(
+    name = "test_groupwise_checkpoint",
+    srcs = ["test_groupwise_checkpoint.py"],
+    env = {"CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+    deps = [
+        "//rtp_llm/models_py:groupwise_export_helpers",
+        "//rtp_llm:safetensors_torch",
+    ],
+)
+
+py_test(
+    name = "test_groupwise_owners",
+    srcs = ["test_groupwise_owners.py", "test_groupwise_checkpoint.py"],
+    main = "test_groupwise_owners.py",
+    env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "ROCR_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+    deps = ["//rtp_llm/models_py:new_weight_loader", "//rtp_llm:safetensors_torch"],
 )
 
 py_test(
@@ -44,4 +87,46 @@ py_test(
     srcs = ["test_moe_ft_scalar.py", "test_block_fp8_ft.py"],
     main = "test_moe_ft_scalar.py",
     deps = ["//rtp_llm/models_py:new_weight_loader"],
+)
+
+py_test(
+    name = "test_w8a8_int8",
+    srcs = ["test_w8a8_int8.py"],
+    deps = ["//rtp_llm/models_py:new_weight_loader", "//rtp_llm:torch", "//rtp_llm:safetensors"],
+)
+
+py_test(
+    name = "test_w8a8_int8_moe",
+    srcs = ["test_w8a8_int8_moe.py"],
+    data = ["//:rtp_compute_ops", "//:th_transformer_config"],
+    deps = ["//rtp_llm/models_py:new_weight_loader", "//rtp_llm:torch", "//rtp_llm:safetensors"],
+)
+
+py_test(
+    name = "test_w4a8_checkpoint",
+    srcs = ["test_w4a8_checkpoint.py", "test_w8a8_int8_moe.py"],
+    main = "test_w4a8_checkpoint.py",
+    deps = ["//rtp_llm/models_py:new_weight_loader", "//rtp_llm:torch", "//rtp_llm:safetensors"],
+)
+
+py_test(
+    name = "groupwise_runtime_test",
+    srcs = ["groupwise_runtime_test.py"],
+    deps = [
+        "//rtp_llm/models_py:new_weight_loader",
+        "//rtp_llm:torch",
+    ],
+)
+
+# Native execution is opt-in after an idle ROCm GPU has been allocated.
+py_test(
+    name = "groupwise_runtime_rocm_test",
+    srcs = ["groupwise_runtime_test.py"],
+    main = "groupwise_runtime_test.py",
+    env = {"RUN_GROUPWISE_NATIVE_GPU_TESTS": "1"},
+    tags = ["manual", "rocm"],
+    deps = [
+        "//rtp_llm/models_py:new_weight_loader",
+        "//rtp_llm:torch",
+    ],
 )

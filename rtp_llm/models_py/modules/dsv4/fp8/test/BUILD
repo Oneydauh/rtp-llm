@@ -8,6 +8,23 @@ _DSV4_FP8_TEST_DEPS = [
     "//rtp_llm:testlib",
 ]
 
+# Direct, CPU-side checkpoint contract tests; no GPU kernel claims.
+[
+    py_test(
+        name = name,
+        srcs = [name + ".py"],
+        env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "",
+               "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+        deps = ["//rtp_llm/models_py:modules", "//rtp_llm/models_py:new_loader_core"],
+    )
+    for name in [
+        "dsv4_attention_checkpoint_test",
+        "dsv4_compressor_checkpoint_test",
+        "dsv4_fp8_checkpoint_test",
+        "dsv4_indexer_checkpoint_test",
+    ]
+]
+
 # Numerical kernels and the associated metadata/pool boundary regressions.
 _GPU_TESTS = [
     "test_bf16_gemm_fp32",
@@ -108,6 +125,13 @@ dsv4_py_test(
         "test_varlen_prefill_oracle",
     ]
 ]
+
+# CPU tensor-layout equivalence. The optional NAS fixture is opt-in.
+py_test(
+    name = "test_mega_owned_weights",
+    srcs = ["test_mega_owned_weights.py"],
+    deps = _DSV4_FP8_TEST_DEPS,
+)
 
 # Compares locally constructed F.linear/cat expressions, not CompressorFP8.
 dsv4_py_test(

@@ -53,11 +53,16 @@ class BaseMoEExperts(RtpModule):
     # Subclasses should list the HF projection names they expect.
     PROJ_NAMES: Tuple[str, ...] = ("gate_proj", "up_proj", "down_proj")
     _supports_newloader_eplb = True
+    # The parent MoE owns this separate leaf; executor selection must know
+    # whether shared-expert output is gated before choosing a fused strategy.
+    has_shared_expert_gate = False
 
     # Quant type string -> family. Registered MoE quant methods own the actual
     # quantized buffer allocation/dispatch/postprocess; this map is used for
     # diagnostics and for fail-fast if a quant family is not registered.
     _BASE_QUANT_MAP = {
+        "awq": "awq",
+        "gptq": "gptq",
         "W8A8_INT8_PER_CHANNEL_COMPRESSED": "w8a8_int8_per_channel",
         # already-quantized FP8 ckpts (weight is fp8 + ckpt has weight_scale)
         "FP8_PER_TENSOR_COMPRESSED": "fp8_per_tensor",
@@ -356,6 +361,7 @@ class BaseMoEExperts(RtpModule):
             prefix=self.prefix,
         )
         clone._expert_placement = placement
+        clone.has_shared_expert_gate = self.has_shared_expert_gate
         return clone
 
     def _validate_quant_config_contract(self, runtime_method: str) -> None:
@@ -423,15 +429,10 @@ class BaseMoEExperts(RtpModule):
         """Map one logical checkpoint id to every matching local physical slot."""
         return self._expert_placement.local_indices(global_expert_id)
 
-    def _remap_expert_id(self, global_expert_id: int) -> Optional[int]:
-        """Map a logical id to its sole local slot for stacked legacy paths."""
-        local_ids = self._remap_expert_ids(global_expert_id)
-        if len(local_ids) > 1:
-            raise RuntimeError(
-                f"Logical expert {global_expert_id} maps to multiple local physical "
-                "slots; use per-expert checkpoint loading"
-            )
-        return local_ids[0] if local_ids else None
+    def checkpoint_read_spec(self, name, shape):
+        if self.quant_method.owns_checkpoint_loading:
+            return self.quant_method.checkpoint_read_spec(self, name, shape)
+        return super().checkpoint_read_spec(name, shape)
 
     def _ensure_projection_not_loaded(self, local_id: int, projection: str) -> None:
         key = (local_id, projection)
@@ -458,6 +459,9 @@ class BaseMoEExperts(RtpModule):
         e.g. ``65.gate_proj.weight``, ``65.gate_proj.weight_scale``.
         """
         weights = self.quant_method.normalize_checkpoint_weights(weights)
+        if self.quant_method.owns_checkpoint_loading:
+            self.quant_method.load_weights(self, weights)
+            return
         for name, tensor in weights.items():
             if name in self._seen_checkpoint_names:
                 raise RuntimeError(
@@ -471,11 +475,6 @@ class BaseMoEExperts(RtpModule):
             parts = name.split(".")
             base = parts[0]
             if base in ("gate_up_proj", "down_proj"):
-                if self._expert_placement.has_redundancy:
-                    raise ValueError(
-                        "Stacked all-expert checkpoints do not support redundant "
-                        "physical expert placement; use per-expert checkpoint keys"
-                    )
                 if self.ep_size > 1:
                     raise ValueError(
                         "Stacked all-expert checkpoints are not supported with "
@@ -627,10 +626,9 @@ class BaseMoEExperts(RtpModule):
     def _load_stacked_expert_aux(
         self, base: str, param_name: str, tensor: torch.Tensor
     ):
-        for g in range(tensor.shape[0]):
-            local_id = self._remap_expert_id(g)
-            if local_id is None:
-                continue
+        for local_id, g in enumerate(
+            self._expert_placement.local_physical_to_logical
+        ):
             if base == "gate_up_proj":
                 self._dispatch_gate_up_scale(local_id, param_name, tensor[g])
             else:
@@ -639,10 +637,9 @@ class BaseMoEExperts(RtpModule):
     def _load_stacked_expert_weights(
         self, base: str, param_name: str, tensor: torch.Tensor
     ) -> None:
-        for global_id in range(self.num_experts):
-            local_id = self._remap_expert_id(global_id)
-            if local_id is None:
-                continue
+        for local_id, global_id in enumerate(
+            self._expert_placement.local_physical_to_logical
+        ):
             if base == "gate_up_proj":
                 self._dispatch_gate_up_quant_weight(
                     local_id, param_name, tensor[global_id]
@@ -682,10 +679,9 @@ class BaseMoEExperts(RtpModule):
                     "equals 2 * moe_intermediate_size; use per-expert projection "
                     "names instead"
                 )
-            for g in range(E):
-                local_id = self._remap_expert_id(g)
-                if local_id is None:
-                    continue
+            for local_id, g in enumerate(
+                self._expert_placement.local_physical_to_logical
+            ):
                 self._ensure_projection_not_loaded(local_id, "gate_proj")
                 self._ensure_projection_not_loaded(local_id, "up_proj")
                 e = tensor[g]  # [H, 2M]
@@ -714,10 +710,9 @@ class BaseMoEExperts(RtpModule):
                     "equals moe_intermediate_size; use per-expert projection "
                     "names instead"
                 )
-            for g in range(E):
-                local_id = self._remap_expert_id(g)
-                if local_id is None:
-                    continue
+            for local_id, g in enumerate(
+                self._expert_placement.local_physical_to_logical
+            ):
                 self._ensure_projection_not_loaded(local_id, "down_proj")
                 e = tensor[g]
                 if e.shape == (self.moe_inter, self.hidden_size):
@@ -1131,8 +1126,22 @@ class BaseMoEExperts(RtpModule):
             # Module.__setattr__.
             setattr(self, attribute, tensor)
 
+    def _configure_factory_adapter(self, adapter):
+        # Topk IDs handed to the executor are in the physical namespace.
+        if adapter.physical_expert_num != self.physical_num_experts:
+            raise ValueError("NewLoader placement and FusedMoE physical counts differ")
+        adapter.expert_num = self.physical_num_experts
+        adapter.has_shared_expert_gate = self.has_shared_expert_gate
+
     def _maybe_build_fused_moe(self):
         if self.fused_moe is not None:
+            return
+        build_owned = getattr(self.quant_method, "build_moe_executor", None)
+        if callable(build_owned):
+            executor = build_owned(self)
+            if not callable(executor):
+                raise TypeError("Quantized MoE builder must return an executable backend")
+            self.fused_moe = executor
             return
         from rtp_llm.models_py.modules import FusedMoeFactory
         from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
@@ -1153,11 +1162,7 @@ class BaseMoEExperts(RtpModule):
             quant_config=self._effective_model_quant_config,
             enable_cuda_graph=self._enable_cuda_graph(),
         )
-        # main exposes logical and physical counts separately. Topk ids handed
-        # to this executor are already in the physical namespace.
-        if adapter.physical_expert_num != self.physical_num_experts:
-            raise ValueError("NewLoader placement and FusedMoE physical counts differ")
-        adapter.expert_num = self.physical_num_experts
+        self._configure_factory_adapter(adapter)
         weights_dict = self._build_weights_dict()
         self._runtime_weights_dict = dict(weights_dict)
         self.fused_moe = FusedMoeFactory().create_fused_moe(adapter, weights_dict)
