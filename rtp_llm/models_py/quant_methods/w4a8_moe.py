@@ -328,7 +328,7 @@ class W4A8Int4MoEMethod(FusedMoEMethodBase):
         packed = tensor.contiguous().view(torch.int8)
         if tuple(packed.shape) != (full_rows, layer.hidden_size // 2):
             raise ValueError(
-                f"W4A8 gate/up packed shape {tuple(packed.shape)} != "
+                f"W4A8 gate/up packed source shape {tuple(packed.shape)} != "
                 f"{(full_rows, layer.hidden_size // 2)}"
             )
         start = layer.moe_expert_tp_rank * rows
@@ -339,7 +339,7 @@ class W4A8Int4MoEMethod(FusedMoEMethodBase):
         full_rows = rows * layer.moe_expert_tp_size
         if tuple(tensor.shape) != (full_rows, layer.hidden_size // self.group_size):
             raise ValueError(
-                f"W4A8 gate/up scale shape {tuple(tensor.shape)} != "
+                f"W4A8 gate/up scale source shape {tuple(tensor.shape)} != "
                 f"{(full_rows, layer.hidden_size // self.group_size)}"
             )
         start = layer.moe_expert_tp_rank * rows
@@ -352,7 +352,7 @@ class W4A8Int4MoEMethod(FusedMoEMethodBase):
         packed = tensor.contiguous().view(torch.int8)
         if tuple(packed.shape) != (layer.hidden_size, full_cols // 2):
             raise ValueError(
-                f"W4A8 down packed shape {tuple(packed.shape)} != "
+                f"W4A8 down packed source shape {tuple(packed.shape)} != "
                 f"{(layer.hidden_size, full_cols // 2)}"
             )
         start = layer.moe_expert_tp_rank * packed_cols
@@ -364,7 +364,7 @@ class W4A8Int4MoEMethod(FusedMoEMethodBase):
         groups = cols // self.group_size
         if tuple(tensor.shape) != (layer.hidden_size, full_cols // self.group_size):
             raise ValueError(
-                f"W4A8 down scale shape {tuple(tensor.shape)} != "
+                f"W4A8 down scale source shape {tuple(tensor.shape)} != "
                 f"{(layer.hidden_size, full_cols // self.group_size)}"
             )
         start = layer.moe_expert_tp_rank * groups
