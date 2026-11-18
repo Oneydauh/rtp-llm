@@ -5,6 +5,8 @@ match NewLoader parameter names or owning devices. This adapter never creates a
 serving model, chooses a loading backend, or installs weights into a model.
 """
 
+from importlib import import_module
+
 from rtp_llm.device import get_current_device
 from rtp_llm.model_loader.load_config import LoadConfig
 from rtp_llm.model_loader.tensor_source import DatabaseTensorSource
@@ -18,6 +20,14 @@ class FTExportWeights:
         self, model_config, weights_info, misc_weights_info, database, *,
         force_cpu_load_weights=False, moe_pure_tp_preshard=False,
     ):
+        from rtp_llm.config.quant_config import Fp8BlockWiseQuantConfig
+
+        if isinstance(getattr(model_config, "quant_config", None), Fp8BlockWiseQuantConfig):
+            # The package is intentionally lazy for serving. The offline
+            # descriptor registry, however, must know both prequantized and
+            # online block transforms before constructing any layer fields.
+            import_module("rtp_llm.model_loader.per_block_fp8_quant_weight")
+
         self._info = weights_info.create_model_weight_info(database)
         self._custom = tuple(misc_weights_info or ())
         self._task_type = model_config.task_type
