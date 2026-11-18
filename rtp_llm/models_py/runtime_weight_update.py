@@ -409,6 +409,10 @@ class RuntimeWeightTransaction:
                 raise ValueError(f"Duplicate runtime weight {update.name!r}")
             names.add(update.name)
             target, source = update.target, update.source
+            if getattr(target, "_rtp_requires_restart_for_update", False):
+                raise PermissionError(
+                    f"Runtime weight {update.name!r} is prepared/shared; restart required"
+                )
             if not isinstance(target, torch.Tensor) or not isinstance(
                 source, torch.Tensor
             ):
