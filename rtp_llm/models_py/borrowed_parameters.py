@@ -13,6 +13,29 @@ from torch import nn
 from rtp_llm.models_py.module_base import _mark_loaded, collect_loaded_tensor_ids
 
 
+class FixedHostCheckpointStorage:
+    """Leaf whose parameters are deliberately resident on CPU even in a GPU model."""
+
+    def _apply(self, fn, recurse=True):
+        return self
+
+
+def _loan_device(model, name, binding, target):
+    def leaf(root, path):
+        prefix, _, _ = path.rpartition(".")
+        return root.get_submodule(prefix) if prefix else root
+
+    destination_host = isinstance(leaf(model, name), FixedHostCheckpointStorage)
+    source_host = isinstance(
+        leaf(binding.owner, binding.source_path), FixedHostCheckpointStorage
+    )
+    if source_host != destination_host:
+        raise ValueError(
+            f"Borrowed parameter {name} host residency does not match destination"
+        )
+    return torch.device("cpu") if destination_host else target
+
+
 @dataclass(frozen=True)
 class BorrowedParameter:
     owner: nn.Module
@@ -73,12 +96,13 @@ def validate_borrowed_parameters(model: nn.Module, target_device=None) -> None:
             or tuple(owned.shape) != shape
         ):
             raise RuntimeError(f"Borrowed parameter {name} lost owner storage identity")
-        if device is not None and (
-            owned.device.type != device.type
-            or (device.index is not None and owned.device.index != device.index)
+        expected = _loan_device(model, name, binding, device)
+        if expected is not None and (
+            owned.device.type != expected.type
+            or (expected.index is not None and owned.device.index != expected.index)
         ):
             raise ValueError(
-                f"Borrowed parameter {name} cannot migrate owner storage to {device}"
+                f"Borrowed parameter {name} cannot migrate owner storage to {expected}"
             )
 
 
@@ -121,11 +145,12 @@ def bind_borrowed_parameters(
             raise ValueError(
                 f"Borrowed parameter {name} shape/dtype does not match destination"
             )
-        if source.device.type != device.type or (
-            device.index is not None and source.device.index != device.index
+        expected = _loan_device(model, name, binding, device)
+        if source.device.type != expected.type or (
+            expected.index is not None and source.device.index != expected.index
         ):
             raise ValueError(
-                f"Borrowed parameter {name} owner must already be on {device}"
+                f"Borrowed parameter {name} owner must already be on {expected}"
             )
         module_path, _, local_name = name.rpartition(".")
         leaf = model.get_submodule(module_path) if module_path else model
