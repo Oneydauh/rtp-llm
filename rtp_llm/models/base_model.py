@@ -127,6 +127,7 @@ class BaseModel(object):
         self.tokenizer: Optional[BaseTokenizer] = None
         self.custom_module: Optional[CustomModule] = None
         self.py_model = None
+        self.uses_new_loader = False
         self.default_generate_config: GenerateConfig = GenerateConfig()
         self.load_tokenizer()
         self._finalize_output_vocab_config()
@@ -186,6 +187,13 @@ class BaseModel(object):
             raise Exception("current model can't support cuda graph in py model mode")
 
         self.custom_module = self._init_custom_module()
+        if self.uses_new_loader:
+            if skip_python_model:
+                raise ValueError("NewLoader requires the Python runtime model")
+            from rtp_llm.models.direct_checkpoint import load_owned_model
+
+            load_owned_model(self)
+            return
         self.model_weights_loader = self.create_model_loader()
         self.py_eplb = self.model_weights_loader._py_eplb
         device_str = self._get_device_str()
@@ -318,6 +326,7 @@ class BaseModel(object):
         moe_pure_tp_preshard: bool = False,
         weight_alias_owner: Optional["BaseModel"] = None,
         weight_alias_names: Sequence[str] = (),
+        use_new_loader: bool = False,
     ) -> "BaseModel":
         """Create model from independent configuration objects.
 
@@ -353,6 +362,9 @@ class BaseModel(object):
             )
         model._weight_alias_owner = weight_alias_owner
         model._weight_alias_names = tuple(weight_alias_names)
+        if not isinstance(use_new_loader, bool):
+            raise TypeError("use_new_loader must be a boolean")
+        model.uses_new_loader = use_new_loader
 
         import os
 

@@ -112,6 +112,7 @@ class ModelFactory:
             force_cpu_load_weights=engine_config.load_config.force_cpu_load_weights,
             loader_recycle_handles=engine_config.load_config.loader_recycle_handles,
             moe_pure_tp_preshard=engine_config.load_config.moe_pure_tp_preshard,
+            use_new_loader=getattr(engine_config.load_config, "use_new_loader", False),
         )
         return model
 
@@ -177,7 +178,8 @@ class ModelFactory:
                 return None
 
             load_method = engine_config.load_config.load_method
-            if parallelism_config.pp_size > 1:
+            use_new_loader = getattr(engine_config.load_config, "use_new_loader", False)
+            if parallelism_config.pp_size > 1 and not use_new_loader:
                 # Only the last PP stage loads draft weights, but fastsafetensors
                 # requires all WORLD ranks to participate in its collectives.
                 # Force SCRATCH here because AUTO may select fastsafetensors.
@@ -239,6 +241,7 @@ class ModelFactory:
                 moe_pure_tp_preshard=engine_config.load_config.moe_pure_tp_preshard,
                 weight_alias_owner=target_model if alias_names else None,
                 weight_alias_names=alias_names,
+                use_new_loader=use_new_loader,
             )
             aliased_local_bytes = 0
             for name in alias_names:

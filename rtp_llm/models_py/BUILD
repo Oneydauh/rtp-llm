@@ -68,6 +68,23 @@ py_library(
     visibility = ["//visibility:public"],
 )
 
+py_test(
+    name = "serving_route_checkpoint_test",
+    srcs = ["serving_route_checkpoint_test.py"],
+    deps = [":new_weight_loader", "//rtp_llm:models"],
+)
+
+py_test(
+    name = "serving_route_qwen3_test",
+    srcs = [
+        "serving_route_qwen3_test.py",
+        "serving_route_checkpoint_test.py",
+        "new_models/qwen3/main_pp_checkpoint_test.py",
+    ],
+    main = "serving_route_qwen3_test.py",
+    deps = [":new_weight_loader", "//rtp_llm:models"],
+)
+
 py_library(
     name = "utils",
     srcs = glob([

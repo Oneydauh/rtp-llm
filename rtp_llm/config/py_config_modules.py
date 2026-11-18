@@ -208,6 +208,9 @@ class LoraConfig:
 class LoadConfig:
     def __init__(self):
         self.load_method: str = "auto"
+        # Explicit service choice, independent of the checkpoint I/O method.
+        # Do not change the production default until the parity run completes.
+        self.use_new_loader: bool = False
         self.force_cpu_load_weights: bool = False
         self.loader_recycle_handles: bool = True
         self.moe_pure_tp_preshard: bool = False
@@ -217,6 +220,7 @@ class LoadConfig:
     def to_string(self):
         return (
             f"load_method: {self.load_method}\n"
+            f"use_new_loader: {self.use_new_loader}\n"
             f"force_cpu_load_weights: {self.force_cpu_load_weights}\n"
             f"loader_recycle_handles: {self.loader_recycle_handles}\n"
             f"moe_pure_tp_preshard: {self.moe_pure_tp_preshard}\n"

@@ -315,6 +315,7 @@ py_library(
         #":decord",
         "//rtp_llm/model_loader:loader",
         "//rtp_llm/models_py:models",
+        "//rtp_llm/models_py:new_weight_loader",
         ":multimodal",
     ] + select({
         "@//:using_ppu": ["//rtp_llm/models_py:ppu_entrypoint"],

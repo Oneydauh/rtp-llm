@@ -24,7 +24,15 @@ class MultimodalMixinFactory:
             logging.info("No multimodal model, skip create multimodal mixin")
             return None
         multimodal_mixin_cls = get_multimodal_mixin_cls(model_config.model_type)
-        return multimodal_mixin_cls(
+        constructor = multimodal_mixin_cls
+        if getattr(engine_config.load_config, "use_new_loader", False):
+            constructor = getattr(multimodal_mixin_cls, "from_new_loader", None)
+            if not callable(constructor):
+                raise ValueError(
+                    f"{model_config.model_type}: multimodal mixin has no direct "
+                    "checkpoint loader; refusing to load via legacy weights"
+                )
+        return constructor(
             model_config.compute_dtype,
             device,
             model_config.mm_related_params,

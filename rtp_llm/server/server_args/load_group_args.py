@@ -7,6 +7,14 @@ def init_load_group_args(parser, load_config, model_args):
     ##############################################################################################################
     load_group = parser.add_argument_group("Load Configuration")
     load_group.add_argument(
+        "--use_new_loader",
+        env_name="USE_NEW_LOADER",
+        bind_to=(load_config, "use_new_loader"),
+        type=str2bool,
+        default=False,
+        help="Load directly into the Python model's parameters; never retry with the legacy loader.",
+    )
+    load_group.add_argument(
         "--load_method",
         env_name="LOAD_METHOD",
         bind_to=(load_config, "load_method"),

@@ -1,0 +1,161 @@
+"""Service boundary for loading directly into the Python model's parameters."""
+
+import logging
+from dataclasses import dataclass
+
+import torch
+
+from rtp_llm.models_py.borrowed_parameters import aliases_from_runtime_exports
+from rtp_llm.models_py.model_loader import (
+    NewLoaderConfig,
+    NewLoaderLoadMethod,
+    NewModelLoader,
+)
+from rtp_llm.models_py.quant_methods import QuantizationConfig
+from rtp_llm.models_py.registry import get_model_class
+
+
+@dataclass
+class RuntimeWeightView:
+    """Non-owning tensor references used by main's engine and custom handlers.
+
+    The engine's MTP constructor uses len(weights) for layer cardinality even
+    when a direct Python module owns the layer. An interior PP stage need not
+    export any global tensors. Nothing here maps checkpoint names to tensors.
+    """
+
+    weights: list
+    global_weights: dict
+    dtype: torch.dtype
+    device: str
+
+    def get_global_weight(self, name):
+        return self.global_weights[name]
+
+    def get_global_weight_or_none(self, name):
+        return self.global_weights.get(name)
+
+
+def custom_weight_mappings(custom):
+    if custom is None:
+        return ()
+    records = custom.get_custom_weight_info()
+    if not records:
+        return ()
+    from rtp_llm.model_loader.weight_module import CustomAtomicWeight
+    from rtp_llm.utils.model_weight import identity, sp_id
+
+    result = []
+    for info in records:
+        if (
+            not isinstance(info, CustomAtomicWeight)
+            or len(info.weights) != 1
+            or info.process_fun is not identity
+            or info.weights[0].merge_fun is not identity
+            or info.split_func is not sp_id
+            or info.data_type is not None
+        ):
+            raise ValueError(f"Unadapted custom checkpoint transform for {info.name!r}")
+        result.append((info.name, info.weights[0].tensor_name(None)))
+    return tuple(result)
+
+
+def _runtime_view(module, config, device):
+    exports = module.runtime_weight_view()
+    if not isinstance(exports, dict) or not all(
+        isinstance(k, str) and k and isinstance(t, torch.Tensor)
+        for k, t in exports.items()
+    ):
+        raise TypeError("runtime_weight_view must return named tensor references")
+    return RuntimeWeightView(
+        [{} for _ in range(config.num_layers)], exports, config.compute_dtype, device
+    )
+
+
+def load_owned_model(service):
+    """Build locally first; never expose a half-loaded module to serving."""
+    config = service.model_config
+    owner_cls = get_model_class(config.model_type)
+    aliases = {}
+    if service._weight_alias_names:
+        source = service._weight_alias_owner
+        if source is None or source.py_model is None or source.weight is None:
+            raise RuntimeError("draft parameter loans require an already loaded target")
+        aliases = aliases_from_runtime_exports(
+            source.py_model,
+            {
+                name: source.weight.get_global_weight(name)
+                for name in service._weight_alias_names
+            },
+            owner_cls.runtime_parameter_paths,
+        )
+    device = service._get_device_str()
+    source_quant = config.quant_config
+    quant_type = "none"
+    if source_quant is not None:
+        # Shared main quant config parser distinguishes prequantized vs online
+        # representations for the same get_method() value.
+        from rtp_llm.models_py.quant_methods.moe_quant_key import (
+            moe_checkpoint_method_key,
+        )
+
+        quant_type = moe_checkpoint_method_key(source_quant)
+    method = getattr(service.load_method, "value", service.load_method)
+    load_config = NewLoaderConfig.from_runtime(
+        service.parallelism_config,
+        device=device,
+        compute_dtype=config.compute_dtype,
+        load_method=method,
+        quant_config=QuantizationConfig(
+            quant_type,
+            source_config=source_quant,
+            hw_kernel_config=service.hw_kernel_config,
+        ),
+        moe_config=service.moe_config,
+        fmha_config=service.fmha_config,
+        py_hw_kernel_config=service.hw_kernel_config,
+        max_generate_batch_size=service.max_generate_batch_size,
+        custom_weight_mappings=custom_weight_mappings(service.custom_module),
+    )
+    loader = NewModelLoader(
+        config, load_config, model_path=config.ckpt_path, parameter_aliases=aliases
+    )
+    logging.info(
+        "Using NewModelLoader for model_type=%s requested=%s", config.model_type, method
+    )
+    adapters = config.lora_infos
+    if adapters and (not service.merge_lora or len(adapters) != 1):
+        raise ValueError("Direct startup LoRA requires one merged checkpoint adapter")
+    module = loader.load()
+    actual = loader.loaded_method
+    requested = load_config.load_method
+    if actual is None or (
+        requested != NewLoaderLoadMethod.AUTO and actual != requested
+    ):
+        raise RuntimeError(
+            f"Direct checkpoint backend mismatch: requested={requested}, loaded={actual}"
+        )
+    if adapters:
+        from rtp_llm.models_py.lora_checkpoint import merge_startup_lora_checkpoint
+
+        for name, path in adapters.items():
+            merge_startup_lora_checkpoint(module, loader, name, path)
+    view = _runtime_view(module, config, device)
+    module.weight = view
+    controller = None
+    if config.eplb_config.enable_eplb():
+        from rtp_llm.models_py.eplb_controller import NewLoaderExpertBalancer
+
+        controller = NewLoaderExpertBalancer(loader, module, config)
+    if service.custom_module is not None:
+        service.custom_module.init(view)
+    service.device = device
+    service.weight = view
+    service.py_model = module
+    service.model_weights_loader = loader
+    service.py_eplb = controller
+    logging.info(
+        "NewModelLoader: model loaded successfully: model_type=%s selected=%s",
+        config.model_type,
+        actual.value,
+    )
