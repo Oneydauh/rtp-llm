@@ -36,6 +36,15 @@ class DeepSeekV41Mixin(BaseMultiModalMixin):
         self.mm_related_params.vit_weights = None
 
     @classmethod
+    def from_new_loader(
+        cls, compute_dtype, device, mm_related_params, load_method, vit_config, ckpt_path
+    ):
+        # Both entry points publish the same validated V4.1 vision owner.
+        return cls(
+            compute_dtype, device, mm_related_params, load_method, vit_config, ckpt_path
+        )
+
+    @classmethod
     def _get_mm_module(cls, mm_related_params, vit_config):
         config = mm_related_params.config["v41_config"]
         if not isinstance(config, V41Config):

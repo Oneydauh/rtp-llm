@@ -9,6 +9,7 @@ import torch
 from safetensors.torch import save_file
 
 from rtp_llm.config.dsv41_config import V41Config
+from rtp_llm.multimodal.multimodal_mixin_factory import MultimodalMixinFactory
 from rtp_llm.multimodal.multimodal_mixins.deepseek_v41.deepseek_v41_mixin import (
     DeepSeekV41Mixin,
 )
@@ -127,28 +128,38 @@ class V41VisionNewLoaderTest(unittest.TestCase):
                     )
                 self.assertEqual(owner.encode_prepared_images([]), [])
 
+    def service_mixin(self, model_type, method, root):
+        params = SimpleNamespace(config={"v41_config": self.config}, vit_weights=None)
+        model = SimpleNamespace(
+            model_type=model_type,
+            compute_dtype=torch.float16,
+            ckpt_path=root,
+            mm_model_config=SimpleNamespace(is_multimodal=True),
+            mm_related_params=params,
+        )
+        engine = SimpleNamespace(load_config=SimpleNamespace(load_method=method))
+        return MultimodalMixinFactory._create_multimodal_mixin(model, engine, None, "cpu")
+
     def test_serving_mixin_publishes_direct_owner_without_legacy_weight_dict(self):
         for method in self.methods():
-            with self.subTest(method=method), tempfile.TemporaryDirectory() as root:
+            with tempfile.TemporaryDirectory() as root:
                 self.write_checkpoint(root, self.state)
-                params = SimpleNamespace(
-                    config={"v41_config": self.config}, vit_weights=None
-                )
-                mixin = DeepSeekV41Mixin(
-                    torch.float16, "cpu", params, method, None, root
-                )
-                self.assertIs(mixin.mm_part, mixin.checkpoint_owner)
-                self.assertEqual(mixin.model_weights_loader.loaded_method, method)
-                self.assertIsNone(params.vit_weights)
-                self.assertFalse(hasattr(mixin, "weights"))
-                self.assertFalse(hasattr(mixin, "mm_mixin_loader"))
-                self.assertEqual(mixin.mm_part.image_start.dtype, torch.bfloat16)
-                torch.testing.assert_close(
-                    mixin.mm_part.vision.norm.weight,
-                    self.state["vision.norm.weight"],
-                    rtol=0,
-                    atol=0,
-                )
+                for kind in ("deepseek_v41", "deepseek_v41_dspark"):
+                    with self.subTest(method=method, kind=kind):
+                        mixin = self.service_mixin(kind, method, root)
+                        self.assertIsInstance(mixin, DeepSeekV41Mixin)
+                        self.assertIs(mixin.mm_part, mixin.checkpoint_owner)
+                        self.assertEqual(mixin.model_weights_loader.loaded_method, method)
+                        self.assertIsNone(mixin.mm_related_params.vit_weights)
+                        self.assertFalse(hasattr(mixin, "weights"))
+                        self.assertFalse(hasattr(mixin, "mm_mixin_loader"))
+                        self.assertEqual(mixin.mm_part.image_start.dtype, torch.bfloat16)
+                        torch.testing.assert_close(
+                            mixin.mm_part.vision.norm.weight,
+                            self.state["vision.norm.weight"],
+                            rtol=0,
+                            atol=0,
+                        )
 
     def test_missing_required_and_unknown_vision_tensor_fail(self):
         for method in self.methods():
@@ -160,9 +171,7 @@ class V41VisionNewLoaderTest(unittest.TestCase):
                     del state[absent]
                     self.write_checkpoint(root, state)
                     with self.assertRaises((ValueError, RuntimeError)):
-                        load_v41_service_vision(
-                            self.config, root, torch.bfloat16, "cpu", method
-                        )
+                        self.service_mixin("deepseek_v41", method, root)
             with self.subTest(
                 method=method, unknown=True
             ), tempfile.TemporaryDirectory() as root:
@@ -170,9 +179,7 @@ class V41VisionNewLoaderTest(unittest.TestCase):
                     root, dict(self.state, **{"vision.unowned.weight": torch.ones(1)})
                 )
                 with self.assertRaises((ValueError, RuntimeError, KeyError)):
-                    load_v41_service_vision(
-                        self.config, root, torch.bfloat16, "cpu", method
-                    )
+                    self.service_mixin("deepseek_v41", method, root)
 
 
 if __name__ == "__main__":
