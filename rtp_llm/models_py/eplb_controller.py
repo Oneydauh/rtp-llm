@@ -50,6 +50,15 @@ class _SelectLayerMethod(Enum):
     MIX = "mix"
 
 
+def create_stage_expert_balancer(loader, model, model_config):
+    """Only actual routed-expert owners participate on this PP stage."""
+    if not model_config.eplb_config.enable_eplb() or not any(
+        isinstance(module, BaseMoEExperts) for module in model.modules()
+    ):
+        return None
+    return NewLoaderExpertBalancer(loader, model, model_config)
+
+
 class NewLoaderExpertBalancer:
     """Implements the Python callback protocol consumed by C++ ExpertBalancer."""
 
@@ -84,7 +93,10 @@ class NewLoaderExpertBalancer:
         self.num_replicas = first.physical_num_experts
         self.num_gpu = first.ep_size
         self.num_groups = int(getattr(model_config, "moe_n_group", 1))
-        if self.num_groups <= 0:
+        mode = getattr(model_config.eplb_config, "eplb_mode", None)
+        # Stats-only never invokes the hierarchical repartitioner.
+        self._stats_only = getattr(mode, "name", mode) == "STATS"
+        if not self._stats_only and self.num_groups <= 0:
             raise ValueError("model_config.moe_n_group must be positive")
 
         parallelism = loader.load_config.parallelism_config
@@ -115,7 +127,11 @@ class NewLoaderExpertBalancer:
                 )
         # rebalance_experts uses a global (one-node) solve on its non-hierarchical
         # path. Match main's explicit topology error on the hierarchical path.
-        if self.num_groups % self.num_nodes == 0 and self.num_gpu % self.num_nodes:
+        if (
+            not self._stats_only
+            and self.num_groups % self.num_nodes == 0
+            and self.num_gpu % self.num_nodes
+        ):
             raise ValueError(
                 f"Hierarchical EPLB requires ep_size={self.num_gpu} divisible by num_nodes={self.num_nodes}"
             )
@@ -179,6 +195,8 @@ class NewLoaderExpertBalancer:
 
     @torch.inference_mode()
     def create_balance_plan(self, log_stats: torch.Tensor, gpu_loads: torch.Tensor):
+        if self._stats_only:
+            raise RuntimeError("Cannot create a balance plan in STATS mode")
         with self._lock:
             self._update_count += 1
             history = self._history.add(log_stats)
