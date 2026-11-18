@@ -1,6 +1,18 @@
 package(default_visibility = ["//:__subpackages__"])
 
 py_library(
+    name = "ft_export_metadata",
+    srcs = ["ft_export_metadata.py"],
+    deps = ["//rtp_llm:safetensors"],
+)
+
+py_library(
+    name = "ft_export_writer",
+    srcs = ["ft_export_writer.py"],
+    deps = ["//rtp_llm:safetensors"],
+)
+
+py_library(
     name = "convert",
     srcs = glob([
         "*.py",

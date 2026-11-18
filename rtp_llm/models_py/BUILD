@@ -43,6 +43,18 @@ py_test(
     deps = [":new_loader_core"],
 )
 
+py_test(
+    name = "rank_local_ft_test",
+    srcs = ["rank_local_ft_test.py"],
+    env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1"},
+    deps = [
+        ":new_loader_core",
+        "//rtp_llm:fastsafetensors",
+        "//rtp_llm/tools/convert:ft_export_metadata",
+        "//rtp_llm/tools/convert:ft_export_writer",
+    ],
+)
+
 # Direct parameter owners use main's existing runtime models/helpers, never a
 # backported scheduler/cache/PP engine. Production routing is integrated later.
 py_library(

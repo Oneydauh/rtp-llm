@@ -2071,9 +2071,16 @@ class NewModelLoader:
             if overlay is not None:
                 ft_checkpoint.apply_overlay(overlay)
             if getattr(parallel, "pp_size", 1) != 1:
-                raise ValueError(
-                    "FT import does not support pipeline stage-local checkpoints"
-                )
+                if meta_checkpoint is not None or not callable(
+                    getattr(model, "layer_ids", None)
+                ):
+                    raise ValueError(
+                        "This format adapter does not declare PP stage ownership"
+                    )
+                # Main's FT writer exports all layers even when deployment
+                # later uses PP. Use the constructed model's range, including
+                # the full-range exception for speculative drafts.
+                ft_checkpoint.select_stage(model.layer_ids(), model.config.num_layers)
             if requested_method == NewLoaderLoadMethod.FASTSAFETENSORS:
                 if meta_checkpoint is not None and any(
                     not path.endswith(".safetensors") for path in checkpoint_files

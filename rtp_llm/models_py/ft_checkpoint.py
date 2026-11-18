@@ -7,7 +7,7 @@ explicitly declare each supported boundary conversion before using it.
 
 import json
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -121,6 +121,10 @@ class FTCheckpoint:
         for axis in ("tp", "dp", "ep"):
             expected = getattr(topology, axis + "_size")
             raw = env.get(axis.upper() + "_SIZE", expected)
+            # WeightConverter preserves the caller's raw EP_SIZE=0 in the
+            # index, although its exporter resolves it to TP_SIZE * DP_SIZE.
+            if axis == "ep" and str(raw) == "0":
+                raw = topology.tp_size * topology.dp_size
             if isinstance(raw, bool) or not re.fullmatch(r"[1-9]\d*", str(raw)):
                 raise ValueError(f"Invalid FT {axis.upper()}_SIZE: {raw!r}")
             if int(raw) != expected:
@@ -132,7 +136,8 @@ class FTCheckpoint:
             raise ValueError("FT checkpoint requires a nonempty weight_map")
         requested = (topology.tp_rank, topology.dp_rank, topology.ep_rank)
         sizes = (topology.tp_size, topology.dp_size, topology.ep_size)
-        entries = {}
+        by_rank = {}
+        paths = {}
         for key, filename in weight_map.items():
             match = _KEY.fullmatch(key)
             if match is None:
@@ -142,21 +147,177 @@ class FTCheckpoint:
                 raise ValueError(f"FT tensor rank outside requested topology: {key}")
             if not isinstance(filename, str) or not filename:
                 raise ValueError(f"Invalid FT shard for {key}")
-            path = (root / filename).resolve()
-            if Path(filename).is_absolute() or root not in path.parents:
-                raise ValueError(f"FT shard escapes checkpoint directory: {filename!r}")
-            if path.suffix != ".safetensors" or not path.is_file():
-                raise ValueError(f"Missing or unsupported FT shard: {filename!r}")
-            if ranks == requested:
-                suffix = match[4]
-                if suffix in entries:
-                    raise ValueError(f"Duplicate logical FT tensor: {suffix}")
-                entries[suffix] = (key, path)
-        if not entries:
+            path = paths.get(filename)
+            if path is None:
+                path = (root / filename).resolve()
+                if Path(filename).is_absolute() or root not in path.parents:
+                    raise ValueError(
+                        f"FT shard escapes checkpoint directory: {filename!r}"
+                    )
+                if path.suffix != ".safetensors" or not path.is_file():
+                    raise ValueError(f"Missing or unsupported FT shard: {filename!r}")
+                paths[filename] = path
+            rank_entries = by_rank.setdefault(ranks, {})
+            suffix = match[4]
+            if suffix in rank_entries:
+                raise ValueError(f"Duplicate logical FT tensor on {ranks}: {suffix}")
+            rank_entries[suffix] = (key, path)
+        if requested not in by_rank:
             raise ValueError(f"FT checkpoint has no tensors for rank {requested}")
-        checkpoint = cls(root, topology, entries)
+        checkpoint = cls(root, topology, by_rank[requested])
+        checkpoint._by_rank = by_rank
+        checkpoint.index_metadata = metadata
         checkpoint.env_params = env
         return checkpoint
+
+    def select_stage(self, layer_ids: range, num_layers: int):
+        """Project a full-model FT export onto the runtime's actual layer range.
+
+        The legacy writer only emits full-model files. The legacy *reader*
+        permits PP consumers, whose layer ids are global and whose first/last
+        globals follow ModelLoader.is_global_weight_local. Drafts can own the
+        entire layer range even when the physical topology has multiple stages.
+        """
+        if (
+            not isinstance(layer_ids, range)
+            or layer_ids.step != 1
+            or type(num_layers) is not int
+            or num_layers <= 0
+            or not 0 <= layer_ids.start < layer_ids.stop <= num_layers
+        ):
+            raise ValueError(
+                f"Invalid FT stage range {layer_ids!r} for {num_layers} layers"
+            )
+
+        def belongs(name):
+            if name.startswith("layers."):
+                index = int(name.split(".", 2)[1])
+                if index >= num_layers:
+                    raise ValueError(f"FT tensor layer id outside model: {name}")
+                return index in layer_ids
+            if name in ("global.embedding", "global.position_encoding.weight"):
+                return 0 in layer_ids
+            if name in ("global.lm_head", "global.lm_head_b") or name.startswith(
+                "global.final_layernorm."
+            ):
+                return num_layers - 1 in layer_ids
+            return True
+
+        self.entries = {k: v for k, v in self.entries.items() if belongs(k)}
+
+    def _shape(self, key, path):
+        if key in self._overlay:
+            return tuple(self._overlay[key].shape)
+        with safe_open(str(path), framework="pt", device="cpu") as shard:
+            return tuple(shard.get_slice(key).get_shape())
+
+    def _export_slot_ids(self, ranks, key, layer_id):
+        manifests = self.index_metadata.get("module_export_metadata")
+        if manifests is None:
+            return None
+        rank_key = "rank_%02d_%02d_%02d" % ranks
+        manifest = manifests.get(rank_key) if isinstance(manifests, dict) else None
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("binding_schema_version") != 1
+        ):
+            raise ValueError(f"Missing or invalid FT binding manifest for {rank_key}")
+        for axis, rank in zip(("tp", "dp", "ep"), ranks):
+            if manifest.get(axis + "_rank") != rank or manifest.get(
+                axis + "_size"
+            ) != getattr(self.topology, axis + "_size"):
+                raise ValueError(f"FT module manifest topology mismatch for {rank_key}")
+        leaves = [
+            leaf
+            for leaf in manifest["modules"].values()
+            if key in leaf["parameter_bindings"].values()
+        ]
+        if len(leaves) != 1 or leaves[0].get("layer_id") != layer_id:
+            raise ValueError(f"Ambiguous FT expert module binding for {key}")
+        ids = leaves[0].get("logical_expert_ids")
+        if not isinstance(ids, list):
+            raise ValueError(
+                f"FT expert manifest must declare logical_expert_ids for {key}"
+            )
+        return tuple(ids)
+
+    def read_expert_rows(self, name, layer_id, placement):
+        """Read one already-sharded projection/scale in *target* physical order.
+
+        Main's CLI exports either pure TP (all EP=0, distinct expert TP slices)
+        or one worker per EP, with no redundant experts and canonical slot order.
+        Module-export manifests additionally describe noncanonical source slots.
+        Never reuse a payload from a different expert TP stripe.
+        """
+        if (
+            type(layer_id) is not int
+            or not name.startswith(f"layers.{layer_id}.")
+            or name not in self.entries
+        ):
+            raise ValueError(f"FT expert tensor not owned by this layer/stage: {name}")
+        t = self.topology
+        if (t.ep_rank, t.ep_size) != (placement.ep_rank, placement.ep_size):
+            raise ValueError("FT expert target EP coordinate mismatch")
+        if t.ep_size == 1:
+            ranks = [(t.tp_rank, t.dp_rank, t.ep_rank)]
+        elif t.ep_size == t.tp_size * t.dp_size:
+            ranks = sorted(self._by_rank, key=lambda xyz: xyz[2])
+            if [xyz[2] for xyz in ranks] != list(range(t.ep_size)):
+                raise ValueError("Missing or ambiguous FT source EP rank")
+        else:
+            raise ValueError("FT expert TP stripes require an explicit source topology")
+
+        logical_count = placement.logical_expert_count
+        sources = {}
+        expected_tail = None
+        for xyz in ranks:
+            key, path = self._by_rank[xyz][name]
+            shape = self._shape(key, path)
+            if (
+                not shape
+                or shape[0] == 0
+                or (expected_tail is not None and shape[1:] != expected_tail)
+            ):
+                raise ValueError(
+                    f"FT expert rows have incompatible shapes: {key} {shape}"
+                )
+            expected_tail = shape[1:]
+            ids = self._export_slot_ids(xyz, key, layer_id)
+            if ids is None:
+                if shape[0] * t.ep_size != logical_count:
+                    raise ValueError(
+                        f"Ambiguous legacy FT expert order for {key}; export logical_expert_ids"
+                    )
+                ids = range(xyz[2] * shape[0], (xyz[2] + 1) * shape[0])
+            if len(ids) != shape[0] or any(
+                type(i) is not int or not 0 <= i < logical_count for i in ids
+            ):
+                raise ValueError(
+                    f"Invalid FT physical-to-logical expert rows for {key}"
+                )
+            for slot, logical in enumerate(ids):
+                # Replicated experts in explicit placements have identical
+                # semantic values; prefer the rank-local source when available.
+                if logical not in sources or xyz[2] == t.ep_rank:
+                    sources[logical] = (key, path, slot)
+        if len(sources) != logical_count:
+            raise ValueError(f"FT source placement omits logical experts for {name}")
+        runs = []
+        for logical in placement.local_physical_to_logical:
+            key, path, slot = sources[logical]
+            if runs and runs[-1][:2] == (key, path) and runs[-1][3] == slot:
+                runs[-1] = (key, path, runs[-1][2], slot + 1)
+            else:
+                runs.append((key, path, slot, slot + 1))
+        parts = [
+            self._read_tensor(
+                k, p, (slice(start, end),) + (slice(None),) * len(expected_tail)
+            )
+            for k, p, start, end in runs
+        ]
+        if any(part.dtype != parts[0].dtype for part in parts[1:]):
+            raise ValueError(f"FT source EP ranks use inconsistent dtype for {name}")
+        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
 
     def read(self, name: str) -> torch.Tensor:
         key, path = self.entries[name]
@@ -202,19 +363,29 @@ class FTCheckpoint:
 
     def read_rank_slice(self, name: str, tp_rank: int, slices=None):
         """Read a bounded slice from a peer TP file without a collective."""
-        peer = (
-            self
-            if tp_rank == self.topology.tp_rank
-            else self.open(str(self.root), replace(self.topology, tp_rank=tp_rank))
-        )
-        key, path = peer.entries[name]
+        if name not in self.entries:
+            raise KeyError(name)
+        if type(tp_rank) is not int or not 0 <= tp_rank < self.topology.tp_size:
+            raise ValueError(f"Invalid FT TP peer {tp_rank!r}")
+        if tp_rank == self.topology.tp_rank:
+            key, path = self.entries[name]
+        else:
+            # FT producer emits one EP coordinate per (TP, DP) worker. A
+            # peer in the same DP replica generally has a DIFFERENT EP rank.
+            # Resolve its actual indexed tuple, never infer it from WORLD.
+            peers = [
+                entries
+                for (tp, dp, _), entries in self._by_rank.items()
+                if tp == tp_rank and dp == self.topology.dp_rank
+            ]
+            if len(peers) != 1:
+                raise ValueError(
+                    f"Expected one indexed FT TP peer {tp_rank} in DP {self.topology.dp_rank}, got {len(peers)}"
+                )
+            key, path = peers[0][name]
         if slices is not None:
             return self._read_tensor(key, path, slices)
-        if key in self._overlay:
-            return tuple(self._overlay[key].shape)
-        with safe_open(str(path), framework="pt", device="cpu") as shard:
-            view = shard.get_slice(key)
-            return tuple(view.get_shape())
+        return self._shape(key, path)
 
     @torch.no_grad()
     def load_parameters(

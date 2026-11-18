@@ -164,10 +164,11 @@ def load_dense_ft_checkpoint(model, checkpoint):
 
     embedding = model.embed_tokens
     head = model.lm_head
-    if (embedding.tp_size, embedding.tp_rank) != (tp, rank) or (
-        head.tp_size,
-        head.tp_rank,
-    ) != (tp, rank):
+    if any(
+        (leaf.tp_size, leaf.tp_rank) != (tp, rank)
+        for leaf in (embedding, head)
+        if leaf is not None
+    ):
         raise ValueError("FT import requires matching embedding/head TP topology")
 
     def embedding_rows(_):
@@ -281,15 +282,23 @@ def load_dense_ft_checkpoint(model, checkpoint):
         ]
         return (merged[0] if projection == "down" else torch.cat(merged, dim=0),)
 
-    bindings = [
-        RuntimeTensorBinding(
-            ("global.embedding",), "embed_tokens.weight", embedding_rows
-        ),
-        RuntimeTensorBinding(("global.lm_head",), "lm_head.weight", head_rows),
-        RuntimeTensorBinding(
-            ("global.final_layernorm.gamma",), "norm.weight", _identity
-        ),
-    ]
+    bindings = []
+    if embedding is not None:
+        bindings.append(
+            RuntimeTensorBinding(
+                ("global.embedding",), "embed_tokens.weight", embedding_rows
+            )
+        )
+    if head is not None:
+        bindings.append(
+            RuntimeTensorBinding(("global.lm_head",), "lm_head.weight", head_rows)
+        )
+    if model.norm is not None:
+        bindings.append(
+            RuntimeTensorBinding(
+                ("global.final_layernorm.gamma",), "norm.weight", _identity
+            )
+        )
     validators = {}
     if "global.final_layernorm.beta" in checkpoint.entries:
 
@@ -302,8 +311,13 @@ def load_dense_ft_checkpoint(model, checkpoint):
                 raise ValueError("Dense RMSNorm FT final beta must be exactly zero")
 
         validators["global.final_layernorm.beta"] = zero_final_beta
-    for index, layer in enumerate(model.layers):
-        src = f"layers.{index}."
+    layer_ids = (
+        model.layer_ids() if hasattr(model, "layer_ids") else range(len(model.layers))
+    )
+    if len(layer_ids) != len(model.layers):
+        raise ValueError("FT pipeline range disagrees with local decoder layers")
+    for index, (layer_id, layer) in enumerate(zip(layer_ids, model.layers)):
+        src = f"layers.{layer_id}."
         dst = f"layers.{index}."
         for old, target, convert in (
             ("pre_layernorm_weights.gamma", "input_layernorm.weight", _identity),
@@ -393,4 +407,5 @@ def load_dense_ft_checkpoint(model, checkpoint):
                 )
             )
     checkpoint.load_parameters(model, tuple(bindings), validators)
-    head._explicit_checkpoint_loaded = True
+    if head is not None:
+        head._explicit_checkpoint_loaded = True
