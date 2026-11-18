@@ -38,6 +38,7 @@ class KimiKdaCheckpointTest(unittest.TestCase):
             )
             owner = loader.load()
             self.assertEqual(loader.loaded_method, method)
+        owner.to(dtype=torch.bfloat16)
         qkv, conv = [], []
         for name in ("q", "k", "v"):
             qkv.append(values[name + "_proj.weight"].chunk(n)[rank])
@@ -62,6 +63,9 @@ class KimiKdaCheckpointTest(unittest.TestCase):
             shapes[p + "_a_proj.weight"] = (4, 8)
             shapes[p + "_b_proj.weight"] = (8, 4)
         values = {k: torch.randn(shape, generator=g).bfloat16() for k, shape in shapes.items()}
+        # Values between adjacent BF16 numbers expose a round-then-promote bug.
+        for key in ("A_log", "dt_bias"):
+            values[key] = torch.randn(shapes[key], generator=g)
         for r in (0, 1):
             self.check(values, dict(cfg, attn_tp_size=2, attn_tp_rank=r), NewLoaderLoadMethod.SCRATCH)
         self.check(values, cfg, NewLoaderLoadMethod.FASTSAFETENSORS)

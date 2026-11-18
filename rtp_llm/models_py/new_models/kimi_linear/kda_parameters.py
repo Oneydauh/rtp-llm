@@ -216,6 +216,18 @@ class KimiKDAParameters(RtpModule):
         start = self.qkv_proj.tp_rank * self.local_num_heads
         return view.narrow(0, start, self.local_num_heads).reshape(-1).contiguous()
 
+    def _apply(self, fn, recurse=True):
+        # A_log and dt_bias are FP32 KDA recurrence/gate parameters, even when
+        # checkpoint projections move to BF16. Do not round then re-promote.
+        scalars = {name: getattr(self, name).detach() for name in ("A_log", "dt_bias")}
+        result = super()._apply(fn, recurse)
+        for name, source in scalars.items():
+            target = getattr(self, name)
+            if target.dtype != torch.float32:
+                with torch.no_grad():
+                    target.data = source.to(device=target.device, dtype=torch.float32)
+        return result
+
     def _split_a_log(self, tensor: torch.Tensor) -> torch.Tensor:
         tensor = tensor.reshape(-1)
         global_heads = self.local_num_heads * self.qkv_proj.tp_size
