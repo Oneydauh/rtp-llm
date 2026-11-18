@@ -38,6 +38,7 @@ from rtp_llm.models_py.module_base import (
 )
 from rtp_llm.models_py.read_spec import LoadedCheckpointTensor, ReadSpec
 from rtp_llm.models_py.registry import get_model_class, list_models
+from rtp_llm.models_py.v41_fst_memory import V41FstMemoryTrace
 
 logger = logging.getLogger(__name__)
 _CUSTOM_WEIGHT_PREFIX = "__custom__."
@@ -2313,6 +2314,13 @@ class NewModelLoader:
                 else getattr(self.model_config, "num_layers", None)
             ),
         )
+        memory_trace = None
+        if ft_checkpoint is None:
+            memory_trace = V41FstMemoryTrace.for_load(
+                self._model_type(), requested_method.value, self.load_config
+            )
+        if memory_trace is not None:
+            memory_trace.record("before_model")
         with torch.device("cpu"):
             model = self._create_checkpoint_model(ft_checkpoint)
         if expert_filter is not None:
@@ -2549,6 +2557,8 @@ class NewModelLoader:
                 close_weights = getattr(weights, "close", None)
                 if callable(close_weights):
                     close_weights()
+            if memory_trace is not None:
+                memory_trace.record("after_reader_close")
             self._validate_loaded_weights(model)
         logger.info(
             "Streamed checkpoint tensors with %s in %.2fs",
@@ -2576,5 +2586,7 @@ class NewModelLoader:
         self._run_post_load_hooks(model)
         validate_borrowed_parameters(model)
         model.eval()
+        if memory_trace is not None:
+            memory_trace.record("after_post_load")
         self._selected_load_method = method
         return model

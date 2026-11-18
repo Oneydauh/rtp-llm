@@ -4,6 +4,13 @@ load("//rtp_llm/models_py/test:defs.bzl", "models_py_test")
 load(":checkpoint_service_tests.bzl", "checkpoint_service_tests")
 
 py_test(
+    name = "v41_fst_memory_test",
+    srcs = ["v41_fst_memory_test.py"],
+    env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "ROCR_VISIBLE_DEVICES": ""},
+    deps = [":new_loader_core"],
+)
+
+py_test(
     name = "qwen4_media_embedding_test",
     srcs = ["new_models/qwen4_exp/test/test_media_embedding.py"],
     main = "new_models/qwen4_exp/test/test_media_embedding.py",
@@ -158,6 +165,7 @@ py_library(
         "read_spec.py",
         "registry.py",
         "runtime_weight_update.py",
+        "v41_fst_memory.py",
         "weight_mapper.py",
     ],
     deps = [
