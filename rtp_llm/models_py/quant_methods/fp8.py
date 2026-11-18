@@ -1493,7 +1493,11 @@ class Fp8BlockLinearMethod(Fp8BlockOnlineLinearMethod):
         if self._runtime_backend == _CUDA_DEEP_GEMM and is_deep_gemm_e8m0_used(
             weight.device
         ):
-            weight, scale = _resolve_requant_weight_ue8m0()(weight, scale)
+            from rtp_llm.models_py.quant_methods.block_fp8_ft import block_ft_runtime_pair
+
+            weight, scale = block_ft_runtime_pair(
+                layer, weight, scale, "weight_scale_inv", _resolve_requant_weight_ue8m0()
+            )
         del layer.weight
         layer.register_parameter(
             "weight", nn.Parameter(weight.contiguous(), requires_grad=False)
@@ -1501,5 +1505,6 @@ class Fp8BlockLinearMethod(Fp8BlockOnlineLinearMethod):
         del layer.weight_scale_inv
         layer.register_parameter(
             "weight_scale",
-            nn.Parameter(scale.contiguous(), requires_grad=False),
+            # DeepGEMM packed scales are MN-major/TMA-aligned.
+            nn.Parameter(scale if scale.dtype == torch.int32 else scale.contiguous(), requires_grad=False),
         )

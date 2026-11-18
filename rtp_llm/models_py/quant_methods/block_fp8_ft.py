@@ -1,0 +1,148 @@
+"""Decode RTP's legacy block-FP8 FT snapshots into rank-local owner tensors.
+
+PerBlockFp8Weight._postprocess uses two distinct serializations. Unpacked dense
+matrices were *reshaped*, not transposed; expert matrices retain three axes.
+DeepGEMM snapshots already contain requantized weights plus four exponent bytes
+per int32, with one identical scale row for each row in the 128-row block.
+Decoding those bytes is lossless. Never dequantize/requantize such weights.
+"""
+
+import torch
+
+from rtp_llm.models_py.ft_checkpoint import RuntimeTensorBinding
+
+
+def _blocks(size, block=128):
+    return (size + block - 1) // block
+
+
+def block_ft_weight(raw, logical_shape, packed, *, rocm_shuffle=False, gate_up=False):
+    """Undo only transforms used by the declared producer."""
+    shape = tuple(logical_shape)
+    if len(shape) not in (2, 3):
+        raise ValueError("Expected a dense or expert block-FP8 matrix")
+    expected = (shape[1], shape[0]) if not packed and len(shape) == 2 else shape
+    if tuple(raw.shape) != expected:
+        raise ValueError(f"FT block-FP8 weight shape {tuple(raw.shape)} != {expected}")
+    if raw.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        raise TypeError("FT block-FP8 weight must have an explicit E4M3 dtype")
+    if packed and raw.dtype != torch.float8_e4m3fn:
+        raise TypeError("Packed UE8M0 scales require E4M3FN DeepGEMM weights")
+    value = raw.contiguous().reshape(shape)
+    if rocm_shuffle:
+        if len(shape) != 3 or packed:
+            raise ValueError("Invalid AITER expert serializer for block-FP8 tensor")
+        # Inverse of aiter.ops.shuffle.shuffle_weight(layout=(16,16)) for FP8.
+        e, n, k = shape
+        if n % 16 or k % 32:
+            raise ValueError("Invalid AITER shuffled expert extents")
+        value = (
+            value.view(torch.uint8)
+            .reshape(e, n // 16, k // 32, 2, 16, 16)
+            .permute(0, 1, 4, 2, 3, 5)
+            .contiguous()
+            .reshape(shape)
+            .view(raw.dtype)
+        )
+        if gate_up:
+            value = swap_halves(value)
+    if value.dtype == torch.float8_e4m3fnuz:
+        # Old ROCm producer doubled the scales and retained the FP8 bits
+        # (except -0 -> +0). FNUZ 0x80 is a NaN, not FN negative zero.
+        if (value.view(torch.uint8) == 128).any():
+            raise ValueError("Invalid NaN in ROCm FT block-FP8 weight")
+        value = value.view(torch.float8_e4m3fn)
+    return value
+
+
+def swap_halves(value):
+    if value.shape[-2] % 2:
+        raise ValueError("Cannot split the gate and up projections equally")
+    # torch.cat may not implement FP8; the bytes and element layout are identical.
+    if value.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        return swap_halves(value.view(torch.uint8)).view(value.dtype)
+    first, second = value.chunk(2, dim=-2)
+    return torch.cat((second, first), dim=-2)
+
+
+def block_ft_scale(raw, logical_shape, *, source_dtype, swap_gate_up=False):
+    shape = tuple(logical_shape)
+    *batch, n, k = shape
+    nb, kb = _blocks(n), _blocks(k)
+    if raw.dtype == torch.int32:
+        if source_dtype != torch.float8_e4m3fn or swap_gate_up:
+            raise ValueError("Invalid producer for packed UE8M0 scale")
+        expected = (*batch, n, _blocks(kb, 4))
+        if tuple(raw.shape) != expected:
+            raise ValueError(f"Packed UE8M0 scale shape {tuple(raw.shape)} != {expected}")
+        # Inspect replicated rows without materializing another copy of every
+        # byte in the expert tensor. Last N block may be only partially filled.
+        complete, tail = divmod(n, 128)
+        if complete:
+            groups = raw[..., :complete * 128, :].unflatten(-2, (complete, 128))
+            if not torch.equal(groups, groups[..., :1, :].expand_as(groups)):
+                raise ValueError("Packed UE8M0 contains inconsistent replicated rows")
+        if tail:
+            end = raw[..., complete * 128:, :]
+            if not torch.equal(end, end[..., :1, :].expand_as(end)):
+                raise ValueError("Packed UE8M0 contains inconsistent tail rows")
+        packed = raw[..., ::128, :]
+        shifts = torch.arange(0, 32, 8, device=raw.device, dtype=torch.int32)
+        exps = ((packed.unsqueeze(-1) >> shifts) & 255).flatten(-2)[..., :kb]
+        if (exps == 255).any():
+            raise ValueError("Invalid UE8M0 NaN exponent in FT scale")
+        return torch.exp2((exps - 127).float()).contiguous()
+    if raw.dtype != torch.float32:
+        raise TypeError("FT block scale must have dtype float32 or packed int32")
+    expected = (kb, nb) if len(shape) == 2 else (*batch, nb, kb)
+    if tuple(raw.shape) != expected:
+        raise ValueError(f"FT block scale shape {tuple(raw.shape)} != {expected}")
+    value = raw.contiguous().reshape(*batch, nb, kb)
+    if swap_gate_up:
+        value = swap_halves(value)
+    if source_dtype == torch.float8_e4m3fnuz:
+        value = value * 0.5
+    if not torch.isfinite(value).all() or (value <= 0).any():
+        raise ValueError("Block scales must be positive and finite")
+    return value
+
+
+def block_ft_runtime_pair(layer, weight, scale, scale_key, requant):
+    """Keep already-quantized FT payload unchanged when selecting DeepGEMM.
+
+    Register the packed-scale provenance at install time, not on attempted
+    validation. The checkpoint canonical scale can also serve other backends.
+    """
+    if scale_key not in getattr(layer, "_packed_block_fp8_ft", ()):
+        return requant(weight, scale)
+    from rtp_llm.models_py.kernels.cuda.fp8_kernel.fp8_kernel import (
+        _transform_scale_ue8m0,
+    )
+
+    return weight, _transform_scale_ue8m0(scale, weight.shape[-2])
+
+
+def block_ft_bindings(layer, source, scale_source, target, checkpoint):
+    """Import a dense rank-local linear matrix while preserving Parameter IDs."""
+    peer = checkpoint.topology.tp_rank
+    shape = tuple(layer.weight.shape)
+    param = layer.weight_scale_inv
+    if tuple(param.shape) != (_blocks(shape[0]), _blocks(shape[1])):
+        raise ValueError("FT adapter requires an unprocessed 128x128 FP8 owner")
+    def dtype(name):
+        return checkpoint.read_rank_slice(name, peer, (slice(0, 1),) * 2).dtype
+    source_type, scale_type = dtype(source), dtype(scale_source)
+    packed = scale_type == torch.int32
+    def entry(name):
+        return lambda: (checkpoint.read(name),)
+    def decode_scale(values):
+        return block_ft_scale(values[0], shape, source_dtype=source_type)
+    def install_scale(values):
+        param.copy_(decode_scale(values))
+        layer._packed_block_fp8_ft = {"weight_scale_inv"} if packed else set()
+    return (
+        RuntimeTensorBinding((source,), target + ".weight",
+            lambda v: block_ft_weight(v[0], shape, packed), entry(source)),
+        RuntimeTensorBinding((scale_source,), target + ".weight_scale_inv",
+            decode_scale, entry(scale_source), install_scale),
+    )

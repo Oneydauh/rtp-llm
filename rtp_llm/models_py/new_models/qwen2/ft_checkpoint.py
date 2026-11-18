@@ -29,11 +29,12 @@ def _bias(values):
 
 def load_dense_ft_checkpoint(model, checkpoint):
     from rtp_llm.models_py.quant_methods.fp8 import (
+        Fp8BlockLinearMethod,
         Fp8LinearMethod,
         Fp8PerChannelLinearMethod,
     )
 
-    fp8_methods = (Fp8LinearMethod, Fp8PerChannelLinearMethod)
+    fp8_methods = (Fp8LinearMethod, Fp8PerChannelLinearMethod, Fp8BlockLinearMethod)
 
     if type(model).__name__ not in ("Qwen2ForCausalLM", "LlamaForCausalLM"):
         raise ValueError("FT adapter is only validated for dense Qwen2/Llama")
@@ -95,6 +96,10 @@ def load_dense_ft_checkpoint(model, checkpoint):
         )
 
         scale = source.removesuffix(".kernel") + ".weight_only_quant_scale"
+        if isinstance(linear.quant_method, Fp8BlockLinearMethod):
+            from rtp_llm.models_py.quant_methods.block_fp8_ft import block_ft_bindings
+
+            return block_ft_bindings(linear, source, scale, destination, checkpoint)
         if isinstance(linear.quant_method, Fp8PerChannelLinearMethod):
             state = PerChannelFP8FTProjection(
                 linear, checkpoint, source, scale, projection

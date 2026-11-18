@@ -6,3 +6,12 @@ py_test(
         "//rtp_llm:torch",
     ],
 )
+
+py_test(
+    name = "test_block_fp8_ft",
+    srcs = ["test_block_fp8_ft.py"],
+    deps = [
+        "//rtp_llm/models_py:new_weight_loader",
+        "//rtp_llm:torch",
+    ],
+)
