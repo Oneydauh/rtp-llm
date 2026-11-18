@@ -164,7 +164,7 @@ class BertLayer(RtpModule):
         )
         attention = self.attn_norm(self.attn_output(context), hidden)
         return self.output_norm(
-            self.output(F.gelu(self.intermediate(attention))), attention
+            self.output(self.intermediate.forward_with_bias_gelu(attention)), attention
         )
 
 

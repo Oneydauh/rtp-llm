@@ -335,14 +335,31 @@ def _run_rocm_fp8_ptpc_executor(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     output_size: int,
+    bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if executor is None:
         raise RuntimeError("ROCm FP8 PTPC executor was not initialized")
     if runtime_backend == _ROCM_AITER_PTPC:
         return executor(input_2d, weight, weight_scale, output_size)
     if runtime_backend == _ROCM_HIPBLASLT_PTPC:
-        return executor(input_2d)
+        return executor.forward_with_owned_bias(input_2d, bias)
     raise RuntimeError(f"Unsupported ROCm FP8 PTPC backend {runtime_backend!r}")
+
+
+class _RocmPtpcEpilogueMixin:
+    @property
+    def supports_fused_bias(self) -> bool:
+        return getattr(self, "_runtime_backend", None) == _ROCM_HIPBLASLT_PTPC
+
+    def apply_with_bias_gelu(self, layer, x, bias=None):
+        if not self.supports_fused_bias:
+            return torch.nn.functional.gelu(self.apply(layer, x, bias))
+        executor = getattr(self, "_rocm_executor", None)
+        if executor is None:
+            raise RuntimeError("ROCm FP8 PTPC executor was not initialized")
+        input_2d = x.reshape(-1, x.shape[-1]).contiguous()
+        output = executor.forward_with_owned_bias(input_2d, bias, use_gelu=True)
+        return output.view(*x.shape[:-1], layer.output_size)
 
 
 def _apply_rocm_fp8_block(
@@ -860,7 +877,7 @@ class Fp8OnlineLinearMethod(QuantizeMethodBase):
 
 
 @register_quant_method("fp8_per_channel_online")
-class Fp8PerChannelOnlineLinearMethod(QuantizeMethodBase):
+class Fp8PerChannelOnlineLinearMethod(_RocmPtpcEpilogueMixin, QuantizeMethodBase):
     """Online FP8 per-channel quantization for the new loader.
 
     Loads BF16/FP16 weights from ckpt, quantizes to float8_e4m3fn at load time
@@ -1019,8 +1036,9 @@ class Fp8PerChannelOnlineLinearMethod(QuantizeMethodBase):
                 layer.weight,
                 layer.weight_scale,
                 layer.output_size,
+                bias=bias,
             )
-            if bias is not None:
+            if bias is not None and self._runtime_backend != _ROCM_HIPBLASLT_PTPC:
                 output = output + bias.to(output.dtype)
         else:
             # Per-token activation quant: [M, K] -> fp8 + [M, 1] fp32.
@@ -1044,7 +1062,7 @@ class Fp8PerChannelOnlineLinearMethod(QuantizeMethodBase):
     "FP8_PER_CHANNEL_COMPRESSED",
     "FP8_PER_CHANNEL_QUARK",
 )
-class Fp8PerChannelLinearMethod(QuantizeMethodBase):
+class Fp8PerChannelLinearMethod(_RocmPtpcEpilogueMixin, QuantizeMethodBase):
     """Already-quantized FP8 per-channel ckpt loader (compressed-tensors / Quark).
 
     ckpt provides:
@@ -1170,8 +1188,9 @@ class Fp8PerChannelLinearMethod(QuantizeMethodBase):
                 layer.weight,
                 layer.weight_scale,
                 layer.output_size,
+                bias=bias,
             )
-            if bias is not None:
+            if bias is not None and self._runtime_backend != _ROCM_HIPBLASLT_PTPC:
                 output = output + bias.to(output.dtype)
         else:
             qinput, x_scale = _resolve_per_token_quant()(input_2d)

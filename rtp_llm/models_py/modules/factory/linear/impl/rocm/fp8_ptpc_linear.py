@@ -378,14 +378,22 @@ class RocmFp8PTPCLinearWithSwizzle(RocmFp8PTPCLinearBase):
         return self._load_solution_cache().get((m, k, n, epilogue), -1)
 
     def _forward_hipb(
-        self, input: torch.Tensor, add_bias: bool, use_gelu: bool = False
+        self,
+        input: torch.Tensor,
+        add_bias: bool,
+        use_gelu: bool = False,
+        bias_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         self.init_hipblas()
         input_fp8, input_scales, input_bf16, original_dtype = self._quantize_input(
             input
         )
-        bias = self.bias if add_bias else None
-        epilogue = self._epilogue_name(add_bias, self.bias is not None, use_gelu)
+        bias = (
+            (bias_override if bias_override is not None else self.bias)
+            if add_bias
+            else None
+        )
+        epilogue = self._epilogue_name(add_bias, bias is not None, use_gelu)
         solution_index = self._get_solution_index(
             input_fp8.shape[0], self.hidden_size, self.output_size, epilogue
         )
@@ -403,6 +411,19 @@ class RocmFp8PTPCLinearWithSwizzle(RocmFp8PTPCLinearBase):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return self._forward_hipb(input, add_bias=True)
+
+    def forward_with_owned_bias(
+        self, input: torch.Tensor, bias: Optional[torch.Tensor], use_gelu: bool = False
+    ) -> torch.Tensor:
+        """Keep NewLoader bias in the GEMM epilogue without caching its storage."""
+        output = self._forward_hipb(
+            input,
+            add_bias=bias is not None,
+            use_gelu=use_gelu and bias is not None,
+            bias_override=bias,
+        )
+        # Match the legacy bias-free GELU contract, not an unsupported epilogue.
+        return F.gelu(output) if use_gelu and bias is None else output
 
     def forward_with_bias_gelu(self, input: torch.Tensor) -> torch.Tensor:
         if self.bias is None:

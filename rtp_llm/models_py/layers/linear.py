@@ -226,6 +226,17 @@ class LinearBase(RtpModule):
 
 class ColumnParallelLinear(LinearBase):
 
+    def forward_with_bias_gelu(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 0 or x.shape[-1] != self.input_size:
+            raise ValueError(
+                f"{self.prefix or type(self).__name__} expected input width "
+                f"{self.input_size}, got {tuple(x.shape)}"
+            )
+        apply_gelu = getattr(self.quant_method, "apply_with_bias_gelu", None)
+        if callable(apply_gelu):
+            return apply_gelu(self, x, self.matmul_bias)
+        return torch.nn.functional.gelu(self(x))
+
     shard_names: List[str] = []
 
     def prepare_lora_factors(self, name, a, b):
@@ -420,6 +431,12 @@ class RowParallelLinear(LinearBase):
     @property
     def matmul_bias(self) -> Optional[torch.Tensor]:
         # Partial products must not include the replicated output bias.
+        # With one rank there is no reduction; preserve the backend's fused
+        # bias rounding (notably hipBLASLt PTPC BERT) when explicitly supported.
+        if self.tp_size == 1 and getattr(
+            self.quant_method, "supports_fused_bias", False
+        ):
+            return self.bias
         return None
 
     def prepare_lora_factors(self, name, a, b):
@@ -606,12 +623,13 @@ class RowParallelLinear(LinearBase):
                 f"{self.prefix or type(self).__name__} expected input width "
                 f"{self.input_size}, got {tuple(x.shape)}"
             )
-        output = self.quant_method.apply(self, x, self.matmul_bias)
+        matmul_bias = self.matmul_bias
+        output = self.quant_method.apply(self, x, matmul_bias)
         if self.reduce_output and self.tp_size > 1:
             from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
 
             output = all_reduce(output, group=Group.TP)
-        if self.bias is not None:
+        if self.bias is not None and matmul_bias is None:
             output = output + self.bias
         return output
 

@@ -29,6 +29,25 @@ py_test(
 )
 
 py_test(
+    name = "bert_ptpc_epilogue_test",
+    srcs = ["bert_ptpc_epilogue_test.py"],
+    deps = ["//rtp_llm/models_py:new_weight_loader"],
+    env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1"},
+)
+
+py_test(
+    name = "bert_ptpc_epilogue_gpu_test",
+    srcs = ["bert_ptpc_epilogue_gpu_test.py"],
+    deps = ["//rtp_llm/models_py:new_weight_loader", "//rtp_llm/models_py/standalone:py_standalone_testlib"],
+    tags = ["rocm"],
+    exec_properties = {"gpu": "MI308X-ROCM7", "gpu_count": "1"},
+    target_compatible_with = select({
+        "@//:using_rocm": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
+py_test(
     name = "test_fp8_cpu_load",
     srcs = ["test_fp8_cpu_load.py"],
     env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1"},
