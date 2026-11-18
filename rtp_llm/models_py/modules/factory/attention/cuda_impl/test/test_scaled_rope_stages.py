@@ -65,7 +65,8 @@ class ScaledRopeStagesTest(unittest.TestCase):
         x.dtype = get_typemeta(torch.empty(0, dtype=dtype))
         x.sequence_lengths = torch.tensor(lengths, dtype=torch.int32).pin_memory()
         x.sequence_lengths_plus_1_device = x.sequence_lengths.cuda() + 1
-        x.combo_position_ids = positions
+        if positions is not None:
+            x.combo_position_ids = positions
         x.kv_cache_kernel_block_id = table.cpu().pin_memory()
         x.kv_cache_kernel_block_id_device = table
         return x
