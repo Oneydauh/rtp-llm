@@ -11,7 +11,6 @@ from rtp_llm.models_py.new_models.qwen3.language import (
     _extract_config_values,
     _validate_supported_parallelism,
 )
-from rtp_llm.ops.compute_ops import PyModelOutputs
 
 from .parameters import install_glm4_parameters
 
@@ -121,6 +120,8 @@ class GqaMoeForCausalLM(Qwen3ForCausalLM):
                 self.capture_aux_hidden(global_id, hidden, residual)
         if self.norm is None:
             materialized = hidden + residual
+            from rtp_llm.ops.compute_ops import PyModelOutputs
+
             out = PyModelOutputs(materialized)
             out.pp_intermediates = {"hidden_states": materialized}
             return out

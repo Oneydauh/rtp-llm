@@ -1,6 +1,8 @@
 """Qwen2 draft model, loading directly into the inference module tree."""
 
-from typing import Any
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -10,7 +12,8 @@ from rtp_llm.models_py.new_models.mtp import MTPBlock
 from rtp_llm.models_py.new_models.qwen2.language import Qwen2ForCausalLM
 from rtp_llm.models_py.read_spec import unwrap_checkpoint_tensor
 from rtp_llm.models_py.weight_mapper import WeightsMapper
-from rtp_llm.ops.compute_ops import PyModelInputs, PyModelOutputs
+if TYPE_CHECKING:
+    from rtp_llm.ops.compute_ops import PyModelInputs
 
 
 class Qwen2MTPForCausalLM(Qwen2ForCausalLM):
@@ -135,4 +138,6 @@ class Qwen2MTPForCausalLM(Qwen2ForCausalLM):
                 select_fmha_impl_for_layer(fmha_impl, self.kv_cache, i),
                 kv_cache=self.kv_cache.get_layer_cache(i) if self.kv_cache else None,
             )
+        from rtp_llm.ops.compute_ops import PyModelOutputs
+
         return PyModelOutputs(self.norm(hidden_states))

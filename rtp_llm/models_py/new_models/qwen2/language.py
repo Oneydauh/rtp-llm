@@ -1,4 +1,6 @@
-from typing import Any, Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -14,7 +16,8 @@ from rtp_llm.models_py.new_models.model_base import required_config_value
 from rtp_llm.models_py.new_models.qwen2.trt_checkpoint import Qwen2CheckpointMapper
 from rtp_llm.models_py.new_models.qwen3.language import Qwen3ForCausalLM
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
-from rtp_llm.ops.compute_ops import LayerKVCache
+if TYPE_CHECKING:
+    from rtp_llm.ops.compute_ops import LayerKVCache
 
 
 class Qwen2MLP(RtpModule):

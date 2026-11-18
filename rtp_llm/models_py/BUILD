@@ -484,6 +484,18 @@ py_test(
 )
 
 py_test(
+    name = "qwen3_dspark_checkpoint_cuda_graph_test",
+    srcs = [
+        "new_models/qwen3_dspark/checkpoint_cuda_test.py",
+        "new_models/qwen3_dspark/checkpoint_test.py",
+    ],
+    main = "new_models/qwen3_dspark/checkpoint_cuda_test.py",
+    deps = [":new_weight_loader"],
+    tags = ["L20_CU13"],
+    exec_properties = {"gpu": "L20_CU13", "gpu_count": "1"},
+)
+
+py_test(
     name = "qwen3_dspark_checkpoint_format_test",
     srcs = [
         "new_models/qwen3_dspark_format_test.py",
@@ -508,7 +520,7 @@ py_test(
         "serving_route_checkpoint_test.py",
     ],
     main = "qwen3_dspark_native_service_test.py",
-    deps = [":new_weight_loader", "//rtp_llm:async_model", "//rtp_llm:models", "//rtp_llm:transformers"],
+    deps = [":new_weight_loader", "//rtp_llm:async_model", "//rtp_llm:model_factory", "//rtp_llm:models", "//rtp_llm:transformers"],
 )
 
 py_test(
@@ -911,7 +923,7 @@ exports_files(["modules/factory/sitecustomize.py"])
 
 exports_files(
     [
-        "new_models/deepseek_v4/platform.py",
+        "new_models/deepseek_v4/ppu_platform.py",
         "modules/dsv4/ppu/resources.py",
         "modules/dsv4/ppu/moe/ppu_ep_moe.py",
         "modules/dsv4/ppu/metadata/cache.py",

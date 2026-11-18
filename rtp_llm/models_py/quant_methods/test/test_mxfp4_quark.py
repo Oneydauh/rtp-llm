@@ -182,17 +182,8 @@ class MXFp4CheckpointTest(unittest.TestCase):
         layer.validate_weights_loaded()
 
     def test_real_qwen3_model_tree_checkpoint_dispatch(self):
-        from rtp_llm.models_py.modules.base import SelectTopk
-        from rtp_llm.ops import compute_ops
-
-        if SelectTopk.__module__.endswith(".cuda.select_topk") and not hasattr(
-            compute_ops, "SelectTopkOp"
-        ):
-            self.skipTest(
-                "CPU model construction selected CUDA SelectTopk, but this ROCm "
-                "native artifact does not export SelectTopkOp; full model loading "
-                "remains unverified (no fake router substituted)"
-            )
+        # This test loads the CPU parameter owner. The router is only
+        # constructed on an accelerator; do not import it as a precondition.
         config = ModelConfig()
         config.model_type = "qwen_3_moe"
         config.num_layers = 1

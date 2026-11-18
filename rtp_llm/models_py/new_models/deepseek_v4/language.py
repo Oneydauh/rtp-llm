@@ -42,7 +42,7 @@ class OwnedV4ModelMixin:
 
     @classmethod
     def resolve_runtime_class(cls, model_config):
-        from .platform import is_ppu_flash
+        from .ppu_platform import is_ppu_flash
 
         if not is_ppu_flash(model_config):
             return cls

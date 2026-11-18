@@ -146,7 +146,7 @@ def _require_n_shared_experts(config_json: dict) -> int:
 
 
 def _is_ppu_flash(config):
-    from rtp_llm.models_py.new_models.deepseek_v4.platform import is_ppu_flash
+    from rtp_llm.models_py.new_models.deepseek_v4.ppu_platform import is_ppu_flash
 
     return is_ppu_flash(config)
 

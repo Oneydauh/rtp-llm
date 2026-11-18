@@ -1,6 +1,8 @@
 """Actual CPU checkpoint I/O at the production publication boundary."""
 
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -112,6 +114,34 @@ def service(path, method, model_type="_service_direct_leaf"):
 
 
 class DirectServingBoundaryTest(unittest.TestCase):
+    def test_direct_loading_does_not_require_legacy_adapter_database_or_rpc(self):
+        # A warm process hides accidental dependencies via sys.modules. Use
+        # the same runfiles as the parent and real readers in a fresh process.
+        code = """
+import sys
+import unittest
+
+class ImportGuard:
+    def find_spec(self, name, path=None, target=None):
+        if name in {
+            "rtp_llm.lora.lora_file",
+            "rtp_llm.model_factory",
+            "rtp_llm.server.backend_rpc_server_visitor",
+        }:
+            raise AssertionError(f"direct checkpoint loading imported {name}")
+        return None
+
+sys.meta_path.insert(0, ImportGuard())
+from rtp_llm.models_py.serving_route_checkpoint_test import DirectServingBoundaryTest
+result = unittest.TextTestRunner().run(unittest.TestSuite([
+    DirectServingBoundaryTest("test_exact_backend_and_publication_preserve_identity"),
+]))
+sys.exit(0 if result.wasSuccessful() else 1)
+"""
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(map(os.path.abspath, sys.path)))
+        with tempfile.TemporaryDirectory() as cwd:
+            subprocess.run([sys.executable, "-c", code], env=env, cwd=cwd, check=True)
+
     def test_extension_projection_retains_independent_dtype_and_pair(self):
         from rtp_llm.model_loader.weight_module import CustomAtomicWeight
         from rtp_llm.models.downstream_modules.custom_module import (

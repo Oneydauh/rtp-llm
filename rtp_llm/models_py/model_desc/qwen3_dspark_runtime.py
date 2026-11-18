@@ -1,17 +1,16 @@
 """Qwen3 DSpark backbone on the shared DSpark proposer contract."""
 
-from typing import Any
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from rtp_llm.device.device_type import is_hip
 from rtp_llm.models_py.model_desc.block_map import select_attention_inputs_for_layer
-from rtp_llm.models_py.modules.factory.attention.common import (
-    create_write_cache_store_impl,
-)
 from rtp_llm.models_py.speculative.dspark_proposer_mixin import DSparkProposerMixin
-from rtp_llm.ops import check_rope_cache, get_rope_cache_once
-from rtp_llm.ops.compute_ops import PyModelInputs, PyModelOutputs
+if TYPE_CHECKING:
+    from rtp_llm.ops.compute_ops import PyModelInputs, PyModelOutputs
 
 
 class _RopePositions:
@@ -130,6 +129,8 @@ class _TorchMhaRotaryEmbeddingOp:
     def __init__(self, attn_config) -> None:
         self.rope_config = attn_config.rope_config
         self.rope_dim = self.rope_config.dim
+        from rtp_llm.ops import check_rope_cache, get_rope_cache_once
+
         rope_cache = get_rope_cache_once(
             self.rope_config,
             attn_config.max_seq_len + attn_config.gen_num_per_cycle + 1,
@@ -249,6 +250,8 @@ class Qwen3DSparkRuntime(DSparkProposerMixin):
                 cache[pages, 0, :, slots, :] = key.to(cache.dtype)
                 cache[pages, 1, :, slots, :] = value.to(cache.dtype)
 
+        from rtp_llm.models_py.modules.factory.attention.common import create_write_cache_store_impl
+
         writer = create_write_cache_store_impl(self.dspark_attention_inputs(inputs))
         if writer is not None:
             for layer_idx in range(self.layer_num):
@@ -336,6 +339,8 @@ class Qwen3DSparkRuntime(DSparkProposerMixin):
         del fmha_impl
         device = self._forward_device()
         if self.kv_cache is None:
+            from rtp_llm.ops.compute_ops import PyModelOutputs
+
             return PyModelOutputs(
                 torch.empty(
                     (0, self.config.hidden_size),

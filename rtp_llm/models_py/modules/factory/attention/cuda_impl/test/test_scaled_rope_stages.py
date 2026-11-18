@@ -97,9 +97,18 @@ class ScaledRopeStagesTest(unittest.TestCase):
         empty = torch.empty(0, dtype=torch.int32, device="cuda")
         params = FlashInferMlaAttnParams()
         params.fill_params_mha_device(history, empty, counts, table, self.PAGE, False)
-        # Position IDs need not equal physical cache slots; use 0 and offsets
-        # as well as the usual contiguous positions to expose that confusion.
-        params.positions_d.copy_(positions)
+        # The device planner reserves token capacity from the page table but
+        # writes only the live token prefix (one Q token per request here).
+        # Keep its storage and shape intact: set_params shares these buffers.
+        active_positions = params.positions_d[: raw.shape[0]]
+        torch.testing.assert_close(active_positions, history)
+        torch.testing.assert_close(
+            params.batch_indice_d[: raw.shape[0]],
+            torch.arange(batch, device=history.device, dtype=history.dtype),
+        )
+        torch.testing.assert_close(params.kvlen_d, history + counts)
+        # Override just the logical RoPE positions, not the physical KV slots.
+        active_positions.copy_(positions)
         prefill = MhaRotaryEmbeddingOp(config)
         prefill.set_params(params)
         pq, pk, pv = prefill.forward(raw.clone().reshape(batch, -1))

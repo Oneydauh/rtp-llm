@@ -19,9 +19,8 @@ from tokenizers.models import WordLevel
 from transformers import PreTrainedTokenizerFast
 
 from rtp_llm.config.kv_cache_config import KVCacheConfig
-from rtp_llm.model_factory import ModelFactory
 from rtp_llm.model_factory_register import ModelDict
-from rtp_llm.models_py.model_loader import NewLoaderConfig, NewLoaderLoadMethod
+from rtp_llm.models_py.model_loader import NewLoaderConfig, NewLoaderLoadMethod, NewModelLoader
 from rtp_llm.models_py.new_models.cosyvoice_qwen.language import (
     CosyVoiceQwenForCausalLM,
 )
@@ -224,7 +223,24 @@ class MultimodalLanguageLoadTest(unittest.TestCase):
         self.assertEqual(model.embed_tokens.weight.shape[0], 151946)
         self.assertEqual(model.lm_head.weight.shape[0], 8)
 
+    def test_sharded_checkpoint_loads_without_decoder_runtime(self):
+        raw = dict(text_config(), model_type="cosyvoice_qwen", input_vocab_size=15)
+        weights = language_weights(15, 8)
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint(directory, raw, weights)
+            for method in ("scratch", "fastsafetensors"):
+                with self.subTest(method=method):
+                    loader = NewModelLoader(raw, load_config(method), model_path=directory)
+                    model = loader.load()
+                    self.assertEqual(loader.loaded_method.value, method)
+                    torch.testing.assert_close(model.embed_tokens.weight, weights["model.embed_tokens.weight"])
+                    torch.testing.assert_close(model.lm_head.weight, weights["lm_head.weight"])
+
+
+class MultimodalLanguageNativeBoundaryTest(unittest.TestCase):
     def check_checkpoint(self, method, tied, explicit_head):
+        from rtp_llm.model_factory import ModelFactory
+
         raw = dict(text_config(), model_type="cosyvoice_qwen", input_vocab_size=15)
         raw["tie_word_embeddings"] = tied
         weights = language_weights(15, 8)

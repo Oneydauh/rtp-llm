@@ -171,18 +171,41 @@ py_library(
     deps = [":numpy", ":safetensors", ":torch"],
 )
 
+# database and LoRA both read checkpoint files. Give the common primitives
+# an owner below both libraries so importing database never requires the SDK.
+_CHECKPOINT_FILE_SRCS = [
+    "utils/ckpt_file_info.py",
+    "utils/dump_config_utils.py",
+    "utils/meta_pickler.py",
+    "utils/time_util.py",
+]
+
+py_library(
+    name = "checkpoint_file_utils",
+    srcs = _CHECKPOINT_FILE_SRCS,
+    deps = [":prettytable", ":safetensors_torch"],
+)
+
+py_library(
+    name = "lora_checkpoint_file",
+    srcs = ["lora/lora_file.py"],
+    deps = [":checkpoint_file_utils", ":torch"],
+)
+
 py_library(
     name = "utils",
     srcs = glob([
         "utils/**/*.py",
-    ], exclude = _JIT_CACHE_SRCS + _JIT_CACHE_ENV_SRCS + [
+    ], exclude = _JIT_CACHE_SRCS + _JIT_CACHE_ENV_SRCS + _CHECKPOINT_FILE_SRCS + [
         "utils/warmup.py",
         "utils/test/*.py",
         "utils/test/**/*.py",
     ]),
     data = glob(["utils/moe_luts/*"]),
     deps = [
+        ":checkpoint_file_utils",
         ":jit_cache_env",
+        ":lora_checkpoint_file",
         ":torch",
         ":safetensors",
         #":decord",
@@ -499,6 +522,7 @@ py_library(
         ":config",
         ":structure",
         ":telemetry",
+        "//rtp_llm/server:request_headers",
     ],
     data = [
         "openai/renderers/qwen_agent/utils/qwen.tiktoken"
@@ -528,10 +552,24 @@ py_library(
 )
 
 py_library(
+    name = "model_factory",
+    srcs = ["model_factory.py"],
+    deps = [
+        ":async_model",
+        ":config",
+        ":device_detection",
+        ":model_factory_register",
+        ":models",
+        ":ops",
+        ":utils",
+        ":warmup",
+    ],
+)
+
+py_library(
     name = "sdk",
     srcs = [
         '__init__.py',
-        'model_factory.py',
         'start_server.py',
         'start_frontend_server.py',
         'start_backend_server.py',
@@ -542,6 +580,7 @@ py_library(
         "//rtp_llm/server:server",
         "//rtp_llm/distribute:distribute",
         "//rtp_llm/models_py/distributed:rank_layout",
+        ":model_factory",
         ":uvicorn",
         ":model_factory_register",
         ":fastapi",
@@ -607,7 +646,8 @@ py_library(
     name = "lora",
     srcs = glob([
         "lora/*.py",
-    ])
+    ], exclude = ["lora/lora_file.py"]),
+    deps = [":lora_checkpoint_file", ":utils"],
 )
 
 py_library(

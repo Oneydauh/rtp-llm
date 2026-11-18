@@ -6,6 +6,7 @@ py_test(
     deps = [
         "//rtp_llm:safetensors",
         "//rtp_llm:torch",
+        "//rtp_llm:transformers",
         "//rtp_llm/models_py:new_weight_loader",
     ],
 )
@@ -27,6 +28,7 @@ py_test(
     deps = [
         "//rtp_llm:safetensors",
         "//rtp_llm:torch",
+        "//rtp_llm:transformers",
         "//rtp_llm/models_py:new_weight_loader",
     ],
 )

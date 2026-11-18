@@ -88,7 +88,7 @@ py_test(
     data = [
         "//rtp_llm:models/deepseek_v4.py",
         "//rtp_llm/models_py:modules/dsv4/ppu/resources.py",
-        "//rtp_llm/models_py:new_models/deepseek_v4/platform.py",
+        "//rtp_llm/models_py:new_models/deepseek_v4/ppu_platform.py",
     ],
 )
 
@@ -472,6 +472,7 @@ py_test(
     name = "prefill_defaults_test",
     srcs = ["test_prefill_defaults.py"],
     main = "test_prefill_defaults.py",
+    env = {"GPU_COUNT": "0"},
     data = ["//rtp_llm/models_py:ppu_sources"],
     deps = ["//rtp_llm:torch"],
 )

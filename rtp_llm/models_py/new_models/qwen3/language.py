@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import logging
 import math
 from numbers import Real
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.nn as nn
@@ -30,12 +32,12 @@ from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 from rtp_llm.models_py.read_spec import unwrap_checkpoint_tensor
 from rtp_llm.models_py.weight_mapper import WeightsMapper
 from rtp_llm.ops import TaskType
-from rtp_llm.ops.compute_ops import (
-    LayerKVCache,
-    PyModelInputs,
-    PyModelOutputs,
-    rtp_llm_ops,
-)
+if TYPE_CHECKING:
+    from rtp_llm.ops.compute_ops import (
+        LayerKVCache,
+        PyModelInputs,
+        PyModelOutputs,
+    )
 
 
 class Qwen3MLP(RtpModule):
@@ -149,6 +151,8 @@ class Qwen3Attention(RtpModule):
         ):
             qkv = qkv.contiguous()
             m, n = qkv.shape
+            from rtp_llm.ops.compute_ops import rtp_llm_ops
+
             rtp_llm_ops.fused_qk_rmsnorm_v2(
                 qkv,
                 self.q_norm.weight.data,
@@ -763,6 +767,8 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
         if capture_aux:
             self.finish_aux_hidden_capture()
         if self.norm is None:
+            from rtp_llm.ops.compute_ops import PyModelOutputs
+
             outputs = PyModelOutputs(hidden_states)
             intermediates = {"hidden_states": hidden_states}
             if capture_aux and self._mtp_aux_capture_buffer is not None:

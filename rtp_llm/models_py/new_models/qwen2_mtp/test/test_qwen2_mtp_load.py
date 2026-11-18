@@ -71,7 +71,7 @@ def _load_tp_pair(rank, root):
         dist.destroy_process_group()
 
 
-class Qwen2MTPLoadTest(unittest.TestCase):
+class _MTPCheckpointFixture(unittest.TestCase):
     def setUp(self):
         self.config = types.SimpleNamespace(
             model_type="qwen_2-mtp",
@@ -158,6 +158,109 @@ class Qwen2MTPLoadTest(unittest.TestCase):
                 model_path=directory,
             ).load()
 
+
+class Qwen2MTPLoadTest(_MTPCheckpointFixture):
+    def test_actual_two_rank_checkpoint_transport(self):
+        with tempfile.TemporaryDirectory() as root:
+            save_file(self.weights(), os.path.join(root, "model.safetensors"))
+            torch.multiprocessing.start_processes(
+                _load_tp_pair, args=(root,), nprocs=2, join=True, start_method="fork"
+            )
+
+    def test_registry_and_real_safetensors_tp_rank_loading(self):
+        self.assertIs(get_model_class("qwen_2-mtp"), Qwen2MTPForCausalLM)
+        weights = self.weights()
+        for rank in (0, 1):
+            with self.subTest(rank=rank):
+                model = self.load(weights, rank=rank, tp=2)
+                torch.testing.assert_close(
+                    model.mtp_block.fc.weight, weights["model.layers.0.eh_proj.weight"]
+                )
+                torch.testing.assert_close(
+                    model.norm.weight, weights["model.layers.0.final_head.norm.weight"]
+                )
+                torch.testing.assert_close(
+                    model.embed_tokens.weight,
+                    weights["model.embed_tokens.weight"][rank * 4 : (rank + 1) * 4],
+                )
+                torch.testing.assert_close(
+                    model.lm_head.weight, model.embed_tokens.weight
+                )
+                self.assertIs(
+                    model.runtime_weight_view()["embedding"], model.embed_tokens.weight
+                )
+                self.assertIs(
+                    model.runtime_weight_view()["lm_head"], model.lm_head.weight
+                )
+
+    def test_hidden_first_projection_matches_legacy_order(self):
+        model = self.load(self.weights())
+        embedding = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+        hidden = torch.tensor([[4.0, 1.0, 2.0, 3.0]])
+        # CPU normalization here exercises the actual MTP module, not an
+        # attention backend or mocked projection.
+        e = (
+            embedding
+            * torch.rsqrt(embedding.square().mean(-1, keepdim=True) + 1e-6)
+            * 2
+        )
+        h = hidden * torch.rsqrt(hidden.square().mean(-1, keepdim=True) + 1e-6) * 3
+        torch.testing.assert_close(model.mtp_block(embedding, hidden), h + 2 * e)
+
+    def test_optional_sampler_maps_remain_int64_and_alias_runtime_view(self):
+        weights = self.weights()
+        weights["model.d2t"] = torch.arange(8, dtype=torch.int64)
+        weights["model.t2d"] = torch.arange(8, dtype=torch.int64)
+        model = self.load(weights)
+        self.assertIs(
+            model.runtime_weight_view()["multi_tokens_predict_d2t_map"], model.d2t
+        )
+        self.assertEqual(model.d2t.dtype, torch.int64)
+        torch.testing.assert_close(model.t2d, weights["model.t2d"])
+
+    def test_missing_fusion_parameter_fails_real_load(self):
+        weights = self.weights()
+        del weights["model.layers.0.h_norm.weight"]
+        with self.assertRaisesRegex(RuntimeError, "missing required"):
+            self.load(weights)
+
+    def test_multiple_decoder_layers_keep_indices_and_layer_zero_fusion(self):
+        weights = self.weights()
+        for name, tensor in tuple(weights.items()):
+            if name.startswith("model.layers.0."):
+                weights[name.replace("model.layers.0.", "model.layers.1.")] = (
+                    tensor + 10
+                )
+        self.config.num_layers = 2
+        model = self.load(weights)
+        self.assertEqual([layer.self_attn.layer_idx for layer in model.layers], [0, 1])
+        torch.testing.assert_close(model.norm.weight, torch.full((4,), 4.0))
+        torch.testing.assert_close(
+            model.layers[1].self_attn.o_proj.weight, torch.full((4, 4), 11.0)
+        )
+
+    def test_incomplete_or_wrong_dtype_maps_fail(self):
+        weights = self.weights()
+        weights["model.d2t"] = torch.arange(8, dtype=torch.int64)
+        with self.assertRaisesRegex(RuntimeError, "both d2t and t2d"):
+            self.load(weights)
+        weights["model.d2t"] = torch.arange(8, dtype=torch.float32)
+        with self.assertRaisesRegex(ValueError, "integer vocabulary map"):
+            self.load(weights)
+
+    def test_forward_requires_matching_target_hidden_states(self):
+        model = self.load(self.weights())
+        with self.assertRaisesRegex(ValueError, "requires input_hiddens"):
+            model(types.SimpleNamespace(input_hiddens=None))
+        with self.assertRaisesRegex(ValueError, "shape mismatch"):
+            model(
+                types.SimpleNamespace(
+                    input_ids=torch.tensor([1]), input_hiddens=torch.zeros(2, 4)
+                )
+            )
+
+
+class Qwen2MTPNativeBoundaryTest(_MTPCheckpointFixture):
     def test_target_and_draft_public_factory_own_distinct_vocabularies(self):
         from rtp_llm.model_factory import ModelFactory
         from rtp_llm.models.base_model import BaseModel
@@ -272,39 +375,6 @@ class Qwen2MTPLoadTest(unittest.TestCase):
                         cfg, draft_cfg, engine, target_model=score
                     )
 
-    def test_actual_two_rank_checkpoint_transport(self):
-        with tempfile.TemporaryDirectory() as root:
-            save_file(self.weights(), os.path.join(root, "model.safetensors"))
-            torch.multiprocessing.start_processes(
-                _load_tp_pair, args=(root,), nprocs=2, join=True, start_method="fork"
-            )
-
-    def test_registry_and_real_safetensors_tp_rank_loading(self):
-        self.assertIs(get_model_class("qwen_2-mtp"), Qwen2MTPForCausalLM)
-        weights = self.weights()
-        for rank in (0, 1):
-            with self.subTest(rank=rank):
-                model = self.load(weights, rank=rank, tp=2)
-                torch.testing.assert_close(
-                    model.mtp_block.fc.weight, weights["model.layers.0.eh_proj.weight"]
-                )
-                torch.testing.assert_close(
-                    model.norm.weight, weights["model.layers.0.final_head.norm.weight"]
-                )
-                torch.testing.assert_close(
-                    model.embed_tokens.weight,
-                    weights["model.embed_tokens.weight"][rank * 4 : (rank + 1) * 4],
-                )
-                torch.testing.assert_close(
-                    model.lm_head.weight, model.embed_tokens.weight
-                )
-                self.assertIs(
-                    model.runtime_weight_view()["embedding"], model.embed_tokens.weight
-                )
-                self.assertIs(
-                    model.runtime_weight_view()["lm_head"], model.lm_head.weight
-                )
-
     def test_full_single_token_draft_forward_matches_dense_reference(self):
         # For one token softmax(QK) is exactly one: both query heads return
         # the one KV head's V. Exercise real loaded projections, not CUDA FMHA.
@@ -352,72 +422,6 @@ class Qwen2MTPLoadTest(unittest.TestCase):
         )
         expected = norm(x + linear(mlp, "mlp.down_proj"), "final_head.norm")
         torch.testing.assert_close(output.hidden_states, expected)
-
-    def test_hidden_first_projection_matches_legacy_order(self):
-        model = self.load(self.weights())
-        embedding = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
-        hidden = torch.tensor([[4.0, 1.0, 2.0, 3.0]])
-        # CPU normalization here exercises the actual MTP module, not an
-        # attention backend or mocked projection.
-        e = (
-            embedding
-            * torch.rsqrt(embedding.square().mean(-1, keepdim=True) + 1e-6)
-            * 2
-        )
-        h = hidden * torch.rsqrt(hidden.square().mean(-1, keepdim=True) + 1e-6) * 3
-        torch.testing.assert_close(model.mtp_block(embedding, hidden), h + 2 * e)
-
-    def test_optional_sampler_maps_remain_int64_and_alias_runtime_view(self):
-        weights = self.weights()
-        weights["model.d2t"] = torch.arange(8, dtype=torch.int64)
-        weights["model.t2d"] = torch.arange(8, dtype=torch.int64)
-        model = self.load(weights)
-        self.assertIs(
-            model.runtime_weight_view()["multi_tokens_predict_d2t_map"], model.d2t
-        )
-        self.assertEqual(model.d2t.dtype, torch.int64)
-        torch.testing.assert_close(model.t2d, weights["model.t2d"])
-
-    def test_missing_fusion_parameter_fails_real_load(self):
-        weights = self.weights()
-        del weights["model.layers.0.h_norm.weight"]
-        with self.assertRaisesRegex(RuntimeError, "missing required"):
-            self.load(weights)
-
-    def test_multiple_decoder_layers_keep_indices_and_layer_zero_fusion(self):
-        weights = self.weights()
-        for name, tensor in tuple(weights.items()):
-            if name.startswith("model.layers.0."):
-                weights[name.replace("model.layers.0.", "model.layers.1.")] = (
-                    tensor + 10
-                )
-        self.config.num_layers = 2
-        model = self.load(weights)
-        self.assertEqual([layer.self_attn.layer_idx for layer in model.layers], [0, 1])
-        torch.testing.assert_close(model.norm.weight, torch.full((4,), 4.0))
-        torch.testing.assert_close(
-            model.layers[1].self_attn.o_proj.weight, torch.full((4, 4), 11.0)
-        )
-
-    def test_incomplete_or_wrong_dtype_maps_fail(self):
-        weights = self.weights()
-        weights["model.d2t"] = torch.arange(8, dtype=torch.int64)
-        with self.assertRaisesRegex(RuntimeError, "both d2t and t2d"):
-            self.load(weights)
-        weights["model.d2t"] = torch.arange(8, dtype=torch.float32)
-        with self.assertRaisesRegex(ValueError, "integer vocabulary map"):
-            self.load(weights)
-
-    def test_forward_requires_matching_target_hidden_states(self):
-        model = self.load(self.weights())
-        with self.assertRaisesRegex(ValueError, "requires input_hiddens"):
-            model(types.SimpleNamespace(input_hiddens=None))
-        with self.assertRaisesRegex(ValueError, "shape mismatch"):
-            model(
-                types.SimpleNamespace(
-                    input_ids=torch.tensor([1]), input_hiddens=torch.zeros(2, 4)
-                )
-            )
 
 
 if __name__ == "__main__":
