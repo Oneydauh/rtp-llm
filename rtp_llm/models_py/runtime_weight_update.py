@@ -112,12 +112,18 @@ class RuntimeLoRAManager:
         with self._lock:
             return tuple(self._adapters)
 
-    def load(self, adapter_name: str, updates: Sequence[LoRAUpdate]) -> None:
+    def load(
+        self,
+        adapter_name: str,
+        updates: Sequence[LoRAUpdate],
+        *,
+        allow_empty_stage: bool = False,
+    ) -> None:
         """Register an adapter without changing inference weights."""
         if not isinstance(adapter_name, str) or not adapter_name:
             raise ValueError("LoRA adapter name must be non-empty")
         updates = list(updates)
-        if not updates:
+        if not updates and not allow_empty_stage:
             raise ValueError("LoRA adapter must contain at least one update")
         staged: Dict[str, LoRAUpdate] = {}
         with self._lock:

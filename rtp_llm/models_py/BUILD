@@ -32,6 +32,13 @@ py_library(
 )
 
 py_test(
+    name = "direct_lora_checkpoint_test",
+    srcs = ["direct_lora_checkpoint_test.py"],
+    deps = [":new_loader_core", "//rtp_llm:lora", "//rtp_llm:utils"],
+    env = {"CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1"},
+)
+
+py_test(
     name = "main_core_checkpoint_test",
     srcs = ["main_core_checkpoint_test.py"],
     env = {

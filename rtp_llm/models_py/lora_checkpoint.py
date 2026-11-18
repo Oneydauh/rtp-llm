@@ -3,6 +3,8 @@
 import json
 import math
 import re
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -35,11 +37,14 @@ def model_lora_checkpoint_updates(model, loader, path: str) -> list[LoRAUpdate]:
     """Resolve PEFT factors through the model's existing TP/fusion owners."""
     module_names = {module: name for name, module in model.named_modules()}
     validate_target = getattr(model, "validate_lora_checkpoint_target", None)
+    owns_target = getattr(model, "owns_lora_checkpoint_target", None)
     grouped = {}
     for update in read_lora_checkpoint(path):
         mapped = loader._mapped_checkpoint_name(model, update.target)
         if callable(validate_target):
             validate_target(mapped)
+        if callable(owns_target) and not owns_target(mapped):
+            continue
         target, _ = model.resolve_checkpoint_load_plan(
             mapped, (update.b.shape[0], update.a.shape[1])
         )
@@ -59,6 +64,8 @@ def model_lora_checkpoint_updates(model, loader, path: str) -> list[LoRAUpdate]:
         grouped.setdefault(name, []).append((target.name, a, b, update.scale))
     updates = []
     for name, pieces in grouped.items():
+        if len({key for key, _, _, _ in pieces}) != len(pieces):
+            raise ValueError(f"Duplicate mapped LoRA projection for {name!r}")
         if len(pieces) > 1 and any(key == "weight" for key, _, _, _ in pieces):
             raise ValueError(f"Cannot mix fused and per-projection LoRA for {name!r}")
         # Disjoint Q/K/V or gate/up factors share a fused parameter; concatenate
@@ -84,12 +91,103 @@ def merge_startup_lora_checkpoint(model, loader, adapter_name: str, path: str) -
     the serving model, and its base snapshots are released after startup.
     """
     updates = model_lora_checkpoint_updates(model, loader, path)
+    if not updates:
+        # Nonempty, well-formed PEFT checkpoint; every target belongs to a
+        # different PP stage. There is nothing to mutate on this rank.
+        return
     manager = RuntimeLoRAManager(
         dict(model.named_parameters()),
         delta_transforms=collect_lora_delta_transforms(model),
     )
     manager.load(adapter_name, updates)
     manager.merge(adapter_name)
+
+
+class RankLocalCheckpointAdapters:
+    """Load PEFT checkpoints onto the direct model's existing parameter owners.
+
+    Registration does not change inference. Activation changes shared model
+    storage, not the adapter for a single request. A serving caller must pause
+    inference on all participating ranks and coordinate success or recovery;
+    the manager's local lock cannot provide that distributed guarantee.
+    """
+
+    def __init__(self, model, loader, *, startup_adapters=(), admin_lock=None):
+        self._model = model
+        self._loader = loader
+        self._startup = frozenset(startup_adapters)
+        self._lock = threading.RLock() if admin_lock is None else admin_lock
+        self._manager = None
+
+    @property
+    def active_adapters(self):
+        with self._lock:
+            return () if self._manager is None else self._manager.active_adapters
+
+    @property
+    def loaded_adapters(self):
+        with self._lock:
+            return () if self._manager is None else self._manager.loaded_adapters
+
+    @contextmanager
+    def base_update_guard(self):
+        """Exclude adapter transitions for the entire caller's base write."""
+        with self._lock:
+            if self._startup or self.active_adapters:
+                raise RuntimeError(
+                    "Cannot update base weights with merged LoRA adapters"
+                )
+            yield
+
+    def load(self, name, path):
+        with self._lock:
+            if name in self._startup:
+                raise ValueError(
+                    f"Adapter {name!r} is already merged into the startup base"
+                )
+            updates = model_lora_checkpoint_updates(self._model, self._loader, path)
+            if self._manager is None:
+                params = dict(self._model.named_parameters())
+
+                def validate_bindings():
+                    # An EPLB switch may replace an nn.Parameter entirely;
+                    # unchanged storage on the old object is not sufficient.
+                    live = dict(self._model.named_parameters())
+                    if live.keys() != params.keys() or any(
+                        live[k] is not v for k, v in params.items()
+                    ):
+                        raise RuntimeError("Direct model parameter bindings changed")
+
+                manager = RuntimeLoRAManager(
+                    params,
+                    lock=self._lock,
+                    validate_contract=validate_bindings,
+                    delta_transforms=collect_lora_delta_transforms(self._model),
+                )
+                manager.load(name, updates, allow_empty_stage=True)
+                self._manager = manager
+            else:
+                self._manager.load(name, updates, allow_empty_stage=True)
+
+    def _transition(self, op, pause_engine, *args):
+        if not callable(pause_engine):
+            raise TypeError("A caller-provided engine quiescence context is required")
+        # Enter engine quiescence before the manager lock on every transition.
+        with pause_engine(), self._lock:
+            if self._manager is None:
+                raise ValueError("No rank-local adapters are registered")
+            getattr(self._manager, op)(*args)
+            if not self._manager.loaded_adapters:
+                self._manager = None
+
+    def merge(self, names, *, pause_engine):
+        self._transition("merge", pause_engine, names)
+
+    def unmerge(self, *, pause_engine):
+        self._transition("unmerge", pause_engine)
+
+    def unload(self, name, *, pause_engine):
+        self._transition("unload", pause_engine, name)
 
 
 def prepare_lora_checkpoint_factors(a, b, input_size, output_size, prefix=""):

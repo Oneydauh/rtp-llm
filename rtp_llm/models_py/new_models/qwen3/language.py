@@ -443,6 +443,22 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
         prefix_mapping={"model.": ""},
     )
 
+    def owns_lora_checkpoint_target(self, mapped_name):
+        if self._pipeline_partitioned:
+            parts = mapped_name.split(".", 2)
+            if (
+                len(parts) == 3
+                and parts[0] == "layers"
+                and parts[1].isascii()
+                and parts[1].isdigit()
+            ):
+                index = int(parts[1])
+                if str(index) == parts[1] and index < self.layer_num:
+                    return index in self._owned_layer_ids
+        # Never silently discard an invalid layer id or an unknown namespace:
+        # let strict per-owner factor mapping diagnose it.
+        return True
+
     def checkpoint_weight_name_filter(self):
         if not self._pipeline_partitioned:
             return None
