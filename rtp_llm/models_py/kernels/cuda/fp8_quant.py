@@ -209,9 +209,7 @@ def sgl_per_token_group_quant_fp8(
         scale_ue8m0=scale_ue8m0,
     )
     if x.numel() > 0:
-        quant_kernel = (
-            os.environ.get("DSV4_FP8_QUANT_KERNEL", "auto").strip().lower()
-        )
+        quant_kernel = os.environ.get("DSV4_FP8_QUANT_KERNEL", "auto").strip().lower()
 
         def can_use_v2() -> bool:
             if group_size not in (16, 32, 64, 128):
@@ -285,9 +283,7 @@ def scaled_fp8_per_tensor_quant(
         raise ValueError(
             f"FP8 per-tensor quantization requires 2D input, got {input.shape}"
         )
-    _validate_native_quant_input(
-        input, "FP8 per-tensor quantization", allow_empty=True
-    )
+    _validate_native_quant_input(input, "FP8 per-tensor quantization", allow_empty=True)
     vector_width = 16 // input.element_size()
     if input.numel() % vector_width != 0:
         raise ValueError(
@@ -305,9 +301,7 @@ def scaled_fp8_per_tensor_quant(
         scale = torch.zeros(1, device=input.device, dtype=torch.float32)
         if input.numel() > 0:
             with torch.cuda.device(input.device):
-                _resolve_compute_op("per_tensor_quant_fp8")(
-                    input, output, scale, False
-                )
+                _resolve_compute_op("per_tensor_quant_fp8")(input, output, scale, False)
     else:
         if scale.numel() != 1:
             raise ValueError(
@@ -319,9 +313,7 @@ def scaled_fp8_per_tensor_quant(
             raise TypeError("FP8 per-tensor scale must be contiguous float32")
         if input.numel() > 0:
             with torch.cuda.device(input.device):
-                _resolve_compute_op("per_tensor_quant_fp8")(
-                    input, output, scale, True
-                )
+                _resolve_compute_op("per_tensor_quant_fp8")(input, output, scale, True)
     return output, scale
 
 
@@ -335,9 +327,7 @@ def scaled_fp8_per_token_quant(
         raise ValueError(
             f"FP8 per-token quantization requires 2D input, got {input.shape}"
         )
-    _validate_native_quant_input(
-        input, "FP8 per-token quantization", allow_empty=True
-    )
+    _validate_native_quant_input(input, "FP8 per-token quantization", allow_empty=True)
     if input.shape[1] == 0:
         raise ValueError("FP8 per-token input width must be positive")
     if input.shape[1] % 8 != 0:
@@ -460,6 +450,36 @@ def quant_weight_ue8m0(
         )
     )
     return out_w, out_s
+
+
+def quant_weight_ue8m0_packed(
+    weight_dequant: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Main's single-pass online dense FP8 conversion, without grouped imports.
+
+    Preserve the BF16/FP16 source until UE8M0 quantization: first rounding to
+    floating-scale FP8 and then requantizing is not numerically equivalent.
+    """
+    if weight_dequant.dim() != 2:
+        raise ValueError(
+            "Direct packed UE8M0 weight quantization requires a 2D tensor, "
+            f"got shape {tuple(weight_dequant.shape)}"
+        )
+    if weight_dequant.dtype not in _NATIVE_INPUT_DTYPES:
+        raise TypeError(f"Expected floating source weights, got {weight_dequant.dtype}")
+    row_chunk_size = 1024
+    n, k = weight_dequant.shape
+    out_w = torch.empty((n, k), dtype=fp8_dtype, device=weight_dequant.device)
+    scale_chunks = []
+    for row_start in range(0, n, row_chunk_size):
+        row_end = min(row_start + row_chunk_size, n)
+        chunk_w, chunk_s = per_block_cast_to_fp8(
+            weight_dequant[row_start:row_end], use_ue8m0=True
+        )
+        out_w[row_start:row_end].copy_(chunk_w)
+        scale_chunks.append(chunk_s)
+    out_s = torch.cat(scale_chunks, dim=0)
+    return out_w, _transform_scale_ue8m0(out_s, mn=out_w.shape[-2])
 
 
 def requant_weight_ue8m0(

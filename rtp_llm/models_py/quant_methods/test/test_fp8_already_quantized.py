@@ -1467,9 +1467,37 @@ class TestFp8BlockForward(unittest.TestCase):
         out_offline = offline(x)
         out_online = online(x)
 
-        # The offline checkpoint and online quantizer use equivalent FP8 block
-        # semantics but may round one BF16 ULP differently before GEMM.
-        torch.testing.assert_close(out_offline, out_online, rtol=0.02, atol=0.005)
+        if is_deep_gemm_e8m0_used():
+            # Main directly quantizes the online BF16 source. An offline
+            # float-scale checkpoint necessarily retains its earlier rounding;
+            # it is not a byte-equivalent reference for that source anymore.
+            from rtp_llm.models_py.kernels.cuda.fp8_quant import (
+                _transform_scale_ue8m0,
+                quant_weight_ue8m0,
+            )
+
+            expected_weight, expected_scale = quant_weight_ue8m0(
+                weight_bf16, [128, 128]
+            )
+            torch.testing.assert_close(
+                online.weight.view(torch.uint8),
+                expected_weight.view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                online.weight_scale,
+                _transform_scale_ue8m0(expected_scale, N),
+                rtol=0,
+                atol=0,
+            )
+            # Use the already initialized backend as a controlled GEMM
+            # reference, supplying independently quantized main source weights.
+            offline.weight.data = expected_weight
+            offline.weight_scale.data = _transform_scale_ue8m0(expected_scale, N)
+            torch.testing.assert_close(offline(x), out_online, rtol=0, atol=0)
+        else:
+            torch.testing.assert_close(out_offline, out_online, rtol=0.02, atol=0.005)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA + torch._scaled_mm")

@@ -7,6 +7,7 @@ from torch import nn
 
 from rtp_llm.device.architecture import is_gfx950
 from rtp_llm.models_py.kernels.cuda.fp8_quant import (
+    quant_weight_ue8m0_packed,
     requant_weight_ue8m0,
     require_cuda_fp8_quant_helpers,
     scaled_fp8_per_tensor_quant,
@@ -1266,7 +1267,30 @@ class Fp8BlockOnlineLinearMethod(QuantizeMethodBase):
         shard_names = getattr(layer, "shard_names", None)
         num_shards = len(shard_names) if shard_names else 1
 
-        if num_shards > 1:
+        direct_ue8m0 = self._use_deep_gemm and is_deep_gemm_e8m0_used(weight.device)
+        if direct_ue8m0:
+            # Main quantizes online dense source weights directly to UE8M0;
+            # float-scale FP8 -> BF16 -> UE8M0 introduces a second rounding.
+            # TP owners have already selected their local, block-aligned rows.
+            if num_shards > 1:
+                sizes = (
+                    [layer.q_size, layer.kv_size, layer.kv_size]
+                    if hasattr(layer, "q_size") and hasattr(layer, "kv_size")
+                    else [logical_n // num_shards] * num_shards
+                )
+                if sum(sizes) != logical_n or any(s % self.BLOCK for s in sizes):
+                    raise ValueError(
+                        f"FP8 merged shard rows must align to {self.BLOCK}: {sizes}"
+                    )
+            runtime_n = (logical_n + self.BLOCK - 1) // self.BLOCK * self.BLOCK
+            source = weight
+            if padded_k != logical_k or runtime_n != logical_n:
+                source = torch.nn.functional.pad(
+                    source, (0, padded_k - logical_k, 0, runtime_n - logical_n)
+                )
+            fp8_weight, scale = quant_weight_ue8m0_packed(source.contiguous())
+            logical_output_n = logical_n
+        elif num_shards > 1:
             if hasattr(layer, "q_size") and hasattr(layer, "kv_size"):
                 shard_sizes = [layer.q_size, layer.kv_size, layer.kv_size]
             elif logical_n % num_shards == 0:
@@ -1322,16 +1346,15 @@ class Fp8BlockOnlineLinearMethod(QuantizeMethodBase):
             runtime_n // self.BLOCK,
             padded_k // self.BLOCK,
         )
-        if scale.shape != expected_scale_shape:
+        if not direct_ue8m0 and scale.shape != expected_scale_shape:
             raise ValueError(
                 f"FP8 scale shape {tuple(scale.shape)} != {expected_scale_shape}"
             )
 
-        _validate_fp8_block_scales(fp8_weight, scale, self.BLOCK, self.BLOCK)
+        if not direct_ue8m0:
+            _validate_fp8_block_scales(fp8_weight, scale, self.BLOCK, self.BLOCK)
         if self._runtime_backend == _ROCM_AITER_BLOCK:
             fp8_weight, scale = _prepare_rocm_fp8_block_weight(fp8_weight, scale)
-        elif is_deep_gemm_e8m0_used(weight.device):
-            fp8_weight, scale = _resolve_requant_weight_ue8m0()(fp8_weight, scale)
 
         del layer.weight
         layer.register_parameter(

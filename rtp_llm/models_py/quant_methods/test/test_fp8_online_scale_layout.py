@@ -15,6 +15,7 @@ import torch
 from safetensors.torch import save_file
 
 from rtp_llm.models_py import weight_mapper
+from rtp_llm.models_py.kernels.cuda import fp8_quant
 from rtp_llm.models_py.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -107,7 +108,10 @@ class OnlineFp8ScaleLayoutTest(unittest.TestCase):
                                 layer = _load(directory, kind, tp, rank, backend)
                                 observed = {}
 
-                                def gpu_requant_contract(weight, scale):
+                                def gpu_requant_contract(weight):
+                                    weight, _ = fp8_quant.per_block_cast_to_fp8(
+                                        weight, use_ue8m0=True
+                                    )
                                     n, k = weight.shape
                                     columns = (k + 511) // 512
                                     # Include a padded leading dimension, as
@@ -149,8 +153,8 @@ class OnlineFp8ScaleLayoutTest(unittest.TestCase):
                                     fp8, "is_deep_gemm_e8m0_used", return_value=True
                                 ), mock.patch.object(
                                     fp8,
-                                    "_resolve_requant_weight_ue8m0",
-                                    return_value=gpu_requant_contract,
+                                    "quant_weight_ue8m0_packed",
+                                    side_effect=gpu_requant_contract,
                                 ), mock.patch.object(
                                     fp8,
                                     "_resolve_sgl_per_token_group_quant",
@@ -208,6 +212,94 @@ class OnlineFp8ScaleLayoutTest(unittest.TestCase):
             torch.testing.assert_close(
                 layer.weight.view(torch.uint8), expected_weight.view(torch.uint8)
             )
+
+    def test_direct_source_quantization_matches_main_and_not_round_trip(self):
+        # Only CUDA's final scale packing is replaced; real source checkpoint,
+        # TP dispatch and production quantization arithmetic run on CPU.
+        def pack_cpu(scale, mn):
+            exponents = (scale.view(torch.int32) >> 23).to(torch.int64)
+            exponents = exponents.repeat_interleave(128, dim=0)[:mn]
+            exponents = torch.nn.functional.pad(
+                exponents, (0, (-exponents.shape[1]) % 4)
+            )
+            parts = exponents.reshape(mn, -1, 4)
+            packed = sum(parts[..., i] << (8 * i) for i in range(4)).to(torch.int32)
+            return packed.T.contiguous().T
+
+        def main_reference(source):
+            # main f559bb4 fp8_kernel.per_block_cast_to_fp8(use_ue8m0=True)
+            n, k = source.shape
+            blocks = source.reshape(n // 128, 128, k // 128, 128)
+            amax = blocks.abs().float().amax((1, 3), keepdim=True).clamp(1e-4)
+            scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0)))
+            weight = (blocks * (1.0 / scale)).clamp(-448, 448).to(torch.float8_e4m3fn)
+            return weight.reshape(n, k), scale.reshape(n // 128, k // 128)
+
+        for kind in ("column", "row", "merged", "qkv"):
+            with tempfile.TemporaryDirectory() as directory:
+                save_file(
+                    _checkpoint(kind), os.path.join(directory, "model.safetensors")
+                )
+                for backend in ("scratch", "fastsafetensors"):
+                    for tp in (1, 2):
+                        for rank in range(tp):
+                            with self.subTest(
+                                kind=kind, backend=backend, tp=tp, rank=rank
+                            ):
+                                layer = _load(directory, kind, tp, rank, backend)
+                                source = torch.nn.functional.pad(
+                                    layer.weight.detach(),
+                                    (
+                                        0,
+                                        (-layer.weight.shape[1]) % 128,
+                                        0,
+                                        (-layer.weight.shape[0]) % 128,
+                                    ),
+                                )
+                                expected_weight, expected_scale = main_reference(source)
+                                # This source discriminates direct main from the
+                                # previous two-rounding path, not just layouts.
+                                first_weight, first_scale = (
+                                    fp8.per_block_quant_like_legacy(source, 128)
+                                )
+                                restored = fp8_quant.block_quant_dequant(
+                                    first_weight,
+                                    first_scale,
+                                    [128, 128],
+                                    torch.bfloat16,
+                                )
+                                roundtrip_weight, _ = main_reference(restored)
+                                self.assertTrue(
+                                    torch.any(
+                                        expected_weight.view(torch.uint8)
+                                        != roundtrip_weight.view(torch.uint8)
+                                    )
+                                )
+                                with mock.patch.object(
+                                    fp8,
+                                    "_select_fp8_runtime_backend",
+                                    return_value=fp8._CUDA_DEEP_GEMM,
+                                ), mock.patch.object(
+                                    fp8, "is_deep_gemm_e8m0_used", return_value=True
+                                ), mock.patch.object(
+                                    fp8_quant,
+                                    "_transform_scale_ue8m0",
+                                    side_effect=pack_cpu,
+                                ):
+                                    layer.process_weights_after_loading()
+                                torch.testing.assert_close(
+                                    layer.weight.view(torch.uint8),
+                                    expected_weight.view(torch.uint8),
+                                    rtol=0,
+                                    atol=0,
+                                )
+                                torch.testing.assert_close(
+                                    layer.weight_scale,
+                                    pack_cpu(expected_scale, source.shape[0]),
+                                    rtol=0,
+                                    atol=0,
+                                )
+                                self.assertEqual(layer.weight_scale.stride(-2), 1)
 
 
 if __name__ == "__main__":
