@@ -104,7 +104,8 @@ class Qwen3ServiceRouteTest(unittest.TestCase):
                     model.py_model.embed_tokens.weight,
                     data["model.embed_tokens.weight"],
                 )
-                self.assertIsNone(model.weight_manager)
+                self.assertTrue(callable(model.weight_manager.update))
+                self.assertIsNotNone(model.rank_local_lora)
 
 
 if __name__ == "__main__":

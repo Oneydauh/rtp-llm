@@ -83,6 +83,7 @@ class BaseModel(object):
         self.moe_pure_tp_preshard = moe_pure_tp_preshard
         self.weight = None
         self.weight_manager = None
+        self.rank_local_lora = None
         # Keep the owner alive for the complete lifetime of any non-owning
         # tensor aliases. The alias names are immutable construction metadata;
         # a draft must never silently become an owner during reload/update.

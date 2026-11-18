@@ -102,6 +102,8 @@ def service(path, method, model_type="_service_direct_leaf"):
         py_model=None,
         model_weights_loader=None,
         py_eplb=None,
+        weight_manager=None,
+        rank_local_lora=None,
     )
 
 
@@ -118,6 +120,8 @@ class DirectServingBoundaryTest(unittest.TestCase):
                 self.assertIsNone(model.py_model)
                 self.assertIsNone(model.weight)
                 self.assertIsNone(model.py_eplb)
+                self.assertIsNone(model.weight_manager)
+                self.assertIsNone(model.rank_local_lora)
                 self.assertEqual(
                     model.model_weights_loader.loaded_method,
                     NewLoaderLoadMethod(method),
@@ -225,6 +229,8 @@ class DirectServingBoundaryTest(unittest.TestCase):
                     model.py_model.weight_param,
                 )
                 self.assertIs(model.py_model.weight, model.weight)
+                self.assertTrue(callable(model.weight_manager.update))
+                self.assertIsNotNone(model.rank_local_lora)
                 self.assertIs(
                     model.py_model.load_config.py_hw_kernel_config,
                     model.hw_kernel_config,

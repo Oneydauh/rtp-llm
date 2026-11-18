@@ -1,6 +1,7 @@
 """Service boundary for loading directly into the Python model's parameters."""
 
 import logging
+import threading
 from dataclasses import dataclass
 
 import torch
@@ -138,17 +139,31 @@ def load_owned_model(service, *, publish_runtime=True):
     module.weight = view
     controller = None
     if config.eplb_config.enable_eplb():
-        from rtp_llm.models_py.eplb_controller import NewLoaderExpertBalancer
+        from rtp_llm.models_py.eplb_controller import create_stage_expert_balancer
 
-        controller = NewLoaderExpertBalancer(loader, module, config)
+        controller = create_stage_expert_balancer(loader, module, config)
     if service.custom_module is not None:
         service.custom_module.init(view)
+    from rtp_llm.models_py.lora_checkpoint import RankLocalCheckpointAdapters
+    from rtp_llm.models_py.new_weight_manager import NewLoaderWeightManager
+
+    # Live base updates and adapter restore/merge coordinate on the same lock.
+    # Construct both before publishing anything that RPC workers can observe.
+    admin_lock = threading.RLock()
+    rank_local_lora = RankLocalCheckpointAdapters(
+        module, loader, startup_adapters=tuple(adapters or ()), admin_lock=admin_lock
+    )
+    weight_manager = NewLoaderWeightManager(
+        module, loader, adapters=rank_local_lora, admin_lock=admin_lock
+    )
     service.device = device
     service.weight = view
     service.py_model = module
     service.checkpoint_owner = module
     service.model_weights_loader = loader
     service.py_eplb = controller
+    service.weight_manager = weight_manager
+    service.rank_local_lora = rank_local_lora
     logging.info(
         "NewModelLoader: model loaded successfully: model_type=%s selected=%s",
         config.model_type,
