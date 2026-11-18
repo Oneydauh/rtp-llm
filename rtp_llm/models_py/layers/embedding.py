@@ -5,7 +5,6 @@ from typing import Dict, Optional, Sequence
 import torch
 import torch.nn as nn
 
-from rtp_llm.models_py.distributed.collective_torch import Group, all_gather, all_reduce
 from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.read_spec import (
     ReadSpec,
@@ -199,6 +198,8 @@ class VocabParallelEmbedding(RtpModule):
         )
         output = torch.nn.functional.embedding(local_ids, self.weight)
         output = output * mask.unsqueeze(-1)
+        from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
+
         return all_reduce(output, group=Group.TP)
 
 
@@ -451,6 +452,8 @@ class ParallelLMHead(RtpModule):
         token_shape = output.shape[:-1]
         local_vocab_size = output.shape[-1]
         flat_output = output.reshape(-1, local_vocab_size)
+        from rtp_llm.models_py.distributed.collective_torch import Group, all_gather
+
         gathered = all_gather(flat_output, group=Group.TP)
         gathered = (
             gathered.reshape(self.tp_size, flat_output.shape[0], local_vocab_size)

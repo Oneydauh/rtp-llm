@@ -1,17 +1,8 @@
 """Main runtime entry for GLM4 non-Lite (GQA), not the MLA model."""
 
-import math
-
 import torch
-from torch import nn
 
 from rtp_llm.config.model_config import ModelConfig
-from rtp_llm.models_py.layers.embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-    output_vocab_head_kwargs,
-)
-from rtp_llm.models_py.layers.norm import RMSResNorm
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
 from rtp_llm.models_py.new_models.model_base import select_fmha_impl_for_layer
 from rtp_llm.models_py.new_models.qwen3.language import (
@@ -21,8 +12,7 @@ from rtp_llm.models_py.new_models.qwen3.language import (
 )
 from rtp_llm.ops.compute_ops import PyModelOutputs
 
-from .checkpoint_layout import Glm4CheckpointLayout
-from .decoder import Glm4MoeDecoderLayer
+from .parameters import install_glm4_parameters
 
 
 class Glm4MoeForCausalLM(Qwen3ForCausalLM):
@@ -66,69 +56,12 @@ class Glm4MoeForCausalLM(Qwen3ForCausalLM):
             ep_size=load_config.ep_size,
             ep_rank=load_config.ep_rank,
         )
-        self._layout = Glm4CheckpointLayout.read(model_config)
-        self._owned_layer_ids = self.layer_ids()
-        self._pipeline_partitioned = getattr(parallel, "pp_size", 1) > 1
-        first = 0 in self._owned_layer_ids
-        last = cfg["num_layers"] - 1 in self._owned_layer_ids
-        self.tie_word_embeddings = model_config.tie_word_embeddings
-        self.normalize_lm_head_weight = model_config.normalize_lm_head_weight
-        self.logit_scale = float(model_config.logit_scale)
-        if not math.isfinite(self.logit_scale):
-            raise ValueError("logit_scale must be finite")
-        self._lm_head_postprocessed = False
-        self.embed_tokens = (
-            VocabParallelEmbedding(
-                cfg["vocab_size"],
-                cfg["hidden_size"],
-                tp_size=cfg["attn_tp_size"],
-                tp_rank=cfg["attn_tp_rank"],
-                params_dtype=cfg["params_dtype"],
-                allow_vocab_padding=True,
-            )
-            if first
-            else None
+        install_glm4_parameters(
+            self,
+            cfg,
+            layer_ids=self.layer_ids(),
+            partitioned=getattr(parallel, "pp_size", 1) > 1,
         )
-        owned = {
-            str(i): Glm4MoeDecoderLayer(
-                cfg,
-                i,
-                dense_width=self._layout.dense_width,
-                shared_width=self._layout.shared_width,
-                moe_layers=self._layout.routed_layers,
-                use_qk_norm=self._layout.use_qk_norm,
-                correction_bias=self._layout.correction_bias,
-            )
-            for i in self._owned_layer_ids
-        }
-        self.layers = (
-            nn.ModuleDict(owned)
-            if self._pipeline_partitioned
-            else nn.ModuleList(owned.values())
-        )
-        self.norm = (
-            RMSResNorm(
-                cfg["hidden_size"],
-                eps=cfg["rms_norm_eps"],
-                params_dtype=cfg["params_dtype"],
-            )
-            if last
-            else None
-        )
-        self.lm_head = (
-            ParallelLMHead(
-                cfg["vocab_size"],
-                cfg["hidden_size"],
-                tp_size=cfg["lm_head_tp_size"],
-                tp_rank=cfg["lm_head_tp_rank"],
-                params_dtype=cfg["lm_head_params_dtype"],
-                **output_vocab_head_kwargs(model_config)
-            )
-            if last
-            else None
-        )
-        if self.tie_word_embeddings and first and last:
-            self.embed_tokens.tie_output_head(self.lm_head)
         self._init_capture_context(
             self._capture_canonical_layer, self._capture_canonical_final
         )

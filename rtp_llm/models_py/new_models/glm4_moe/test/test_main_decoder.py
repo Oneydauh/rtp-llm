@@ -9,7 +9,6 @@ from types import SimpleNamespace
 
 import torch
 from safetensors.torch import save_file
-from torch import nn
 
 from rtp_llm.models_py.model_loader import (
     NewLoaderConfig,
@@ -17,8 +16,7 @@ from rtp_llm.models_py.model_loader import (
     NewModelLoader,
 )
 from rtp_llm.models_py.module_base import RtpModule
-from rtp_llm.models_py.new_models.glm4_moe.checkpoint_layout import Glm4CheckpointLayout
-from rtp_llm.models_py.new_models.glm4_moe.decoder import Glm4MoeDecoderLayer
+from rtp_llm.models_py.new_models.glm4_moe.parameters import install_glm4_parameters
 from rtp_llm.models_py.new_models.glm4_moe.test.checkpoint_fixture import checkpoint
 from rtp_llm.models_py.registry import register_model
 from rtp_llm.models_py.weight_mapper import WeightsMapper
@@ -31,8 +29,12 @@ class _Decoders(RtpModule):
 
     def __init__(self, config, load_config):
         super().__init__()
-        self.layout = Glm4CheckpointLayout.read(config)
         cfg = dict(
+            num_layers=2,
+            vocab_size=8,
+            lm_head_tp_size=1,
+            lm_head_tp_rank=0,
+            lm_head_params_dtype=torch.float32,
             hidden_size=4,
             num_heads=2,
             num_kv_heads=1,
@@ -55,24 +57,13 @@ class _Decoders(RtpModule):
                 dp_size=1, dp_rank=0, world_size=1, local_world_size=1
             ),
         )
-        self.layers = nn.ModuleList(
-            Glm4MoeDecoderLayer(
-                cfg,
-                i,
-                dense_width=self.layout.dense_width,
-                shared_width=self.layout.shared_width,
-                moe_layers=self.layout.routed_layers,
-                use_qk_norm=self.layout.use_qk_norm,
-                correction_bias=self.layout.correction_bias,
-            )
-            for i in range(2)
-        )
+        install_glm4_parameters(self, cfg, layer_ids=range(2), partitioned=False)
 
     def load_weights(self, weights):
         return super().load_weights(self.WEIGHTS_MAPPER.apply(weights))
 
     def checkpoint_weight_name_filter(self):
-        return self.layout.target_owns
+        return self._layout.target_owns
 
 
 def config(path):
@@ -80,6 +71,9 @@ def config(path):
         model_type="_glm4_main_decoders",
         ckpt_path=str(path),
         num_layers=2,
+        tie_word_embeddings=False,
+        normalize_lm_head_weight=False,
+        logit_scale=1.0,
         hidden_size=4,
         expert_num=4,
         moe_k=2,
@@ -110,7 +104,7 @@ class MainDecoderTest(unittest.TestCase):
                 )
             )
         )
-        src = {n: t for n, t in checkpoint().items() if n.startswith("model.layers.")}
+        src = checkpoint()
         src["model.layers.2.enorm.weight"] = torch.ones(4)
         return src
 
@@ -142,11 +136,16 @@ class MainDecoderTest(unittest.TestCase):
             torch.testing.assert_close(
                 param, dict(scratch.named_parameters())[name], rtol=0, atol=0
             )
-        self.assertEqual(fast.layout.dense_width, 8)
-        self.assertEqual(fast.layout.shared_width, 4)
+        torch.testing.assert_close(
+            fast.embed_tokens.weight, src["model.embed_tokens.weight"]
+        )
+        torch.testing.assert_close(fast.lm_head.weight, src["lm_head.weight"])
+        torch.testing.assert_close(fast.norm.weight, src["model.norm.weight"])
+        self.assertEqual(fast._layout.dense_width, 8)
+        self.assertEqual(fast._layout.shared_width, 4)
         self.assertEqual(fast.layers[0].mlp.gate_up_proj.weight.shape, (16, 4))
         self.assertTrue(fast.layers[1].mlp.experts.is_cpu_checkpoint_staging())
-        self.assertTrue(fast.layout.correction_bias)
+        self.assertTrue(fast._layout.correction_bias)
         qkv = fast.layers[0].self_attn.qkv_proj
         torch.testing.assert_close(
             qkv.bias,
@@ -181,9 +180,9 @@ class MainDecoderTest(unittest.TestCase):
             )
             save_file(src, str(path / "model.safetensors"))
             model = self.load(path, "scratch")
-            self.assertFalse(model.layout.correction_bias)
+            self.assertFalse(model._layout.correction_bias)
             self.assertIsNone(model.layers[1].mlp.gate.e_score_correction_bias)
-            self.assertTrue(model.layout.target_owns("model.layers.3.enorm.weight"))
+            self.assertTrue(model._layout.target_owns("model.layers.3.enorm.weight"))
 
 
 if __name__ == "__main__":
