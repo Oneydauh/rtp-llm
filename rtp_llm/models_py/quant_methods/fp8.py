@@ -556,8 +556,16 @@ def _resolve_fp8_gemm_nt():
         native = getattr(importlib.import_module("deep_gemm"), "fp8_gemm_nt", None)
         if not callable(native):
             raise RuntimeError("deep_gemm.fp8_gemm_nt is not callable")
+
         def run(a, b, output, c=None, disable_ue8m0_cast=True):
-            return native(a, b, output, c, compiled_dims="nk", disable_ue8m0_cast=disable_ue8m0_cast)
+            return native(
+                a,
+                b,
+                output,
+                c,
+                compiled_dims="nk",
+                disable_ue8m0_cast=disable_ue8m0_cast,
+            )
 
         fp8_gemm_nt = run
     return fp8_gemm_nt
@@ -1493,10 +1501,16 @@ class Fp8BlockLinearMethod(Fp8BlockOnlineLinearMethod):
         if self._runtime_backend == _CUDA_DEEP_GEMM and is_deep_gemm_e8m0_used(
             weight.device
         ):
-            from rtp_llm.models_py.quant_methods.block_fp8_ft import block_ft_runtime_pair
+            from rtp_llm.models_py.quant_methods.block_fp8_ft import (
+                block_ft_runtime_pair,
+            )
 
             weight, scale = block_ft_runtime_pair(
-                layer, weight, scale, "weight_scale_inv", _resolve_requant_weight_ue8m0()
+                layer,
+                weight,
+                scale,
+                "weight_scale_inv",
+                _resolve_requant_weight_ue8m0(),
             )
         del layer.weight
         layer.register_parameter(
@@ -1506,5 +1520,8 @@ class Fp8BlockLinearMethod(Fp8BlockOnlineLinearMethod):
         layer.register_parameter(
             "weight_scale",
             # DeepGEMM packed scales are MN-major/TMA-aligned.
-            nn.Parameter(scale if scale.dtype == torch.int32 else scale.contiguous(), requires_grad=False),
+            nn.Parameter(
+                scale if scale.dtype == torch.int32 else scale.contiguous(),
+                requires_grad=False,
+            ),
         )

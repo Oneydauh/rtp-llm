@@ -5,6 +5,7 @@ width of the dense prefix. Appended NextN layers do not belong to the target.
 """
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +28,18 @@ def _has_bias(names, layers):
             and parts[2].isdigit()
             and int(parts[2]) < layers
             and parts[3:] == ["mlp", "gate", "e_score_correction_bias"]
+        ):
+            return True
+        # Old FT checkpoints persist the GLM correction tensor under its
+        # per-rank runtime name. It is not guaranteed to have topk_method
+        # metadata; the old loader, like the HF path, detects the actual key.
+        if (
+            len(parts) == 5
+            and re.fullmatch(r"rank_[0-9]+_[0-9]+_[0-9]+", parts[0])
+            and parts[1] == "layers"
+            and parts[2].isdigit()
+            and int(parts[2]) < layers
+            and parts[3:] == ["partial_moe_weights", "e_score_correction_bias"]
         ):
             return True
     return False

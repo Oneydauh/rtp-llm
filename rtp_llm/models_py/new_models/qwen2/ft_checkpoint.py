@@ -28,6 +28,12 @@ def _bias(values):
 
 
 def load_dense_ft_checkpoint(model, checkpoint):
+    if type(model).__name__ not in ("Qwen2ForCausalLM", "LlamaForCausalLM"):
+        raise ValueError("No dense FT adapter for this model")
+    return load_gqa_ffn_ft_checkpoint(model, checkpoint)
+
+
+def load_gqa_ffn_ft_checkpoint(model, checkpoint):
     from rtp_llm.models_py.quant_methods.fp8 import (
         Fp8BlockLinearMethod,
         Fp8LinearMethod,
@@ -36,8 +42,6 @@ def load_dense_ft_checkpoint(model, checkpoint):
 
     fp8_methods = (Fp8LinearMethod, Fp8PerChannelLinearMethod, Fp8BlockLinearMethod)
 
-    if type(model).__name__ not in ("Qwen2ForCausalLM", "LlamaForCausalLM", "Glm4MoeForCausalLM"):
-        raise ValueError("No FT adapter for this model's projection tree")
     swizzle_flags = set()
     for key, value in checkpoint.env_params.items():
         normalized = key.lower().replace("_", "")
@@ -66,7 +70,11 @@ def load_dense_ft_checkpoint(model, checkpoint):
 
     layers = ft_layer_bindings(model)
     for _, _, layer in layers:
-        ffn = getattr(layer.mlp, "shared_experts", None) if hasattr(layer.mlp, "experts") else layer.mlp
+        ffn = (
+            getattr(layer.mlp, "shared_experts", None)
+            if hasattr(layer.mlp, "experts")
+            else layer.mlp
+        )
         for linear in (
             layer.self_attn.qkv_proj,
             layer.self_attn.o_proj,
@@ -78,7 +86,13 @@ def load_dense_ft_checkpoint(model, checkpoint):
                 raise ValueError(
                     "Dense FT has no declared adapter for this quantized runtime layout"
                 )
-            if isinstance(linear.quant_method, fp8_methods) and swizzled:
+            if (
+                isinstance(
+                    linear.quant_method, (Fp8LinearMethod, Fp8PerChannelLinearMethod)
+                )
+                and not isinstance(linear.quant_method, Fp8BlockLinearMethod)
+                and swizzled
+            ):
                 raise ValueError(
                     "FP8 FT swizzled source requires an explicit quantized layout decoder"
                 )
@@ -96,11 +110,17 @@ def load_dense_ft_checkpoint(model, checkpoint):
             PerTensorFP8FTProjection,
         )
 
-        scale = source.removesuffix(".kernel") + ".weight_only_quant_scale"
         if isinstance(linear.quant_method, Fp8BlockLinearMethod):
             from rtp_llm.models_py.quant_methods.block_fp8_ft import block_ft_bindings
 
-            return block_ft_bindings(linear, source, scale, destination, checkpoint)
+            keys = (source,) if isinstance(source, str) else source
+            scales = tuple(
+                k.removesuffix(".kernel") + ".weight_only_quant_scale" for k in keys
+            )
+            return block_ft_bindings(
+                linear, keys, scales, destination, checkpoint, swizzled=swizzled
+            )
+        scale = source.removesuffix(".kernel") + ".weight_only_quant_scale"
         if isinstance(linear.quant_method, Fp8PerChannelLinearMethod):
             state = PerChannelFP8FTProjection(
                 linear, checkpoint, source, scale, projection
@@ -368,20 +388,39 @@ def load_dense_ft_checkpoint(model, checkpoint):
             )
         for qk in ("q", "k"):
             if getattr(layer.self_attn, qk + "_norm", None) is not None:
-                bindings.append(RuntimeTensorBinding(
-                    (src + "self_attention_weights." + qk + "_layernorm.gamma",),
-                    dst + "self_attn." + qk + "_norm.weight", _identity))
+                bindings.append(
+                    RuntimeTensorBinding(
+                        (src + "self_attention_weights." + qk + "_layernorm.gamma",),
+                        dst + "self_attn." + qk + "_norm.weight",
+                        _identity,
+                    )
+                )
         ffn, ffn_target = layer.mlp, "mlp."
         if hasattr(layer.mlp, "experts"):
-            from rtp_llm.models_py.quant_methods.block_fp8_ft import block_moe_ft_bindings
+            from rtp_llm.models_py.quant_methods.block_fp8_ft import (
+                block_moe_ft_bindings,
+            )
 
-            bindings.extend(block_moe_ft_bindings(layer.mlp.experts, src, dst + "mlp.experts", checkpoint, layer_id))
-            bindings.append(RuntimeTensorBinding(
-                (src + "partial_moe_weights.gate.kernel",), dst + "mlp.gate.weight", _transpose))
+            bindings.extend(
+                block_moe_ft_bindings(
+                    layer.mlp.experts, src, dst + "mlp.experts", checkpoint, layer_id
+                )
+            )
+            bindings.append(
+                RuntimeTensorBinding(
+                    (src + "partial_moe_weights.gate.kernel",),
+                    dst + "mlp.gate.weight",
+                    kernel,
+                )
+            )
             if getattr(layer.mlp.gate, "e_score_correction_bias", None) is not None:
-                bindings.append(RuntimeTensorBinding(
-                    (src + "partial_moe_weights.e_score_correction_bias",),
-                    dst + "mlp.gate.e_score_correction_bias", _identity))
+                bindings.append(
+                    RuntimeTensorBinding(
+                        (src + "partial_moe_weights.e_score_correction_bias",),
+                        dst + "mlp.gate.e_score_correction_bias",
+                        _identity,
+                    )
+                )
             ffn, ffn_target = layer.mlp.shared_experts, "mlp.shared_experts."
         if ffn is None:
             continue
@@ -400,18 +439,18 @@ def load_dense_ft_checkpoint(model, checkpoint):
             (down_names, "down", ffn_target + "down_proj.weight"),
             (gate_names, "gate_up", ffn_target + "gate_up_proj.weight"),
         ):
-            linear = (
-                ffn.down_proj if projection == "down" else ffn.gate_up_proj
-            )
+            linear = ffn.down_proj if projection == "down" else ffn.gate_up_proj
             if isinstance(linear.quant_method, fp8_methods):
-                if len(names) != 1:
+                if len(names) != 1 and not isinstance(
+                    linear.quant_method, Fp8BlockLinearMethod
+                ):
                     raise ValueError(
                         "Per-tensor FP8 FT requires the producer's fused gate/up tensor"
                     )
                 bindings.extend(
                     fp8_bindings(
                         linear,
-                        names[0],
+                        names[0] if len(names) == 1 else names,
                         dst + target.removesuffix(".weight"),
                         projection,
                         src,

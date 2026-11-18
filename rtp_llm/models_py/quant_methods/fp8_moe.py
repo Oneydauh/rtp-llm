@@ -855,13 +855,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer,
             layer.w13.data.contiguous(),
             layer.w13_scale.to(layer.w13.device, non_blocking=True).contiguous(),
-            "w13_scale", requant_weight_ue8m0,
+            "w13_scale",
+            requant_weight_ue8m0,
         )
         layer.w2.data, layer.w2_scale = block_ft_runtime_pair(
             layer,
             layer.w2.data.contiguous(),
             layer.w2_scale.to(layer.w2.device, non_blocking=True).contiguous(),
-            "w2_scale", requant_weight_ue8m0,
+            "w2_scale",
+            requant_weight_ue8m0,
         )
         logger.info(
             "[Fp8MoEMethod] requantized MoE fp8 block scales to UE8M0: "

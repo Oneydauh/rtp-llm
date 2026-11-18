@@ -74,16 +74,18 @@ def block_ft_scale(raw, logical_shape, *, source_dtype, swap_gate_up=False):
             raise ValueError("Invalid producer for packed UE8M0 scale")
         expected = (*batch, n, _blocks(kb, 4))
         if tuple(raw.shape) != expected:
-            raise ValueError(f"Packed UE8M0 scale shape {tuple(raw.shape)} != {expected}")
+            raise ValueError(
+                f"Packed UE8M0 scale shape {tuple(raw.shape)} != {expected}"
+            )
         # Inspect replicated rows without materializing another copy of every
         # byte in the expert tensor. Last N block may be only partially filled.
         complete, tail = divmod(n, 128)
         if complete:
-            groups = raw[..., :complete * 128, :].unflatten(-2, (complete, 128))
+            groups = raw[..., : complete * 128, :].unflatten(-2, (complete, 128))
             if not torch.equal(groups, groups[..., :1, :].expand_as(groups)):
                 raise ValueError("Packed UE8M0 contains inconsistent replicated rows")
         if tail:
-            end = raw[..., complete * 128:, :]
+            end = raw[..., complete * 128 :, :]
             if not torch.equal(end, end[..., :1, :].expand_as(end)):
                 raise ValueError("Packed UE8M0 contains inconsistent tail rows")
         packed = raw[..., ::128, :]
@@ -122,29 +124,107 @@ def block_ft_runtime_pair(layer, weight, scale, scale_key, requant):
     return weight, _transform_scale_ue8m0(scale, weight.shape[-2])
 
 
-def block_ft_bindings(layer, source, scale_source, target, checkpoint):
+def block_ft_bindings(
+    layer, source, scale_source, target, checkpoint, *, swizzled=False
+):
     """Import a dense rank-local linear matrix while preserving Parameter IDs."""
     peer = checkpoint.topology.tp_rank
-    shape = tuple(layer.weight.shape)
+    full_shape = tuple(layer.weight.shape)
     param = layer.weight_scale_inv
-    if tuple(param.shape) != (_blocks(shape[0]), _blocks(shape[1])):
+    if tuple(param.shape) != (_blocks(full_shape[0]), _blocks(full_shape[1])):
         raise ValueError("FT adapter requires an unprocessed 128x128 FP8 owner")
+    sources = (source,) if isinstance(source, str) else tuple(source)
+    scale_sources = (
+        (scale_source,) if isinstance(scale_source, str) else tuple(scale_source)
+    )
+    if len(sources) != len(scale_sources) or len(sources) not in (1, 2):
+        raise ValueError("Expected one linear projection or separate gate/up planes")
+    shape = full_shape
+    if len(sources) == 2:
+        if full_shape[0] % 256:
+            raise ValueError(
+                "Separate gate and up block scales require an aligned split"
+            )
+        shape = (full_shape[0] // 2, full_shape[1])
+
     def dtype(name):
         return checkpoint.read_rank_slice(name, peer, (slice(0, 1),) * 2).dtype
-    source_type, scale_type = dtype(source), dtype(scale_source)
+
+    source_types = {dtype(s) for s in sources}
+    scale_types = {dtype(s) for s in scale_sources}
+    if len(source_types) != 1 or len(scale_types) != 1:
+        raise ValueError("Gate/up FT checkpoint ABIs differ")
+    source_type, scale_type = source_types.pop(), scale_types.pop()
     packed = scale_type == torch.int32
-    def entry(name):
-        return lambda: (checkpoint.read(name),)
+    declared = checkpoint.index_metadata.get("ft_export_backend")
+    rocm = block_ft_source_is_rocm(declared, source_type, packed)
+
+    def entry(keys):
+        return lambda: tuple(checkpoint.read(key) for key in keys)
+
+    def combine(parts):
+        if len(parts) == 1:
+            return parts[0]
+        dt = parts[0].dtype
+        if dt == torch.float8_e4m3fn:
+            return torch.cat([p.view(torch.uint8) for p in parts]).view(dt)
+        return torch.cat(parts)
+
+    def decode_weight(values):
+        pieces = []
+        for name, val in zip(sources, values):
+            weight = block_ft_weight(val, shape, packed)
+            # Old ROCm rewrites dense kernels before its final flat reshape.
+            # Separate w1 (gate) is specifically absent from the rewrite list.
+            if rocm and not name.endswith("ffn_weights.intermediate_weight.kernel"):
+                if swizzled:
+                    from rtp_llm.models_py.quant_methods.dense_layout import (
+                        decode_dense_weight,
+                    )
+
+                    weight = decode_dense_weight(weight)
+                else:
+                    # shuffle_gemm_weight uses the same AITER tile permutation.
+                    weight = block_ft_weight(
+                        weight.unsqueeze(0), (1, *shape), False, rocm_shuffle=True
+                    )[0]
+            pieces.append(weight)
+        return combine(pieces)
+
     def decode_scale(values):
-        return block_ft_scale(values[0], shape, source_dtype=source_type)
+        return combine(
+            [block_ft_scale(val, shape, source_dtype=source_type) for val in values]
+        )
+
     def install_scale(values):
         param.copy_(decode_scale(values))
         layer._packed_block_fp8_ft = {"weight_scale_inv"} if packed else set()
+
     return (
-        RuntimeTensorBinding((source,), target + ".weight",
-            lambda v: block_ft_weight(v[0], shape, packed), entry(source)),
-        RuntimeTensorBinding((scale_source,), target + ".weight_scale_inv",
-            decode_scale, entry(scale_source), install_scale),
+        RuntimeTensorBinding(
+            sources, target + ".weight", decode_weight, entry(sources)
+        ),
+        RuntimeTensorBinding(
+            scale_sources,
+            target + ".weight_scale_inv",
+            decode_scale,
+            entry(scale_sources),
+            install_scale,
+        ),
+    )
+
+
+def block_ft_source_is_rocm(declared, source_type, packed):
+    if declared not in (None, "cuda", "rocm"):
+        raise ValueError(f"Unknown FT producer ABI: {declared!r}")
+    if (declared == "rocm" and packed) or (
+        declared == "cuda" and source_type == torch.float8_e4m3fnuz
+    ):
+        raise ValueError("Contradictory FT producer ABI and block-FP8 payload")
+    return not packed and (
+        declared == "rocm"
+        or source_type == torch.float8_e4m3fnuz
+        or (declared is None and torch.version.hip is not None)
     )
 
 
@@ -156,29 +236,37 @@ def block_moe_ft_bindings(layer, source_prefix, target, checkpoint, layer_id):
     not CUDA's unshuffled layout. FNUZ and packed scales identify their
     producer independently. A tagged snapshot can also be moved across ABIs.
     """
-    if layer._quant_family != "fp8_per_block" or layer._fp8_moe_weight_block_size != [128, 128]:
+    if layer._quant_family != "fp8_per_block" or layer._fp8_moe_weight_block_size != [
+        128,
+        128,
+    ]:
         raise ValueError("Expected a block-FP8 expert owner with 128x128 runtime tiles")
     bindings = []
     placement = layer._expert_placement
     declared = checkpoint.index_metadata.get("ft_export_backend")
-    if declared not in (None, "cuda", "rocm"):
-        raise ValueError(f"Unknown FT expert producer ABI: {declared!r}")
 
     def bind(key, tensor_name, convert, projections, scale, packed):
         param = getattr(layer, tensor_name)
+
         def read():
             return (checkpoint.read_expert_rows(key, layer_id, placement),)
+
         def install(values):
             param.copy_(convert(values))
             if scale and packed:
-                layer._packed_block_fp8_ft = getattr(layer, "_packed_block_fp8_ft", set()) | {tensor_name}
+                layer._packed_block_fp8_ft = getattr(
+                    layer, "_packed_block_fp8_ft", set()
+                ) | {tensor_name}
             for slot in range(layer.num_local_experts):
                 for proj in projections:
                     if scale:
                         layer._loaded_aux_keys.add((slot, proj, "weight_scale_inv"))
                     else:
                         layer._record_projection_loaded(slot, proj)
-        return RuntimeTensorBinding((key,), target + "." + tensor_name, convert, read, install)
+
+        return RuntimeTensorBinding(
+            (key,), target + "." + tensor_name, convert, read, install
+        )
 
     for w, stem, projs in (
         ("w13", "intermediate_weight", ("up_proj", "gate_proj")),
@@ -188,19 +276,20 @@ def block_moe_ft_bindings(layer, source_prefix, target, checkpoint, layer_id):
         weight_key = prefix + ".kernel"
         scale_key = prefix + ".weight_only_quant_scale"
         shape = tuple(getattr(layer, w).shape)
+
         def dtype(key):
-            return checkpoint.read_rank_slice(key, checkpoint.topology.tp_rank, (slice(0, 1),) * 3).dtype
+            return checkpoint.read_rank_slice(
+                key, checkpoint.topology.tp_rank, (slice(0, 1),) * 3
+            ).dtype
+
         source_type, scale_type = dtype(weight_key), dtype(scale_key)
         packed = scale_type == torch.int32
-        rocm = not packed and (
-            declared == "rocm" or source_type == torch.float8_e4m3fnuz or
-            (declared is None and torch.version.hip is not None)
-        )
-        if (declared == "rocm" and packed) or (declared == "cuda" and source_type == torch.float8_e4m3fnuz):
-            raise ValueError("Contradictory FT producer ABI and block-FP8 payload")
+        rocm = block_ft_source_is_rocm(declared, source_type, packed)
         gate_up = w == "w13"
+
         def convert_weight(values, s=shape, p=packed, r=rocm, g=gate_up):
             return block_ft_weight(values[0], s, p, rocm_shuffle=r, gate_up=g)
+
         def convert_scale(values, s=shape, dt=source_type, g=gate_up, r=rocm):
             raw = values[0]
             if not g:
@@ -217,6 +306,9 @@ def block_moe_ft_bindings(layer, source_prefix, target, checkpoint, layer_id):
                 for part in ((right, left) if r else (left, right))
             ]
             return torch.cat(decoded, dim=-2)
+
         bindings.append(bind(weight_key, w, convert_weight, projs, False, packed))
-        bindings.append(bind(scale_key, w + "_scale", convert_scale, projs, True, packed))
+        bindings.append(
+            bind(scale_key, w + "_scale", convert_scale, projs, True, packed)
+        )
     return bindings

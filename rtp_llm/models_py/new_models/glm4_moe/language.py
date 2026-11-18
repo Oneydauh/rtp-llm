@@ -23,9 +23,11 @@ class Glm4MoeForCausalLM(Qwen3ForCausalLM):
     supports_checkpoint_weight_updates = False
 
     def load_ft_checkpoint(self, checkpoint):
-        from rtp_llm.models_py.new_models.qwen2.ft_checkpoint import load_dense_ft_checkpoint
+        from rtp_llm.models_py.new_models.qwen2.ft_checkpoint import (
+            load_gqa_ffn_ft_checkpoint,
+        )
 
-        load_dense_ft_checkpoint(self, checkpoint)
+        load_gqa_ffn_ft_checkpoint(self, checkpoint)
 
     def validate_lora_checkpoint_target(self, name):
         from rtp_llm.models_py.lora_checkpoint import (
