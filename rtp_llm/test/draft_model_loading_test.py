@@ -164,17 +164,23 @@ class DraftModelLoadingTest(unittest.TestCase):
             SpeculativeType.EAGLE,
             SpeculativeType.DSPARK,
         ):
-            for pp_size, pp_rank, load_method, expected_method in (
-                (1, 0, "auto", "auto"),
-                (1, 0, "fastsafetensors", "fastsafetensors"),
-                (1, 0, "scratch", "scratch"),
-                (3, 0, "fastsafetensors", None),
-                (3, 1, "fastsafetensors", None),
-                (3, 2, "auto", "scratch"),
-                (3, 2, "fastsafetensors", "scratch"),
-                (3, 2, "scratch", "scratch"),
+            for direct, pp_size, pp_rank, load_method, expected_method in (
+                (False, 1, 0, "auto", "auto"),
+                (False, 1, 0, "fastsafetensors", "fastsafetensors"),
+                (False, 1, 0, "scratch", "scratch"),
+                (False, 3, 0, "fastsafetensors", None),
+                (False, 3, 1, "fastsafetensors", None),
+                (False, 3, 2, "auto", "scratch"),
+                (False, 3, 2, "fastsafetensors", "scratch"),
+                (False, 3, 2, "scratch", "scratch"),
+                (True, 3, 0, "fastsafetensors", None),
+                (True, 3, 1, "fastsafetensors", None),
+                (True, 3, 2, "auto", "auto"),
+                (True, 3, 2, "fastsafetensors", "fastsafetensors"),
+                (True, 3, 2, "scratch", "scratch"),
             ):
                 with self.subTest(
+                    direct=direct,
                     sp_type=sp_type,
                     pp_size=pp_size,
                     pp_rank=pp_rank,
@@ -182,6 +188,7 @@ class DraftModelLoadingTest(unittest.TestCase):
                 ):
                     engine_config = make_engine_config(sp_type, pp_size, pp_rank)
                     engine_config.load_config.load_method = load_method
+                    engine_config.load_config.use_new_loader = direct
                     target_config = SimpleNamespace(
                         max_seq_len=128, gen_num_per_cycle=2
                     )
@@ -207,6 +214,7 @@ class DraftModelLoadingTest(unittest.TestCase):
                     self.assertEqual(propose.sp_type, sp_type)
                     self.assertEqual(propose.gen_num_per_circle, 2)
                     args = model_cls.from_config.call_args.kwargs
+                    self.assertIs(args["use_new_loader"], direct)
                     self.assertEqual(args["load_method"], expected_method)
                     self.assertIs(args["model_config"], draft_config)
                     self.assertEqual(
