@@ -1,16 +1,19 @@
 """Whole two-layer Kimi KDA/MLA + MoE checkpoint against main's typed config."""
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import save_file
 
 from rtp_llm.models.kimi_linear.kimi_linear import KimiLinear
 from rtp_llm.models.direct_checkpoint import load_owned_model
-from rtp_llm.models_py.model_loader import NewLoaderLoadMethod
+from rtp_llm.models_py.model_loader import NewLoaderConfig, NewLoaderLoadMethod, NewModelLoader
+from rtp_llm.models_py.new_models.deepseek_v3.moe import DeepSeekV32MoeGate
 from rtp_llm.models_py.model_desc.kimi_linear import KimiLinearModel
 from rtp_llm.models_py.new_models.kimi_linear.language import KimiLinearForCausalLM
 from rtp_llm.ops import DataType, ParallelismConfig
@@ -109,6 +112,38 @@ def _checkpoint_weights():
 
 
 class KimiModelCheckpointTest(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("KIMI_LINEAR_CHECKPOINT"), "release checkpoint not provided")
+    def test_release_router_gemm_layout(self):
+        ckpt = Path(os.environ["KIMI_LINEAR_CHECKPOINT"])
+        index = json.loads((ckpt/"model.safetensors.index.json").read_text())["weight_map"]
+        prefix = "model.layers.1.block_sparse_moe.gate."
+        data = {}
+        for name in ("weight", "e_score_correction_bias"):
+            with safe_open(str(ckpt/index[prefix+name]), framework="pt", device="cpu") as handle:
+                data[name] = handle.get_tensor(prefix+name)
+
+        class GateLoader(NewModelLoader):
+            def _create_model(self):
+                e, h = data["weight"].shape
+                return DeepSeekV32MoeGate(h, e, True, torch.bfloat16)
+
+        with tempfile.TemporaryDirectory() as root:
+            save_file(data, str(Path(root)/"model.safetensors"))
+            for method in (NewLoaderLoadMethod.SCRATCH, NewLoaderLoadMethod.FASTSAFETENSORS):
+                with self.subTest(method=method):
+                    loader = GateLoader({"model_type": "kimi_linear"},
+                                        NewLoaderConfig(device="cpu", load_method=method), model_path=root)
+                    gate = loader.load()
+                    self.assertEqual(loader.loaded_method, method)
+                    # Main KimiLinearWeight uses transpose(...).contiguous();
+                    # CudaF16Linear consumes the transposed view of that matrix.
+                    ref = data["weight"].to(torch.bfloat16).T.contiguous().T
+                    self.assertEqual(gate.weight.stride(), ref.stride())
+                    torch.testing.assert_close(gate.weight, ref, rtol=0, atol=0)
+                    torch.testing.assert_close(gate.e_score_correction_bias, data["e_score_correction_bias"].float())
+                    x = torch.randn(17, ref.shape[1], generator=torch.Generator().manual_seed(13)).bfloat16()
+                    torch.testing.assert_close(gate(x), torch.nn.functional.linear(x, ref), rtol=0, atol=0)
+
     def test_entire_typed_model(self):
         with tempfile.TemporaryDirectory() as root:
             raw = _raw_config()
@@ -142,6 +177,10 @@ class KimiModelCheckpointTest(unittest.TestCase):
                     self.assertIs(kda.self_attn.prefill_kda.conv_weights, kda.self_attn.conv1d.weight)
                     self.assertIs(kda.self_attn.decode_kda.alog, kda.self_attn.A_log)
                     self.assertIsNotNone(mla.block_sparse_moe)
+                    gate = mla.block_sparse_moe.gate
+                    expected_gate = data["model.layers.1.block_sparse_moe.gate.weight"].T.contiguous().T
+                    self.assertEqual(gate.weight.stride(), expected_gate.stride())
+                    torch.testing.assert_close(gate.weight, expected_gate)
                     self.assertIs(model.runtime_weight_view()["lm_head"], model.lm_head.weight)
                     torch.testing.assert_close(model.embed_tokens.weight, data["model.embed_tokens.weight"])
                     torch.testing.assert_close(model.lm_head.weight, data["lm_head.weight"])

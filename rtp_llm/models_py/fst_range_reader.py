@@ -153,7 +153,7 @@ def native_cpu_range_api():
 
 
 def iter_fst_range_tensors(
-    files, *, name_filter=None, slice_expander=None, read_spec_resolver=None
+    files, *, name_filter=None, slice_expander=None, read_spec_resolver=None, catalog=None
 ):
     """Read via FST C++; CPU tensors own storage beyond the reader lifetime."""
     cpp, SafeTensorsMetadata, TorchOp, dtype_convert = native_cpu_range_api()
@@ -220,7 +220,10 @@ def iter_fst_range_tensors(
     for path in files:
         with open(path, "rb", buffering=0) as stream:
             metadata = SafeTensorsMetadata.from_fd(stream.fileno(), path, framework)
+            allowed = catalog.shard_keys(path, metadata.tensors) if catalog is not None else None
             for name, frame in metadata.tensors.items():
+                if allowed is not None and name not in allowed:
+                    continue
                 if name_filter is not None and not name_filter(name):
                     continue
                 shape = tuple(frame.shape)

@@ -1,3 +1,10 @@
+py_test(
+    name = "test_fp8_online_scale_layout",
+    srcs = ["test_fp8_online_scale_layout.py"],
+    deps = ["//rtp_llm/models_py:new_weight_loader", "//rtp_llm:fastsafetensors"],
+    env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1"},
+)
+
 py_library(
     name = "mxfp4_test_fixtures",
     srcs = ["test_mxfp4_quark.py"],
@@ -18,6 +25,17 @@ py_test(
     deps = [
         "//rtp_llm/models_py:new_weight_loader",
         "//rtp_llm:torch",
+    ],
+)
+
+py_test(
+    name = "test_fp8_cpu_load",
+    srcs = ["test_fp8_cpu_load.py"],
+    env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1"},
+    deps = [
+        "//rtp_llm/models_py:new_weight_loader",
+        "//rtp_llm:torch",
+        "//rtp_llm:safetensors",
     ],
 )
 

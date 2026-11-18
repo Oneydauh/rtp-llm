@@ -7,6 +7,7 @@ from safetensors.torch import save_file
 from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.models_py.model_loader import NewLoaderConfig, NewModelLoader
 from rtp_llm.models_py.new_models.qwen3_next.language import Qwen35DenseMTPForCausalLM
+from rtp_llm.models_py.new_models.qwen3_next.language import Qwen3NextMoEBlock
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 from rtp_llm.ops import DataType, HybridAttentionType
 
@@ -181,6 +182,48 @@ def _mtp_config(model_type="qwen35_moe_mtp"):
 
 
 class Qwen3NextLoadTest(unittest.TestCase):
+    def test_shared_expert_fuses_gate_and_finalizes_only_once(self):
+        # Compare BF16 intermediate rounding with the one-store gate of the
+        # inference runtime. Use CPU stand-ins for just the CUDA kernel and TP
+        # collective so both precision and reduction order are observable.
+        block = object.__new__(Qwen3NextMoEBlock)
+        torch.nn.Module.__init__(block)
+        block.tp_size, block.ep_size = 2, 1
+        block.use_ep_shared_allreduce = False
+        block.experts = types.SimpleNamespace(fused_moe=types.SimpleNamespace(
+            router=types.SimpleNamespace(tp_collective_size=2, supports_skip_tp_allreduce=True)))
+        calls = []
+        hidden = torch.linspace(-2, 2, 64).reshape(8, 8).bfloat16()
+        gates = hidden[:, :1] * 0.625
+        shared = hidden * 2.1
+        routed = hidden.flip(1)
+        remote = hidden * 0.31
+        def route(_):
+            calls.append(("routed", block.use_unified_tp_allreduce))
+            return routed.clone()
+        def shared_expert(_, skip_allreduce=False):
+            calls.append(("shared", skip_allreduce))
+            return shared
+        def fused(gate, shard, out):
+            calls.append("merge")
+            out.copy_(torch.addcmul(out.float(), shard.float(), gate.float().sigmoid()))
+        def reduce(partial, group):
+            calls.append("allreduce")
+            return partial + remote
+        block._forward_routed = route
+        block.shared_expert = shared_expert
+        block.shared_expert_gate = lambda _: gates
+        block.sigmoid_gate_scale_add = fused
+        block.tp_all_reduce = reduce
+        expected_partial = torch.addcmul(routed.float(), shared.float(), gates.float().sigmoid()).bfloat16()
+        self.assertFalse(torch.equal(expected_partial, routed + gates.sigmoid() * shared))
+        self.assertTrue(torch.equal(block(hidden), expected_partial + remote))
+        self.assertEqual(calls, [("routed", True), ("shared", True), "merge", "allreduce"])
+        block.experts.fused_moe.router.supports_skip_tp_allreduce = False
+        calls.clear()
+        self.assertTrue(torch.equal(block(hidden), expected_partial))
+        self.assertEqual(calls, [("routed", False), ("shared", False), "merge"])
+
     def test_dense_mtp_real_checkpoint_load_uses_dense_mlp(self):
         config = _mtp_config("qwen35_dense_mtp")
         config.moe_layer_index = []

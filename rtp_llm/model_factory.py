@@ -102,6 +102,7 @@ class ModelFactory:
             vit_config=vit_config,
             merge_lora=merge_lora,
             force_cpu_load_weights=engine_config.load_config.force_cpu_load_weights,
+            reserve_runtime_mem_mb=getattr(engine_config.runtime_config, "reserve_runtime_mem_mb", 0),
             loader_recycle_handles=engine_config.load_config.loader_recycle_handles,
             moe_pure_tp_preshard=engine_config.load_config.moe_pure_tp_preshard,
         )
@@ -223,6 +224,7 @@ class ModelFactory:
                 vit_config=None,  # Propose model doesn't need vit_config
                 merge_lora=False,  # Propose model doesn't need merge_lora
                 force_cpu_load_weights=engine_config.load_config.force_cpu_load_weights,
+                reserve_runtime_mem_mb=getattr(engine_config.runtime_config, "reserve_runtime_mem_mb", 0),
                 loader_recycle_handles=engine_config.load_config.loader_recycle_handles,
                 moe_pure_tp_preshard=engine_config.load_config.moe_pure_tp_preshard,
                 weight_alias_owner=target_model if alias_names else None,

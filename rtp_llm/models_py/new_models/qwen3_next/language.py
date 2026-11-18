@@ -29,6 +29,7 @@ from rtp_llm.models_py.layers.linear import (
 )
 from rtp_llm.models_py.layers.norm import RMSNorm, RMSResNorm
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
+from rtp_llm.models_py.model_desc.generic_moe import GenericMoeLayer, use_unified_moe_tp_reduce
 from rtp_llm.models_py.module_base import CheckpointLoadTarget, RtpModule
 from rtp_llm.models_py.modules import MultimodalEmbeddingInjector
 from rtp_llm.models_py.new_models.model_base import required_config_value
@@ -634,6 +635,23 @@ class Qwen3NextMoEBlock(RtpModule):
             )
         else:
             self.shared_expert_gate = None
+        self.experts.has_shared_expert_gate = self.shared_expert_gate is not None
+        self.sigmoid_gate_scale_add = None
+        self.use_ep_shared_allreduce = (
+            self.shared_expert is not None and self.tp_size > 1 and self.ep_size > 1
+        )
+
+    @property
+    def use_unified_tp_allreduce(self) -> bool:
+        # The expert executor (and hence its actual collective) is selected
+        # after loading, not in the decoder constructor.
+        router = getattr(self.experts.fused_moe, "router", None)
+        return use_unified_moe_tp_reduce(
+            has_shared_expert=self.shared_expert is not None,
+            ffn_tp_size=self.tp_size,
+            ep_size=self.ep_size,
+            router=router,
+        )
 
     def _bind_router(self) -> None:
         if self.select_topk is not None:
@@ -641,6 +659,10 @@ class Qwen3NextMoEBlock(RtpModule):
         from rtp_llm.models_py.modules import SelectTopk
 
         selector = SelectTopk(config=self._router_config)
+        if self.shared_expert_gate is not None:
+            from rtp_llm.models_py.modules import SigmoidGateScaleAdd
+
+            self.sigmoid_gate_scale_add = SigmoidGateScaleAdd()
         if self._fake_balance_config is not None:
             from rtp_llm.models_py.modules import FakeBalanceExpert
 
@@ -653,7 +675,7 @@ class Qwen3NextMoEBlock(RtpModule):
         if device.type != "cpu":
             self._bind_router()
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward_routed(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.experts.fused_moe is None:
             raise RuntimeError(
                 "Qwen3-Next MoE executor is not initialized; load and "
@@ -680,26 +702,17 @@ class Qwen3NextMoEBlock(RtpModule):
         if self.fake_balance_expert is not None:
             self.fake_balance_expert(topk_ids, topk_weights)
 
-        experts_output = self.experts(hidden_states, topk_weights, topk_ids)
-        if self.shared_expert is None:
-            return experts_output
-
-        use_ep_shared_allreduce = self.tp_size > 1 and self.ep_size > 1
-        shared_output = self.shared_expert(
-            hidden_states, skip_allreduce=use_ep_shared_allreduce
+        return self.experts(
+            hidden_states, topk_weights, topk_ids,
+            skip_tp_allreduce=self.use_unified_tp_allreduce,
         )
-        if self.shared_expert_gate is not None:
-            gate_output = self.shared_expert_gate(hidden_states)
-            shared_contribution = torch.sigmoid(gate_output) * shared_output
-            if use_ep_shared_allreduce:
-                shared_contribution = all_reduce(shared_contribution, group=Group.TP)
-            experts_output = experts_output + shared_contribution
-        else:
-            if use_ep_shared_allreduce:
-                shared_output = all_reduce(shared_output, group=Group.TP)
-            experts_output = experts_output + shared_output
 
-        return experts_output
+    # Checkpoint parameters stay in this owner. Reuse the inference runtime's
+    # EP/TP reductions and single-rounding sigmoid gate, including the
+    # non-unified branch for executors which must finalize their own output.
+    _merge_shared_expert_output = GenericMoeLayer._merge_shared_expert_output
+    _gate_shared_expert_output = GenericMoeLayer._gate_shared_expert_output
+    forward = GenericMoeLayer.forward
 
 
 # ================================================================== #

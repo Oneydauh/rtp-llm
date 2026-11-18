@@ -97,6 +97,15 @@ class CustomHandler(object):
         self.need_post_process = False
 
     def checkpoint_weight_names(self) -> tuple[str, ...]:
+        return tuple(
+            name
+            for layer in self.checkpoint_projection_layers()
+            for name in layer
+            if name is not None
+        )
+
+    def checkpoint_projection_layers(self) -> tuple:
+        """Optional ordered (checkpoint weight, optional bias) linear stack on hidden states."""
         return ()
 
     # for cpp

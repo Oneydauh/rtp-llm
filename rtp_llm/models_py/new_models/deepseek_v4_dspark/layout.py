@@ -38,6 +38,11 @@ class DSparkV4CheckpointLayout:
         )
 
     def includes(self, name):
+        # The released draft contains a training confidence predictor in its
+        # final stage. Inference samples with the Markov tables, not this head.
+        # Leave unexpected stage tensors visible to strict dispatch.
+        if name == "mtp.2.confidence_head.proj.weight":
+            return False
         if name in self._shared or self.auxiliary(name):
             return True
         return self._backbone.accepts(name)

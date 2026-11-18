@@ -137,6 +137,7 @@ class V4DraftOwnerTest(unittest.TestCase):
                     name = "mtp.2." + name
                 tensors[name] = value
             tensors["mtp.0.ffn.gate.bias"] = torch.zeros(4)
+            tensors["mtp.2.confidence_head.proj.weight"] = torch.ones(1, 128)
             tensors.update(
                 {
                     key: value

@@ -1,5 +1,24 @@
 package(default_visibility = ["//visibility:public"])
 
+py_test(
+    name = "linear_bias_cpu_test",
+    main = "linear_bias_contract_test.py",
+    srcs = ["linear_bias_contract_test.py"],
+    args = ["CPUCheckpointBiasTest"],
+    env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "ROCR_VISIBLE_DEVICES": ""},
+    deps = ["//rtp_llm/models_py:new_weight_loader", "//rtp_llm:fastsafetensors"],
+)
+
+py_test(
+    name = "linear_bias_hipblas_test",
+    main = "linear_bias_contract_test.py",
+    srcs = ["linear_bias_contract_test.py"],
+    args = ["ROCmCheckpointBiasTest"],
+    tags = ["rocm"],
+    exec_properties = {"gpu": "MI308X-ROCM7", "gpu_count": "1"},
+    deps = ["//rtp_llm/models_py:new_weight_loader"],
+)
+
 py_library(
     name = "fp4_test_fixtures",
     srcs = ["fp4_linear_test.py", "fp4_moe_test.py"],

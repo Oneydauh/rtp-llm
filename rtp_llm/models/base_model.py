@@ -230,6 +230,7 @@ class BaseModel(object):
         moe_pure_tp_preshard: bool = False,
         weight_alias_owner: Optional["BaseModel"] = None,
         weight_alias_names: Sequence[str] = (),
+        reserve_runtime_mem_mb: int = 0,
     ) -> "BaseModel":
         """Create model from independent configuration objects.
 
@@ -264,6 +265,7 @@ class BaseModel(object):
                 "weight_alias_names require an explicit weight_alias_owner"
             )
         model._weight_alias_owner = weight_alias_owner
+        model.reserve_runtime_mem_mb = reserve_runtime_mem_mb
         model._weight_alias_names = tuple(weight_alias_names)
 
         import os

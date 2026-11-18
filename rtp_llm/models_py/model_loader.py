@@ -4,6 +4,7 @@ import os
 import platform
 import re
 import time
+from contextlib import contextmanager, nullcontext
 from itertools import chain
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -368,6 +369,7 @@ class NewLoaderConfig:
     lm_head_tp_rank: Optional[int] = None
     keep_mla_checkpoint_weights: bool = False
     custom_weight_mappings: Tuple[Tuple[str, str] | Tuple[str, str, torch.dtype], ...] = ()
+    custom_projection_layers: Tuple[Tuple[str, Optional[str]], ...] = ()
     # Experimental consumer bypass retains source file staging until batch
     # close and adds CPU range I/O. Do not enable by default without proving
     # the installed FST's early-release semantics and GPU peak behavior.
@@ -377,6 +379,7 @@ class NewLoaderConfig:
     force_cpu_load_weights: bool = False
     # Opaque owner-validated coupled tensor references (e.g. scaled vocabulary).
     prepared_runtime_loan: Any = field(default=None, repr=False, compare=False)
+    reserve_runtime_mem_mb: int = 0
 
     @classmethod
     def from_runtime(cls, parallelism_config, **options) -> "NewLoaderConfig":
@@ -609,7 +612,7 @@ class NewModelLoader:
         self.model_path = model_path
         self.parameter_aliases = dict(parameter_aliases or {})
         self._ckpt_files = None
-        self._safetensor_catalog_cache = _CHECKPOINT_CATALOG_UNSET
+        self._checkpoint_catalog_cache = _CHECKPOINT_CATALOG_UNSET
         self._selected_load_method: Optional[NewLoaderLoadMethod] = None
 
     @property
@@ -756,6 +759,7 @@ class NewModelLoader:
             # not use the whole-file loader or inference's WORLD communicator.
             weights = iter_fst_range_tensors(
                 selected_files,
+                catalog=self._checkpoint_catalog(),
                 name_filter=base_filter,
                 slice_expander=base_expander,
                 read_spec_resolver=base_resolver,
@@ -763,6 +767,7 @@ class NewModelLoader:
         else:
             weights = weight_mapper.get_all_weights(
                 selected_files,
+                catalog=self._checkpoint_catalog(),
                 device="cpu",
                 name_filter=base_filter,
                 safetensor_slice_expander=base_expander,
@@ -843,7 +848,7 @@ class NewModelLoader:
 
     def _checkpoint_files(self):
         if self._ckpt_files is None:
-            catalog = self._safetensor_catalog()
+            catalog = self._checkpoint_catalog()
             if catalog is not None:
                 self._ckpt_files = list(catalog.shard_files)
             else:
@@ -859,11 +864,15 @@ class NewModelLoader:
         return self._ckpt_files
 
     def _safetensor_catalog(self) -> Optional[weight_mapper.CheckpointCatalog]:
-        if self._safetensor_catalog_cache is _CHECKPOINT_CATALOG_UNSET:
-            self._safetensor_catalog_cache = weight_mapper.safetensor_catalog(
+        catalog = self._checkpoint_catalog()
+        return catalog if catalog is not None and catalog.format == "safetensors" else None
+
+    def _checkpoint_catalog(self) -> Optional[weight_mapper.CheckpointCatalog]:
+        if self._checkpoint_catalog_cache is _CHECKPOINT_CATALOG_UNSET:
+            self._checkpoint_catalog_cache = weight_mapper.checkpoint_catalog(
                 self._resolved_model_path()
             )
-        return self._safetensor_catalog_cache
+        return self._checkpoint_catalog_cache
 
     def _expert_filter(self):
         if self.load_config.ep_size == 1:
@@ -1063,6 +1072,12 @@ class NewModelLoader:
                 f"Registered model {model_cls.__name__} must inherit RtpModule to "
                 "provide newloader completeness validation"
             )
+        if self.load_config.custom_projection_layers and not getattr(
+            model, "supports_handler_projection_layers", False
+        ):
+            raise ValueError(
+                f"{type(model).__name__} cannot validate handler projection layers"
+            )
         if self.load_config.custom_weight_mappings and not bool(
             getattr(model, "supports_custom_weight_mappings", False)
         ):
@@ -1138,6 +1153,8 @@ class NewModelLoader:
         model: nn.Module,
         target_device: str,
         deferred_modules: Optional[List[RtpModule]] = None,
+        *,
+        keep_on_device: bool = False,
     ) -> None:
         """Allocate checkpoint-backed parameters without copying placeholders.
 
@@ -1172,6 +1189,8 @@ class NewModelLoader:
             if id(tensor) in borrowed_ids:
                 return tensor
             if id(tensor) in deferred_tensor_ids:
+                return tensor
+            if keep_on_device and tensor.device == device:
                 return tensor
             if id(tensor) in parameter_ids:
                 return torch.empty_like(tensor, device=device)
@@ -1893,7 +1912,7 @@ class NewModelLoader:
                 )
         return None
 
-    def _synchronize_fastsafetensors_prerequisite(
+    def _synchronize_load_failure(
         self,
         local_reason: Optional[str],
     ) -> Optional[str]:
@@ -1919,7 +1938,7 @@ class NewModelLoader:
             torch.distributed.all_gather_object(reasons, local_reason, group=group)
         except (RuntimeError, TypeError, ValueError) as exc:
             return (
-                "cannot synchronize fastsafetensors prerequisites across ranks: "
+                "cannot synchronize checkpoint load status across ranks: "
                 f"{exc}"
             )
         failures = [
@@ -1960,7 +1979,7 @@ class NewModelLoader:
         # WORLD collective whose other ranks will never call this loader.
         isolated_load = bool(getattr(model, "fastsafetensors_load_isolated", False))
         if not isolated_load:
-            reason = self._synchronize_fastsafetensors_prerequisite(reason)
+            reason = self._synchronize_load_failure(reason)
         if reason is None:
             selected = NewLoaderLoadMethod.FASTSAFETENSORS
             logger.info(
@@ -1976,6 +1995,84 @@ class NewModelLoader:
             )
             return NewLoaderLoadMethod.SCRATCH
         raise RuntimeError(f"NewLoader fastsafetensors prerequisite failed: {reason}")
+
+    def _arm_streamed_scratch(self, model, method):
+        # The reader is still scratch. Only V4 owners with checkpoint-backed
+        # device parameters opt in; no change to AUTO/FST platform eligibility.
+        if not (
+            method == NewLoaderLoadMethod.SCRATCH
+            and getattr(model, "arm_cuda_streamed_scratch", False)
+            and not self.load_config.force_cpu_load_weights
+            and torch.device(self.load_config.device).type == "cuda"
+            and self._accelerator_backend_name() == "Cuda"
+            and platform.machine().lower() in ("aarch64", "arm64")
+        ):
+            return False
+        # The allocation/dispatch acknowledgements use WORLD. Unlike the
+        # two-rank P/D services, auxiliary owners and PP drafts can be built
+        # by a single rank or stage. Do not introduce a new collective there.
+        pc = self.load_config.parallelism_config
+        if getattr(model, "fastsafetensors_load_isolated", False) or getattr(
+            pc, "pp_size", 1
+        ) != 1:
+            return False
+        if torch.distributed.is_initialized():
+            world = torch.distributed.get_world_size()
+            if world > 1 and getattr(pc, "world_size", None) != world:
+                return False
+        return True
+
+    @contextmanager
+    def _scratch_stage(self, phase):
+        # All scratch reads below are rank-local. Agree at the boundary before
+        # any rank enters the runtime post-load hooks with a partial model.
+        error = None
+        try:
+            yield
+        except Exception as exc:
+            error = exc
+        reason = None if error is None else f"{type(error).__name__}: {error}"
+        failure = self._synchronize_load_failure(reason)
+        if failure is not None:
+            raise RuntimeError(f"streamed scratch {phase} failed: {failure}") from error
+
+    def _prepare_streamed_scratch(self, model):
+        device = torch.device(self.load_config.device)
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        if self._staged_device_modules(model):
+            raise ValueError("streamed scratch requires final checkpoint destinations")
+        loans = borrowed_parameter_ids(model)
+        seen = set(loans)
+        size = 0
+        for tensor in chain(model.parameters(), model.buffers()):
+            if id(tensor) not in seen and tensor.device != device:
+                size += tensor.numel() * tensor.element_size()
+                seen.add(id(tensor))
+        reserve_mb = self.load_config.reserve_runtime_mem_mb
+        if type(reserve_mb) is not int or reserve_mb < 0:
+            raise ValueError(f"invalid runtime memory reservation: {reserve_mb!r} MiB")
+        reserve = reserve_mb * 1024**2
+        free, _ = torch.cuda.mem_get_info(device)
+        # Caching allocator blocks belong to this process, not other jobs.
+        usable = (
+            free
+            + torch.cuda.memory_reserved(device)
+            - torch.cuda.memory_allocated(device)
+        )
+        if usable < size + reserve:
+            raise RuntimeError(
+                f"insufficient device budget on {device}: available={usable}, "
+                f"checkpoint destination={size}, runtime reserve={reserve}"
+            )
+        self._prepare_model_for_fastsafetensors(model, str(device), keep_on_device=True)
+        logger.info(
+            "NewLoader scratch destination: %s (%d bytes); rank-local CPU reader, "
+            "no full host destination; runtime reserve=%d",
+            device,
+            size,
+            reserve,
+        )
 
     def _normal_fst_read_spec_resolver(self, resolver):
         """Keep proven full-read FP4 behavior unless explicitly opted in."""
@@ -2348,6 +2445,10 @@ class NewModelLoader:
             method == NewLoaderLoadMethod.FASTSAFETENSORS
             and not self.load_config.force_cpu_load_weights
         )
+        streamed_scratch = self._arm_streamed_scratch(model, method)
+        if streamed_scratch:
+            with self._scratch_stage("destination allocation"):
+                self._prepare_streamed_scratch(model)
         if accelerator_fst:
             staged_modules = self._staged_device_modules(model)
             self._validate_staged_device_modules(
@@ -2386,6 +2487,7 @@ class NewModelLoader:
                 overlay.base_filter(model_filter) if overlay is not None else model_filter,
                 (lambda key: self._mapped_checkpoint_name(model,key).startswith(host_prefixes))
                 if host_prefixes else None,
+                catalog=self._checkpoint_catalog(),
             )
             if independent:
                 logger.info("NewLoader FST: %d collective files; %d use independent native CPU range reads",
@@ -2394,7 +2496,7 @@ class NewModelLoader:
                 self._fastsafetensors_weights_iterator(
                     shared, self.load_config.device, base_filter, base_expander, base_resolver
                 ) if shared else (),
-                iter_fst_range_tensors(independent, name_filter=base_filter,
+                iter_fst_range_tensors(independent, catalog=self._checkpoint_catalog(), name_filter=base_filter,
                     slice_expander=base_expander, read_spec_resolver=base_resolver)
                 if independent else (),
             )
@@ -2406,6 +2508,7 @@ class NewModelLoader:
             )
             weights = iter_fst_range_tensors(
                 selected_files,
+                catalog=self._checkpoint_catalog(),
                 name_filter=base_filter,
                 slice_expander=base_expander,
                 read_spec_resolver=base_resolver,
@@ -2413,6 +2516,7 @@ class NewModelLoader:
         else:
             weights = weight_mapper.get_all_weights(
                 selected_files,
+                catalog=self._checkpoint_catalog(),
                 device="cpu",
                 name_filter=base_filter,
                 safetensor_slice_expander=base_expander,
@@ -2426,22 +2530,26 @@ class NewModelLoader:
             model, "_rtp_checkpoint_load_plan", _CHECKPOINT_LOAD_PLAN_UNSET
         )
         model._rtp_checkpoint_load_plan = checkpoint_load_plan
-        try:
-            model.load_weights(weights)
-            if staged_coordinator is not None:
-                staged_coordinator.finish()
-        finally:
-            if previous_load_plan is _CHECKPOINT_LOAD_PLAN_UNSET:
-                delattr(model, "_rtp_checkpoint_load_plan")
-            else:
-                model._rtp_checkpoint_load_plan = previous_load_plan
-            if staged_coordinator is not None:
-                for module in coordinator_modules:
-                    delattr(module, "_rtp_staged_load_coordinator")
-            close_weights = getattr(weights, "close", None)
-            if callable(close_weights):
-                close_weights()
-        self._validate_loaded_weights(model)
+        dispatch_context = (
+            self._scratch_stage("checkpoint dispatch") if streamed_scratch else nullcontext()
+        )
+        with dispatch_context:
+            try:
+                model.load_weights(weights)
+                if staged_coordinator is not None:
+                    staged_coordinator.finish()
+            finally:
+                if previous_load_plan is _CHECKPOINT_LOAD_PLAN_UNSET:
+                    delattr(model, "_rtp_checkpoint_load_plan")
+                else:
+                    model._rtp_checkpoint_load_plan = previous_load_plan
+                if staged_coordinator is not None:
+                    for module in coordinator_modules:
+                        delattr(module, "_rtp_staged_load_coordinator")
+                close_weights = getattr(weights, "close", None)
+                if callable(close_weights):
+                    close_weights()
+            self._validate_loaded_weights(model)
         logger.info(
             "Streamed checkpoint tensors with %s in %.2fs",
             method.value,
@@ -2449,6 +2557,18 @@ class NewModelLoader:
         )
 
         if not accelerator_fst:
+            if self.load_config.force_cpu_load_weights:
+                # A forced host load includes method-owned host conversion,
+                # not merely CPU I/O followed by a different GPU quantizer.
+                # Other quantization families retain their existing lifecycle.
+                for module in self._staged_device_modules(model):
+                    prepare = getattr(
+                        getattr(module, "quant_method", None),
+                        "prepare_weights_on_cpu",
+                        None,
+                    )
+                    if callable(prepare):
+                        prepare(module)
             self._migrate_staged_modules(model, self.load_config.device)
         validate_borrowed_parameters(model, self.load_config.device)
         model.to(self.load_config.device)

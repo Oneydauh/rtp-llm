@@ -656,6 +656,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         del layer._down_ch_scales
 
     def _online_per_tensor(self, layer):
+        if getattr(layer, "_fp8_cpu_weight_prepared", False):
+            layer.w13.data, layer.w13_scale.data = _requant_per_tensor_to_runtime_fp8(
+                layer.w13.data, layer.w13_scale.data
+            )
+            layer.w2.data, layer.w2_scale.data = _requant_per_tensor_to_runtime_fp8(
+                layer.w2.data, layer.w2_scale.data
+            )
+            del layer._fp8_cpu_weight_prepared
+            return
         E = layer.num_local_experts
         device = layer.w13.data.device
         runtime_dtype = _runtime_fp8_dtype(device)
@@ -676,6 +685,34 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         layer.w13 = nn.Parameter(new_w13.to(device), requires_grad=False)
         layer.w2 = nn.Parameter(new_w2.to(device), requires_grad=False)
+
+    def prepare_weights_on_cpu(self, layer):
+        if layer._quant_family != "fp8_per_tensor_online" or getattr(
+            layer, "_fp8_cpu_weight_prepared", False
+        ):
+            return
+        from rtp_llm.models_py.quant_methods.fp8_cpu import (
+            quantize_weight_per_tensor_cpu,
+        )
+
+        # Prepare both planes before installing either; a CPU preparation error
+        # must not leave a mixed BF16/FP8 expert module.
+        prepared = {}
+        for name in ("w13", "w2"):
+            source = getattr(layer, name).data
+            weight = torch.empty_like(source, dtype=torch.float8_e4m3fn)
+            scales = torch.empty(
+                layer.num_local_experts, dtype=torch.float32, device=source.device
+            )
+            for expert in range(layer.num_local_experts):
+                quantized, scale = quantize_weight_per_tensor_cpu(source[expert])
+                weight[expert].copy_(quantized)
+                scales[expert] = scale
+            prepared[name] = (weight, scales)
+        for name, (weight, scales) in prepared.items():
+            getattr(layer, name).data = weight
+            getattr(layer, name + "_scale").data = scales
+        layer._fp8_cpu_weight_prepared = True
 
     def _online_per_channel(self, layer):
         E = layer.num_local_experts

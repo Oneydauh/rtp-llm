@@ -323,6 +323,8 @@ py_library(
         ":pillow-avif-plugin",
         ":nest_asyncio",
         ":matplotlib",
+        # The shared registry imports the registered Qwen2-Audio processor.
+        ":librosa",
         ":torchvision",
         ":protobuf",
         ":pyOpenSSL",
@@ -458,6 +460,8 @@ py_library(
     deps = [
         ":ops",
         ":pydantic",
+        # server_config_setup resolves model types through ModelDict.
+        ":model_factory_register",
         "//rtp_llm/distribute:distribute",
         "//rtp_llm/models_py/distributed:rank_layout",
         ":multimodal"

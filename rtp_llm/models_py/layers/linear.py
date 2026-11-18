@@ -94,13 +94,18 @@ class LinearBase(RtpModule):
         else:
             self.bias = None
 
+    @property
+    def matmul_bias(self) -> Optional[torch.Tensor]:
+        """Bias applied inside this rank's matrix multiplication."""
+        return self.bias
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 0 or x.shape[-1] != self.input_size:
             raise ValueError(
                 f"{self.prefix or type(self).__name__} expected input width "
                 f"{self.input_size}, got {tuple(x.shape)}"
             )
-        output = self.quant_method.apply(self, x, self.bias)
+        output = self.quant_method.apply(self, x, self.matmul_bias)
         return output
 
     def validate_runtime_device(self, device: torch.device) -> None:
@@ -412,6 +417,11 @@ class RowParallelLinear(LinearBase):
 
     shard_names: List[str] = []
 
+    @property
+    def matmul_bias(self) -> Optional[torch.Tensor]:
+        # Partial products must not include the replicated output bias.
+        return None
+
     def prepare_lora_factors(self, name, a, b):
         if name != "weight":
             raise ValueError(f"Unexpected LoRA projection {name!r}")
@@ -596,7 +606,7 @@ class RowParallelLinear(LinearBase):
                 f"{self.prefix or type(self).__name__} expected input width "
                 f"{self.input_size}, got {tuple(x.shape)}"
             )
-        output = self.quant_method.apply(self, x, None)
+        output = self.quant_method.apply(self, x, self.matmul_bias)
         if self.reduce_output and self.tp_size > 1:
             from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
 

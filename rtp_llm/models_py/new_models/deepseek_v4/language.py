@@ -35,6 +35,10 @@ class _BackboneMapper:
 class OwnedV4ModelMixin:
     """Shared loader hooks; each serving role keeps its own runtime class."""
 
+    # These owners copy each selected checkpoint tensor into its final rank-local
+    # destination; CPU source tensors do not become runtime parameters.
+    arm_cuda_streamed_scratch = True
+
     runtime_parameter_paths = {
         "embedding": "v4.embed.weight",
         "lm_head": "v4.head.weight",

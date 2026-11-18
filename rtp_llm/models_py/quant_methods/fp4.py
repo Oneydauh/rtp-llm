@@ -188,7 +188,23 @@ class ModelOptFp4LinearMethod(QuantizeMethodBase):
                 )
         return parameter, selected, dim
 
+    @staticmethod
+    def _is_kv_cache_scale(layer, name, shape):
+        # ModelOpt can export FP8 KV-cache calibration alongside NVFP4 GEMM
+        # tensors. The runtime manages KV-cache scales; these are not QKV
+        # projection input_scale or weight_scale_2, and do not complete either.
+        if not hasattr(layer, "num_kv_heads") or name not in (
+            "k_proj.k_scale",
+            "v_proj.v_scale",
+        ):
+            return False
+        if tuple(shape) not in ((), (1,)):
+            raise ValueError(f"ModelOpt KV-cache scale {name!r} must be scalar")
+        return True
+
     def checkpoint_read_spec(self, layer, name, shape):
+        if self._is_kv_cache_scale(layer, name, shape):
+            return ReadSpec.skip(name, tuple(shape))
         parameter, projections, dim = self._source(layer, name, shape)
         if len(projections) == 1 and parameter != "bias":
             projection = projections[0]
@@ -232,6 +248,9 @@ class ModelOptFp4LinearMethod(QuantizeMethodBase):
             source_shape = (
                 spec.source_shape if spec is not None else tuple(tensor.shape)
             )
+            if self._is_kv_cache_scale(layer, name, source_shape):
+                # Direct/legacy checkpoint iterators need not provide a ReadSpec.
+                continue
             parameter, projections, dim = self._source(layer, name, source_shape)
             target = getattr(layer, parameter)
             keys = {projection.name for projection in projections}

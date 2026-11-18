@@ -4,6 +4,7 @@ import ntpath
 import os
 import re
 from dataclasses import dataclass
+from functools import cached_property
 from typing import (
     Callable,
     Dict,
@@ -47,6 +48,41 @@ class CheckpointCatalog:
     format: str
     entries: Tuple[Tuple[str, str], ...]
     shard_files: Tuple[str, ...]
+
+    @cached_property
+    def _keys_by_file(self):
+        # Physical paths can be symlinks (e.g. a shared HF blob cache).
+        canonical = {p: os.path.realpath(p) for p in {path for _, path in self.entries}}
+        result = {}
+        for name, path in self.entries:
+            result.setdefault(canonical[path], set()).add(name)
+        return result
+
+    @cached_property
+    def _declared_names(self):
+        return frozenset(name for name, _ in self.entries)
+
+    def shard_keys(self, path, physical_keys):
+        """Validate the declared source and expose only indexed tensor names.
+
+        A reduced checkpoint may reference a genuine full-model shard. Names
+        absent from the index are not part of this checkpoint. An indexed name
+        in the wrong shard must *not* silently substitute for its declared copy.
+        """
+        expected = self._keys_by_file[os.path.realpath(path)]
+        physical = set(physical_keys)
+        missing = expected - physical
+        if missing:
+            raise ValueError(
+                f"Checkpoint index declares tensor {min(missing)!r} in {path!r}, but it is missing"
+            )
+        extras = physical - expected
+        misplaced = extras & self._declared_names
+        if misplaced:
+            raise ValueError(
+                f"Checkpoint tensor {min(misplaced)!r} found outside its indexed shard in {path!r}"
+            )
+        return expected
 
 
 class WeightsMapper:
@@ -141,11 +177,16 @@ def _load_safetensors(
     name_filter: Optional[Callable[[str], bool]] = None,
     slice_expander: Optional[SafetensorSliceExpander] = None,
     read_spec_resolver: Optional[ReadSpecResolver] = None,
+    catalog: Optional[CheckpointCatalog] = None,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     from safetensors import safe_open
 
     with safe_open(path, framework="pt", device=device) as handle:
-        for name in handle.keys():
+        keys = handle.keys()
+        allowed = catalog.shard_keys(path, keys) if catalog is not None else None
+        for name in keys:
+            if allowed is not None and name not in allowed:
+                continue
             if name_filter is not None and not name_filter(name):
                 continue
             if slice_expander is not None and slice_expander.handles_safetensor(name):
@@ -180,13 +221,19 @@ def _load_pytorch(
     device: str,
     name_filter: Optional[Callable[[str], bool]] = None,
     read_spec_resolver: Optional[ReadSpecResolver] = None,
+    catalog: Optional[CheckpointCatalog] = None,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     payload = torch.load(path, map_location=device, weights_only=True)
     state_dict = _unwrap_pytorch_state_dict(payload)
+    allowed = (
+        catalog.shard_keys(path, (key for key, value in state_dict.items() if isinstance(value, torch.Tensor)))
+        if catalog is not None else None
+    )
     for name, tensor in state_dict.items():
         if (
             isinstance(name, str)
             and isinstance(tensor, torch.Tensor)
+            and (allowed is None or name in allowed)
             and (name_filter is None or name_filter(name))
         ):
             if read_spec_resolver is not None:
@@ -205,6 +252,7 @@ def get_all_weights(
     name_filter: Optional[Callable[[str], bool]] = None,
     safetensor_slice_expander: Optional[SafetensorSliceExpander] = None,
     read_spec_resolver: Optional[ReadSpecResolver] = None,
+    catalog: Optional[CheckpointCatalog] = None,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     seen = set()
     for path in ckpt_paths:
@@ -215,6 +263,7 @@ def get_all_weights(
                 name_filter,
                 safetensor_slice_expander,
                 read_spec_resolver,
+                catalog,
             )
         elif path.endswith((".bin", ".pt", ".pth")):
             if safetensor_slice_expander is not None:
@@ -222,7 +271,7 @@ def get_all_weights(
                     "Safetensor slice expansion cannot be used with a PyTorch "
                     f"checkpoint: {path}"
                 )
-            weights = _load_pytorch(path, device, name_filter, read_spec_resolver)
+            weights = _load_pytorch(path, device, name_filter, read_spec_resolver, catalog)
         else:
             raise ValueError(f"Unsupported checkpoint format: {path}")
         for name, tensor in weights:
@@ -240,9 +289,17 @@ def _read_checkpoint_index(
     index_path = os.path.join(model_path, index_name)
     if not os.path.isfile(index_path):
         return None
+    def unique_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"Duplicate key {key!r} in checkpoint index {index_path}")
+            result[key] = value
+        return result
+
     try:
         with open(index_path, encoding="utf-8") as handle:
-            payload = json.load(handle)
+            payload = json.load(handle, object_pairs_hook=unique_keys)
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(
             f"Failed to read checkpoint index {index_path}: {exc}"
@@ -339,6 +396,10 @@ def _checkpoint_catalog_from_index(
 def safetensor_catalog(model_path: str) -> Optional[CheckpointCatalog]:
     """Build the validated safetensors index catalog, if one exists."""
     return _checkpoint_catalog_from_index(model_path, _SAFETENSORS_INDEX)
+
+
+def checkpoint_catalog(model_path: str) -> Optional[CheckpointCatalog]:
+    return safetensor_catalog(model_path) or _checkpoint_catalog_from_index(model_path, _PYTORCH_INDEX)
 
 
 def safetensor_index_entries(

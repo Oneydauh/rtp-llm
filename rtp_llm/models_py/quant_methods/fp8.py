@@ -732,6 +732,19 @@ class Fp8OnlineLinearMethod(QuantizeMethodBase):
     requires_staged_device_postprocess = True
     required_checkpoint_parameters = ("weight",)
 
+    def prepare_weights_on_cpu(self, layer):
+        """Honor forced host conversion without declaring a serving backend."""
+        if getattr(layer, "_fp8_cpu_weight_prepared", False):
+            return
+        from rtp_llm.models_py.quant_methods.fp8_cpu import (
+            quantize_weight_per_tensor_cpu,
+        )
+
+        weight, scale = quantize_weight_per_tensor_cpu(layer.weight.data)
+        layer.weight.data = weight
+        layer.weight_scale.data = scale.reshape(1).contiguous()
+        layer._fp8_cpu_weight_prepared = True
+
     def create_weights(
         self,
         layer,
@@ -763,7 +776,12 @@ class Fp8OnlineLinearMethod(QuantizeMethodBase):
             raise ValueError(f"expected 2D weight, got {weight.shape}")
 
         self._runtime_backend = _select_fp8_runtime_backend(weight.device, "per_tensor")
-        fp8_weight, scale = _resolve_per_tensor_quant()(weight)
+        if getattr(layer, "_fp8_cpu_weight_prepared", False):
+            fp8_weight, scale = _requant_per_tensor_to_runtime_fp8(
+                weight, layer.weight_scale
+            )
+        else:
+            fp8_weight, scale = _resolve_per_tensor_quant()(weight)
 
         # nn.Parameter dtype is immutable; rebind both attributes as a
         # consistent accelerator-resident FP8/FP32 runtime pair.
@@ -776,6 +794,9 @@ class Fp8OnlineLinearMethod(QuantizeMethodBase):
             "weight_scale",
             nn.Parameter(scale.view(1).contiguous(), requires_grad=False),
         )
+
+        if hasattr(layer, "_fp8_cpu_weight_prepared"):
+            del layer._fp8_cpu_weight_prepared
 
         Fp8OnlineLinearMethod._quant_count += 1
         if not Fp8OnlineLinearMethod._quant_logged:
@@ -1321,7 +1342,13 @@ class Fp8BlockOnlineLinearMethod(QuantizeMethodBase):
         del layer.weight_scale
         layer.register_parameter(
             "weight_scale",
-            nn.Parameter(scale.contiguous(), requires_grad=False),
+            # UE8M0 requantization returns packed MN-major/TMA-aligned scales.
+            # Row-major contiguous() destroys that ABI when K has >4 blocks,
+            # triggering DeepGEMM's sf.stride(-2) == 1 assertion at first use.
+            nn.Parameter(
+                scale if scale.dtype == torch.int32 else scale.contiguous(),
+                requires_grad=False,
+            ),
         )
 
         Fp8BlockOnlineLinearMethod._quant_count += 1

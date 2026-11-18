@@ -1440,6 +1440,8 @@ class BaseMoEExperts(RtpModule):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        *,
+        skip_tp_allreduce: bool = False,
     ) -> torch.Tensor:
         if self.fused_moe is None:
             raise RuntimeError(
@@ -1484,4 +1486,5 @@ class BaseMoEExperts(RtpModule):
             topk_ids=physical_topk_ids,
             activation=self.activation_type,
             extra_finalize_args=extra_finalize_args,
+            **({"skip_tp_allreduce": True} if skip_tp_allreduce else {}),
         )

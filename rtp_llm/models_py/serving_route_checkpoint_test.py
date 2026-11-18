@@ -1,5 +1,6 @@
 """Actual CPU checkpoint I/O at the production publication boundary."""
 
+import json
 import os
 import subprocess
 import sys
@@ -66,6 +67,39 @@ class ServiceLeaf(RtpModule):
         return {"lm_head": self.weight_param}
 
 
+@register_model("_indexed_service_probe")
+class IndexedServiceProbe(ServiceLeaf):
+    def __init__(self, config, load_config):
+        super().__init__(config, load_config)
+        self.other = torch.nn.Parameter(torch.empty(3))
+
+    def resolve_checkpoint_load_plan(self, name, shape):
+        if name.startswith("model.layers.10."):
+            raise AssertionError("unindexed expert reached ReadSpec resolution")
+        return super().resolve_checkpoint_load_plan(name, shape)
+
+
+def _load_indexed_rank(rank, root, rendezvous):
+    from datetime import timedelta
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2,
+                            timeout=timedelta(seconds=60))
+    try:
+        model = service(root, "fastsafetensors", "_indexed_service_probe")
+        pc = model.parallelism_config
+        pc.world_size = pc.tp_size = 2
+        pc.world_rank = pc.local_rank = pc.tp_rank = rank
+        pc.get_attn_tp_size = pc.get_ffn_tp_size = lambda: 2
+        pc.get_attn_tp_rank = pc.get_ffn_tp_rank = lambda: rank
+        load_owned_model(model)
+        assert model.model_weights_loader.loaded_method == NewLoaderLoadMethod.FASTSAFETENSORS
+        torch.testing.assert_close(model.py_model.weight_param, torch.arange(4).reshape(2, 2).float())
+        torch.testing.assert_close(model.py_model.other, torch.tensor([-1., 17., 3.]))
+    finally:
+        dist.destroy_process_group()
+
+
 def service(path, method, model_type="_service_direct_leaf"):
     parallel = SimpleNamespace(
         world_size=1,
@@ -114,6 +148,77 @@ def service(path, method, model_type="_service_direct_leaf"):
 
 
 class DirectServingBoundaryTest(unittest.TestCase):
+    def test_two_gloo_ranks_combine_collective_and_indexed_range_reads(self):
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as root:
+            save_file({"weight_param": torch.arange(4).reshape(2, 2).float(),
+                       "model.layers.10.mlp.experts.0.weight": torch.ones(4)},
+                      os.path.join(root, "partial.safetensors"))
+            save_file({"other": torch.tensor([-1., 17., 3.])}, os.path.join(root, "clean.safetensors"))
+            with open(os.path.join(root, "model.safetensors.index.json"), "w") as handle:
+                json.dump({"weight_map": {"weight_param": "partial.safetensors", "other": "clean.safetensors"}}, handle)
+            torch.multiprocessing.spawn(_load_indexed_rank, args=(root, (Path(root)/"dist").as_uri()), nprocs=2)
+
+    def test_hf_index_owns_physical_shard_subset(self):
+        # A shortened score checkpoint keeps a physical shard from a larger
+        # model. Its unrelated experts must never reach the strict dispatcher.
+        for ext, method in (("bin", "scratch"), ("safetensors", "scratch"),
+                            ("safetensors", "fastsafetensors")):
+            with self.subTest(ext=ext, method=method), tempfile.TemporaryDirectory() as root:
+                folder = os.path.join(root, "shards")
+                os.mkdir(folder)
+                shard = f"shards/model-00001.{ext}"
+                weight = torch.arange(4).reshape(2, 2).float()
+                data = {"weight_param": weight, "model.layers.10.mlp.experts.0.scale": torch.ones(4)}
+                write = torch.save if ext == "bin" else save_file
+                write(data, os.path.join(root, shard))
+                # A file outside the index must not be discovered as a base shard.
+                write({"weight_param": -weight}, os.path.join(root, f"extra.{ext}"))
+                index = "pytorch_model.bin.index.json" if ext == "bin" else "model.safetensors.index.json"
+                with open(os.path.join(root, index), "w") as handle:
+                    json.dump({"weight_map": {"weight_param": shard}}, handle)
+                owned = service(root, method)
+                load_owned_model(owned)
+                self.assertEqual(owned.model_weights_loader.loaded_method.value, method)
+                torch.testing.assert_close(owned.py_model.weight_param, weight)
+
+    def test_hf_index_rejects_missing_and_misplaced_tensors(self):
+        from rtp_llm.models_py.weight_mapper import checkpoint_catalog
+
+        for method in ("scratch", "fastsafetensors"):
+            with self.subTest(method=method), tempfile.TemporaryDirectory() as root:
+                first, second = "a.safetensors", "b.safetensors"
+                index = os.path.join(root, "model.safetensors.index.json")
+                with open(index, "w") as handle:
+                    json.dump({"weight_map": {"weight_param": first, "other": second}}, handle)
+                save_file({"weight_param": torch.ones(2, 2)}, os.path.join(root, first))
+                for keys, error in (({"unused": torch.ones(1)}, "missing"),
+                                    ({"other": torch.ones(1), "weight_param": torch.zeros(2, 2)},
+                                     "outside its indexed shard")):
+                    save_file(keys, os.path.join(root, second))
+                    with self.assertRaisesRegex((RuntimeError, ValueError), error):
+                        load_owned_model(service(root, method))
+                with open(index, "w") as handle:
+                    handle.write('{"weight_map":{"weight_param":"a.safetensors","weight_param":"b.safetensors"}}')
+                with self.assertRaisesRegex(ValueError, "Duplicate key"):
+                    checkpoint_catalog(root)
+
+    def test_partial_index_uses_native_ranges_only_for_dirty_shards(self):
+        from rtp_llm.models_py.fst_file_plan import plan_fst_files
+        from rtp_llm.models_py.weight_mapper import checkpoint_catalog
+
+        with tempfile.TemporaryDirectory() as root:
+            a = os.path.join(root, "a.safetensors")
+            b = os.path.join(root, "b.safetensors")
+            save_file({"active": torch.ones(1), "inactive": torch.zeros(2)}, a)
+            save_file({"other": torch.zeros(1)}, b)
+            with open(os.path.join(root, "model.safetensors.index.json"), "w") as handle:
+                json.dump({"weight_map": {"active": "a.safetensors", "other": "b.safetensors"}}, handle)
+            group = SimpleNamespace(size=lambda: 1)
+            self.assertEqual(plan_fst_files([a, b], root, group, None, None, checkpoint_catalog(root)), ([b], [a]))
+            self.assertEqual(plan_fst_files([a, b], root, group, None, None), ([a, b], []))
+
     def test_direct_loading_does_not_require_legacy_adapter_database_or_rpc(self):
         # A warm process hides accidental dependencies via sys.modules. Use
         # the same runfiles as the parent and real readers in a fresh process.

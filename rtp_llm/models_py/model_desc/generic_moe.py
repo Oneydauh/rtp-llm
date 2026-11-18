@@ -31,6 +31,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def use_unified_moe_tp_reduce(*, has_shared_expert, ffn_tp_size, ep_size, router):
+    """Can both expert branches stay partial over exactly the same TP group?"""
+    return (
+        has_shared_expert
+        and ffn_tp_size > 1
+        and ep_size == 1
+        and router is not None
+        and getattr(router, "tp_collective_size", None) == ffn_tp_size
+        and getattr(router, "supports_skip_tp_allreduce", False)
+    )
+
+
 class GenericMoeLayer(nn.Module):
     """Generic MoE layer supporting both Qwen3 and internal model."""
 
@@ -122,12 +134,11 @@ class GenericMoeLayer(nn.Module):
         self.use_ep_shared_allreduce = (
             self.shared_expert is not None and self.ffn_tp_size > 1 and self.ep_size > 1
         )
-        self.use_unified_tp_allreduce = (
-            self.shared_expert is not None
-            and self.ffn_tp_size > 1
-            and self.ep_size == 1
-            and self.ffn_tp_size == router_tp_size
-            and router.supports_skip_tp_allreduce
+        self.use_unified_tp_allreduce = use_unified_moe_tp_reduce(
+            has_shared_expert=self.shared_expert is not None,
+            ffn_tp_size=self.ffn_tp_size,
+            ep_size=self.ep_size,
+            router=router,
         )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(

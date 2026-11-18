@@ -166,7 +166,7 @@ class UnquantizedLinearMethod(QuantizeMethodBase):
             layer._dense_layout_dtype = layer.weight.dtype
         executor = rocm_dense_executor_type(swizzled)(
             layer.weight.T,
-            bias=layer.bias,
+            bias=layer.matmul_bias,
             quant_config=None,
         )
         # Executors hold non-owning views. Registering them as child modules

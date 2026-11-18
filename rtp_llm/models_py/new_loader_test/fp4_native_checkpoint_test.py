@@ -88,6 +88,47 @@ def ingest(directory, recipe, *, kind="qkv", tp=1, rank=0, method="scratch"):
 
 
 class NativeFp4CheckpointTest(unittest.TestCase):
+    def test_modelopt_qkv_cache_sidecars_are_not_gemm_scales(self):
+        weights = dense_fixture.Fp4LinearTest().checkpoint("qkv")
+        sidecars = {
+            "projection.k_proj.k_scale": torch.tensor(99.0),
+            "projection.v_proj.v_scale": torch.tensor([77.0]),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            save_file(
+                {**weights, **sidecars}, os.path.join(directory, "model.safetensors")
+            )
+            for tp in (1, 2):
+                for rank in range(tp):
+                    for method in ("scratch", "fastsafetensors"):
+                        with self.subTest(tp=tp, rank=rank, method=method):
+                            layer = ingest(
+                                directory, "dense", tp=tp, rank=rank, method=method
+                            ).projection
+                            self.assertEqual(layer.weight_scale_2.item(), 2.5)
+                            self.assertEqual(layer.input_scale.item(), 3.25)
+
+        model_config, config = make_config("dense")
+        layer = _Root(model_config, config).projection
+        layer.load_weights(
+            {key.removeprefix("projection."): value for key, value in sidecars.items()}
+        )
+        self.assertFalse(layer._loaded_parameter_names)
+        for key, tensor in sidecars.items():
+            spec = layer.checkpoint_read_spec(
+                key.removeprefix("projection."), tuple(tensor.shape)
+            )
+            self.assertFalse(spec.load)
+        with self.assertRaisesRegex(ValueError, "must be scalar"):
+            layer.checkpoint_read_spec("k_proj.k_scale", (2,))
+        with self.assertRaisesRegex(ValueError, "Unknown NVFP4"):
+            layer.checkpoint_read_spec("q_proj.k_scale", ())
+        model_config, config = make_config("dense", kind="column")
+        with self.assertRaisesRegex(ValueError, "Unknown NVFP4"):
+            _Root(model_config, config).projection.checkpoint_read_spec(
+                "k_proj.k_scale", ()
+            )
+
     def test_real_scratch_and_native_fst_storage_agree(self):
         for recipe in ("dense", "offline", "online", "quark"):
             kinds = (

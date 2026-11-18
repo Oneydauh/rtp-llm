@@ -41,12 +41,49 @@ class ReplicatedHandlerHeads(nn.Module):
     vocabulary_sources = frozenset(("embed_tokens.weight", "lm_head.weight"))
     allowed = vocabulary_sources | {"classifier.weight", "classifier.bias"}
 
-    def __init__(self, mappings, mapper, hidden_size, dtype, *, projection_sources=()):
+    def __init__(
+        self,
+        mappings,
+        mapper,
+        hidden_size,
+        dtype,
+        *,
+        projection_sources=(),
+        projection_layers=(),
+        protected_roots=(),
+    ):
         super().__init__()
         self.hidden_size = hidden_size
         self.sources = {}
         self.dtypes = {}
         projections = set(projection_sources)
+        self.chain = []
+        chain_weights, chain_biases = set(), set()
+        declared = {m[1] for m in mappings}
+        if not isinstance(projection_layers, tuple):
+            raise TypeError("Handler projection layers must be an ordered tuple")
+        for pair in projection_layers:
+            if not isinstance(pair, tuple) or len(pair) != 2 or pair[0] is None:
+                raise ValueError(
+                    "Expected (checkpoint weight, optional bias) per projection"
+                )
+            mapped = []
+            for source, seen in zip(pair, (chain_weights, chain_biases)):
+                if source is None:
+                    mapped.append(None)
+                    continue
+                if not isinstance(source, str) or source not in declared:
+                    raise ValueError(f"Undeclared handler projection source {source!r}")
+                name = mapper.map_name(source)
+                if (
+                    name in chain_weights | chain_biases
+                    or name.split(".", 1)[0] in protected_roots
+                ):
+                    raise ValueError(f"Ambiguous handler projection source {source}")
+                seen.add(name)
+                mapped.append(name)
+            self.chain.append(tuple(mapped))
+        self.chain_weights, self.chain_biases = chain_weights, chain_biases
         if not all(
             isinstance(n, str) and n.endswith((".weight", ".bias")) for n in projections
         ):
@@ -55,7 +92,10 @@ class ReplicatedHandlerHeads(nn.Module):
             target, source, declared_dtype = unpack_handler_mapping(mapping)
             name = mapper.map_name(source)
             if (
-                name not in self.allowed and name not in projections
+                name not in self.allowed
+                and name not in projections
+                and name not in chain_weights
+                and name not in chain_biases
             ) or name in self.sources:
                 raise ValueError(f"Unsupported or ambiguous handler source {source}")
             self.sources[name] = (str(len(self.sources)), target)
@@ -75,12 +115,23 @@ class ReplicatedHandlerHeads(nn.Module):
             or tuple(tensor.shape) != spec.source_shape
         ):
             raise ValueError(f"Downstream checkpoint tensor {name} must be replicated")
-        is_bias = name.endswith(".bias")
+        is_bias = name in self.chain_biases or (
+            name not in self.chain_weights and name.endswith(".bias")
+        )
         if (
             not tensor.is_floating_point()
             or tensor.ndim != (1 if is_bias else 2)
             or tensor.shape[0] < 1
-            or (not is_bias and tensor.shape[1] != self.hidden_size)
+            or (
+                not is_bias
+                and (
+                    tensor.shape[1] < 1
+                    or (
+                        name not in self.chain_weights
+                        and tensor.shape[1] != self.hidden_size
+                    )
+                )
+            )
         ):
             raise ValueError(f"Invalid downstream tensor {name}: {tuple(tensor.shape)}")
         # FST frees its backing storage; the handler owns its registered parameter.
@@ -99,8 +150,26 @@ class ReplicatedHandlerHeads(nn.Module):
         ]
         if missing:
             raise RuntimeError(f"Missing downstream checkpoint tensors: {missing}")
+        width = self.hidden_size
+        for weight, bias in self.chain:
+            tensor = self.params[self.sources[weight][0]]
+            if tensor.shape[1] != width:
+                raise ValueError(
+                    f"Invalid handler projection {weight}: expected input width {width}, got {tensor.shape[1]}"
+                )
+            width = tensor.shape[0]
+            if bias is not None and self.params[self.sources[bias][0]].shape != (
+                width,
+            ):
+                raise ValueError(
+                    f"Invalid handler projection bias {bias}: expected {width} outputs"
+                )
         for name, (b_key, _) in self.sources.items():
-            if name.endswith(".bias"):
+            if (
+                name.endswith(".bias")
+                and name not in self.chain_biases
+                and name not in self.chain_weights
+            ):
                 weight = name[:-4] + "weight"
                 if weight in self.sources:
                     w_key, _ = self.sources[weight]

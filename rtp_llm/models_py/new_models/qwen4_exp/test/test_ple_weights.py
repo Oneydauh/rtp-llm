@@ -84,13 +84,15 @@ class PLECheckpointTest(unittest.TestCase):
         ) as stream:
             json.dump({"metadata": {}, "weight_map": weight_map}, stream)
 
-    def loader(self, *, tp=1, rank=0, **config):
+    def loader(
+        self, *, tp=1, rank=0, load_method=NewLoaderLoadMethod.SCRATCH, **config
+    ):
         return NewModelLoader(
             {"model_type": "qwen4_ple_storage_fixture", **config},
             NewLoaderConfig(
                 device="cpu",
                 compute_dtype=torch.bfloat16,
-                load_method=NewLoaderLoadMethod.SCRATCH,
+                load_method=load_method,
                 tp_size=tp,
                 tp_rank=rank,
             ),
@@ -201,6 +203,71 @@ class PLECheckpointTest(unittest.TestCase):
             model.ple_embedding.runtime_arguments(eos_token_id=2)["weight_scale"]
         )
 
+    def test_release_bf16_scale_normalized_after_real_scratch_and_fst(self):
+        # Actual Qwen3.8-Flash-Next-FP8 release global scale: BF16 [1],
+        # model-00005-of-00131.safetensors. The table remains raw E4M3.
+        weights = self.weights(dtype=torch.float8_e4m3fn)
+        key = "ple_embedding.ngram_embedding.weight_scale"
+        weights[key] = torch.tensor([0.00019931793212890625], dtype=torch.bfloat16)
+        self.write(weights)
+        for method in (
+            NewLoaderLoadMethod.SCRATCH,
+            NewLoaderLoadMethod.FASTSAFETENSORS,
+        ):
+            for preserve in (False, True):
+                with self.subTest(method=method, preserve=preserve):
+                    loader = self.loader(
+                        source_fp8=True, preserve_fp8=preserve, load_method=method
+                    )
+                    model = loader.load()
+                    self.assertEqual(loader.loaded_method, method)
+                    table = model.ple_embedding.ngram_embedding
+                    self.assertEqual(table.weight_scale.dtype, torch.float32)
+                    self.assertEqual(table.weight_scale.shape, torch.Size([]))
+                    torch.testing.assert_close(
+                        table.weight_scale,
+                        weights[key].float().reshape(()),
+                        rtol=0,
+                        atol=0,
+                    )
+                    for index, tensor in zip(table.shard_indices, table.runtime_shards()):
+                        raw = weights[
+                            f"ple_embedding.ngram_embedding.shard_{index}.weight"
+                        ]
+                        if preserve:
+                            torch.testing.assert_close(
+                                tensor.view(torch.uint8),
+                                raw.view(torch.uint8),
+                                rtol=0,
+                                atol=0,
+                            )
+                        else:
+                            # OldLoader converts the scale to FP32 on read, then
+                            # casts both operands to compute dtype before mul.
+                            reference = raw.bfloat16() * weights[key].float().bfloat16()
+                            torch.testing.assert_close(
+                                tensor, reference, rtol=0, atol=0
+                            )
+                    before = [(id(t), t.data_ptr()) for t in table.runtime_shards()]
+                    scale_ptr = table.weight_scale.data_ptr()
+                    table.process_weights_after_loading()
+                    self.assertEqual(
+                        before, [(id(t), t.data_ptr()) for t in table.runtime_shards()]
+                    )
+                    self.assertEqual(scale_ptr, table.weight_scale.data_ptr())
+
+    def test_supported_floating_scale_normalizes_without_changing_value(self):
+        for dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+            for shape in ((), (1,)):
+                with self.subTest(dtype=dtype, shape=shape):
+                    table = Qwen4PLEHostTable(
+                        8, 4, source_fp8=True, preserve_fp8=True
+                    )
+                    scale = torch.full(shape, 0.25, dtype=dtype)
+                    table.load_weights({"weight_scale": scale})
+                    self.assertEqual(table.weight_scale.dtype, torch.float32)
+                    self.assertEqual(table.weight_scale.item(), 0.25)
+
     def test_missing_local_shard_and_inconsistent_rows_fail(self):
         table = Qwen4PLEHostTable(8, 4, tp_size=2, tp_rank=0)
         table.load_weights({"shard_0.weight": torch.ones(4, 4, dtype=torch.bfloat16)})
@@ -261,9 +328,16 @@ class PLECheckpointTest(unittest.TestCase):
     def test_invalid_scale_dtype_and_topology_fail_before_binding(self):
         for scale in (
             torch.tensor(float("nan")),
+            torch.tensor(float("inf")),
             torch.tensor(0.0),
+            torch.tensor(-1.0),
+            torch.empty(0),
             torch.ones(2),
-            torch.tensor(1.0, dtype=torch.bfloat16),
+            torch.ones(1, 1),
+            torch.tensor(1, dtype=torch.int64),
+            torch.tensor(True),
+            torch.tensor(1e100, dtype=torch.float64),
+            torch.tensor(1e-100, dtype=torch.float64),
         ):
             with self.subTest(scale=scale):
                 table = Qwen4PLEHostTable(8, 4, source_fp8=True, preserve_fp8=True)

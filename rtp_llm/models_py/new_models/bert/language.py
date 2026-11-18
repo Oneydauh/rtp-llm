@@ -196,9 +196,13 @@ class BertEncoderOwner(GptModelBase, RtpModule):
             )
         return exports
 
+    def _input_embeddings(self, inputs):
+        """First-stage embedding boundary for specialized encoder modalities."""
+        return self.embeddings(inputs.input_ids, inputs.bert_embedding_inputs)
+
     def forward_hidden(self, inputs, fmha_impl=None):
         hidden = (
-            self.embeddings(inputs.input_ids, inputs.bert_embedding_inputs)
+            self._input_embeddings(inputs)
             if self.first
             else inputs.pp_intermediates["hidden_states"]
         )

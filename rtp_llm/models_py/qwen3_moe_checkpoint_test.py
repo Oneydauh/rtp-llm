@@ -305,10 +305,19 @@ class Qwen3MoeCpuTest(unittest.TestCase):
                         data["model.layers.0.self_attn.q_norm.weight"],
                     )
                 )
-                self.assertTrue(
-                    torch.equal(
-                        dec.mlp.gate.weight, data["model.layers.0.mlp.gate.weight"]
-                    )
+                # The original CUDA F16 gate consumes the transpose of a
+                # materialized [hidden, experts] matrix. Equal logical values
+                # with contiguous [experts, hidden] storage select a different
+                # GEMM operand layout, potentially changing a greedy route.
+                gate_ref = data["model.layers.0.mlp.gate.weight"].T.contiguous().T
+                self.assertEqual(dec.mlp.gate.weight.stride(), gate_ref.stride())
+                torch.testing.assert_close(dec.mlp.gate.weight, gate_ref, rtol=0, atol=0)
+                tokens = torch.randn(3, 4, generator=torch.Generator().manual_seed(13))
+                torch.testing.assert_close(
+                    dec.mlp.gate(tokens),
+                    torch.nn.functional.linear(tokens, gate_ref),
+                    rtol=0,
+                    atol=0,
                 )
                 for i in range(4):
                     prefix = f"model.layers.0.mlp.experts.{i}."

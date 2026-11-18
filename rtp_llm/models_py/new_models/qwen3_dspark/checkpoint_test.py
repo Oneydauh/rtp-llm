@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import torch
 from safetensors.torch import save_file
 
+from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.models_py.borrowed_parameters import (
     BorrowedParameter,
     validate_borrowed_parameters,
@@ -21,38 +22,34 @@ from rtp_llm.models_py.model_loader import NewLoaderConfig, NewModelLoader
 from rtp_llm.models_py.new_models.qwen3_dspark import Qwen3DSparkForCausalLM
 from rtp_llm.models_py.quant_methods import QuantizationConfig
 from rtp_llm.models_py.registry import get_model_class
+from rtp_llm.ops import RopeStyle
 
 
-def config(draft=True, tp=1):
-    cfg = SimpleNamespace(
-        model_type="qwen_3_dspark" if draft else "qwen_3",
-        num_layers=2,
-        is_mtp=draft,
-        capture_aux_hidden_layer_ids=[],
-        hidden_state_capture_layer_ids=[],
-        vocab_size=4 if draft else 8,
-        input_vocab_size=8,
-        hidden_size=4,
-        inter_size=4,
-        attn_config=SimpleNamespace(
-            head_num=2, kv_head_num=1, size_per_head=2, is_causal=False
-        ),
-        layernorm_eps=1e-6,
-        enable_fp32_lm_head=False,
-        tie_word_embeddings=False,
-        dspark_target_layer_ids=[0, 3],
-        gen_num_per_cycle=3,
-        dspark_sample_from_anchor=False,
-        dspark_noise_token_id=7,
-        dspark_markov_rank=2,
-    )
-    cfg.getAttentionConfigs = lambda size: SimpleNamespace(
-        head_num=2 // size,
-        kv_head_num=1,
-        size_per_head=2,
-        is_causal=False,
-        kernel_tokens_per_block=4,
-    )
+def config(draft=True):
+    # Let the production config derive rank-local heads, RoPE cache length
+    # and kernel block geometry; CUDA initializes the real context RoPE on load.
+    cfg = ModelConfig()
+    cfg.model_type = "qwen_3_dspark" if draft else "qwen_3"
+    cfg.num_layers = 2
+    cfg.is_mtp = draft
+    cfg.vocab_size = 4 if draft else 8
+    cfg.input_vocab_size = 8
+    cfg.hidden_size = cfg.inter_size = 4
+    cfg.max_seq_len = 32
+    cfg.layernorm_eps = 1e-6
+    cfg.enable_fp32_lm_head = False
+    cfg.dspark_target_layer_ids = [0, 3]
+    cfg.gen_num_per_cycle = 3
+    cfg.dspark_sample_from_anchor = False
+    cfg.dspark_noise_token_id = 7
+    cfg.dspark_markov_rank = 2
+    attn = cfg.attn_config
+    attn.head_num, attn.kv_head_num, attn.size_per_head = 2, 1, 2
+    attn.is_causal = not draft
+    attn.tokens_per_block = 4
+    attn.rope_config.style = RopeStyle.Base
+    attn.rope_config.dim = attn.size_per_head
+    attn.rope_config.base = 10000
     return cfg
 
 
@@ -136,6 +133,13 @@ class DSparkLoadTest(unittest.TestCase):
     def test_production_registration_and_real_scratch_checkpoint(self):
         self.assertIs(get_model_class("qwen_3_dspark"), Qwen3DSparkForCausalLM)
         model = self.load(checkpoint())
+        # The CUDA graph target loads this same checkpoint and uses these
+        # native fields when it constructs MhaRotaryEmbeddingOp.
+        attn = model.attn_configs
+        self.assertEqual(attn.rope_config.style, RopeStyle.Base)
+        self.assertEqual(attn.rope_config.dim, attn.size_per_head)
+        self.assertEqual(attn.max_seq_len + attn.gen_num_per_cycle + 1, 36)
+        self.assertEqual(attn.kernel_tokens_per_block, 4)
         self.assertEqual(model.d2t.tolist(), [0, 2, 4, 6])
         self.assertEqual(tuple(model.embed_tokens.weight.shape), (8, 4))
         self.assertEqual(tuple(model.lm_head.weight.shape), (4, 4))

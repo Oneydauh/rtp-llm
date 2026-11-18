@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 from rtp_llm.device.device_type import DeviceType, get_device_type
 from rtp_llm.models_py.layers.moe_experts import BaseMoEExperts
+from rtp_llm.models_py.model_desc.generic_moe import use_unified_moe_tp_reduce
 from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.quant_methods.moe_topk import group_topk_supported
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
@@ -247,7 +248,10 @@ class DeepSeekV32MoeGate(RtpModule):
     ):
         super().__init__()
         self.weight = nn.Parameter(
-            torch.empty(num_experts, hidden_size, dtype=params_dtype),
+            # Legacy's gate checkpoint transform makes [H,E] contiguous, and
+            # CUDA F16Linear consumes its transpose.  Keep that F.linear
+            # operand stride: the two cuBLAS layouts need not round alike.
+            torch.empty(hidden_size, num_experts, dtype=params_dtype).T,
             requires_grad=False,
         )
         if has_correction_bias:
@@ -333,6 +337,8 @@ class DeepSeekV32MoEBlock(RtpModule):
             grouped=grouped,
         )
         self.top_k = top_k
+        self.ffn_tp_size = tp_size
+        self.ep_size = ep_size
         self.scoring_func = scoring_func
         self.routed_scaling_factor = routed_scaling_factor
         self.n_group = n_group
@@ -498,7 +504,9 @@ class DeepSeekV32MoEBlock(RtpModule):
                 tp_rank=tp_rank,
                 quant_config=quant_config,
                 params_dtype=params_dtype,
-                reduce_output=True,
+                # Merge partial routed + shared outputs before the collective
+                # when the router permits it.  Otherwise only reduce shared.
+                reduce_output=False,
                 prefix=f"{prefix}.shared_experts",
             )
         else:
@@ -589,10 +597,24 @@ class DeepSeekV32MoEBlock(RtpModule):
         if self.fake_balance_expert is not None:
             self.fake_balance_expert(topk_ids, topk_weights)
 
-        experts_output = self.experts(hidden_states, topk_weights, topk_ids)
+        return self._merge_experts(hidden_states, topk_weights, topk_ids)
 
-        if self.shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
-            experts_output = experts_output + shared_output
+    def _merge_experts(self, hidden_states, topk_weights, topk_ids):
+        if self.shared_experts is None:
+            return self.experts(hidden_states, topk_weights, topk_ids)
+        from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
 
-        return experts_output
+        router = getattr(self.experts.fused_moe, "router", None)
+        if use_unified_moe_tp_reduce(
+            has_shared_expert=True,
+            ffn_tp_size=self.ffn_tp_size,
+            ep_size=self.ep_size,
+            router=router,
+        ):
+            routed = self.experts(hidden_states, topk_weights, topk_ids, skip_tp_allreduce=True)
+            return all_reduce(routed + self.shared_experts(hidden_states), group=Group.TP)
+        routed = self.experts(hidden_states, topk_weights, topk_ids)
+        shared = self.shared_experts(hidden_states)
+        if self.ffn_tp_size > 1:
+            shared = all_reduce(shared, group=Group.TP)
+        return routed + shared

@@ -106,10 +106,18 @@ def load_owned_model(service, *, publish_runtime=True):
         py_hw_kernel_config=service.hw_kernel_config,
         max_generate_batch_size=service.max_generate_batch_size,
         force_cpu_load_weights=getattr(service, "force_cpu_load_weights", False),
+        reserve_runtime_mem_mb=getattr(service, "reserve_runtime_mem_mb", 0),
         custom_weight_mappings=(
             service.custom_module.checkpoint_weight_mappings()
             if service.custom_module is not None
             else ()
+        ),
+        custom_projection_layers=(
+            getattr(
+                getattr(service.custom_module, "handler", None),
+                "checkpoint_projection_layers",
+                lambda: (),
+            )()
         ),
     )
     loader = NewModelLoader(

@@ -104,7 +104,12 @@ def _rank_filter_worker(rank, directory, invalid):
 def check_local_ple(test, method, *, exported, preserve=True):
     dtype = torch.float8_e4m3fn if preserve or not exported else torch.bfloat16
     values = {i: (torch.arange(6).view(2, 3) + i).to(dtype) for i in range(4)}
-    scale = torch.tensor(0.25, dtype=torch.float32)
+    # HF release stores BF16 [1]; legacy FT exports the normalized FP32 scalar.
+    scale = (
+        torch.tensor(0.25, dtype=torch.float32)
+        if exported
+        else torch.tensor([0.00019931793212890625], dtype=torch.bfloat16)
+    )
     aux = torch.tensor([3.0, 7.0, 9.0])
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
@@ -166,7 +171,7 @@ def _fst_worker(rank, directory):
             True,
             values,
             torch.tensor([3.0, 7.0, 9.0]),
-            torch.tensor(0.25),
+            torch.tensor(0.00019931793212890625),
         )
     finally:
         torch.distributed.destroy_process_group()
@@ -192,7 +197,7 @@ def _verify(test, root, method, rank, preserve, values, aux, scale):
         )
         pointers.append(tensor.data_ptr())
     if preserve:
-        torch.testing.assert_close(model.table.weight_scale, scale)
+        torch.testing.assert_close(model.table.weight_scale, scale.float().reshape(()))
         test.assertEqual(model.table.weight_scale.device.type, "cpu")
     model.to("meta")
     test.assertTrue(model.aux.is_meta)

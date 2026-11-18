@@ -101,7 +101,8 @@ def h20_oss_suites():
                     "data/model/qwen3_moe/q_r_30b_py_tp2.json",
                     "data/prompt_candidates.json",
                 ],
-                smoke_args = "--moe_strategy fp8_per_block_no_dp --quantization FP8_PER_BLOCK --act_type BF16 --tp_size 2 --ep_size 2 --world_size 2 --use_deepep_moe 0 --load_method fastsafetensors --eplb_mode ALL --redundant_expert 2 --eplb_update_time 12 --eplb_test_mode 1 --eplb_force_repack 1 --warm_up 0 --enable_cuda_graph 1 --decode_capture_config '1' --reserver_runtime_mem_mb 16005 --seq_size_per_block 64 --concurrency_limit 4",
+                # AUTO must choose the SM90 graph-capable masked executor.
+                smoke_args = "--moe_strategy auto --quantization FP8_PER_BLOCK --act_type BF16 --tp_size 2 --ep_size 2 --world_size 2 --use_deepep_moe 0 --load_method fastsafetensors --eplb_mode ALL --redundant_expert 2 --eplb_update_time 12 --eplb_test_mode 1 --eplb_force_repack 1 --warm_up 0 --enable_cuda_graph 1 --decode_capture_config '1' --reserver_runtime_mem_mb 16005 --seq_size_per_block 64 --concurrency_limit 4",
                 gpu_type = ["H20_CU13"],
             ),
             smoke_test(

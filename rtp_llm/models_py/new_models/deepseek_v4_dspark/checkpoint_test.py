@@ -29,14 +29,21 @@ class _Sampler(DSparkMarkovHead):
         super().__init__(
             config.vocab_size, config.vocab_size, config.dspark_markov_rank
         )
+        self.proposal_layout = config.proposal_layout
+
+    def checkpoint_weight_name_filter(self):
+        if self.proposal_layout:
+            return DSparkV4CheckpointLayout(False).includes
+        return super().checkpoint_weight_name_filter()
 
 
-def _load(folder, vocab, rank, method):
+def _load(folder, vocab, rank, method, *, proposal_layout=False):
     loader = NewModelLoader(
         SimpleNamespace(
             model_type="_test_v4_flash_dspark_markov",
             vocab_size=vocab,
             dspark_markov_rank=rank,
+            proposal_layout=proposal_layout,
         ),
         NewLoaderConfig(device="cpu", load_method=method),
         model_path=str(folder),
@@ -72,6 +79,8 @@ class V4DSparkCheckpointTest(unittest.TestCase):
                 "mtp.0.attn.wq_a.weight",
                 "mtp.2.norm.weight",
                 "mtp.1.ffn.experts.12.w2.scale",
+                "mtp.2.confidence_head.proj.weight",
+                "mtp.2.confidence_head.unknown.weight",
                 "norm.weight",
             }
         )
@@ -81,7 +90,12 @@ class V4DSparkCheckpointTest(unittest.TestCase):
         self.assertEqual(
             set(filter(decode.includes, inventory)),
             inventory
-            - {"layers.42.attn.wkv.weight", "mtp.3.attn.wkv.weight", "norm.weight"},
+            - {
+                "layers.42.attn.wkv.weight",
+                "mtp.3.attn.wkv.weight",
+                "norm.weight",
+                "mtp.2.confidence_head.proj.weight",
+            },
         )
         self.assertNotIn(_TABLES[0], set(filter(prefill.auxiliary, inventory)))
         self.assertTrue(all(map(decode.auxiliary, _TABLES)))
@@ -91,6 +105,19 @@ class V4DSparkCheckpointTest(unittest.TestCase):
 
     def test_real_sampler_scratch(self):
         self._check_sampler("scratch")
+
+    def test_proposal_load_ignores_only_the_unused_release_head(self):
+        tensors = {name: torch.ones(16, 3).bfloat16() for name in _TABLES}
+        tensors["mtp.2.confidence_head.proj.weight"] = torch.ones(1, 8)
+        with tempfile.TemporaryDirectory() as folder:
+            checkpoint = str(Path(folder) / "model.safetensors")
+            save_file(tensors, checkpoint)
+            model = _load(folder, 16, 3, "scratch", proposal_layout=True)
+            torch.testing.assert_close(model.markov_w2.weight, tensors[_TABLES[1]])
+            tensors["mtp.2.confidence_head.unknown.weight"] = torch.ones(1)
+            save_file(tensors, checkpoint)
+            with self.assertRaisesRegex(RuntimeError, "confidence_head.unknown.weight"):
+                _load(folder, 16, 3, "scratch", proposal_layout=True)
 
     @unittest.skipUnless(
         os.getenv("NEWLOADER_TEST_NATIVE_FST") == "1", "requires real FST"
@@ -127,6 +154,10 @@ class V4DSparkCheckpointTest(unittest.TestCase):
         # Exclude the two shared globals which a production target lends.
         prefill = set(filter(DSparkV4CheckpointLayout(True).includes, index)) - _GLOBALS
         self.assertEqual(prefill, _COMMIT)
+        self.assertNotIn(
+            "mtp.2.confidence_head.proj.weight",
+            set(filter(DSparkV4CheckpointLayout(False).includes, index)),
+        )
         self.assertEqual(len({index[name] for name in prefill}), 3)
         self.assertEqual(
             len(config["compress_ratios"]) - config["num_hidden_layers"], 3

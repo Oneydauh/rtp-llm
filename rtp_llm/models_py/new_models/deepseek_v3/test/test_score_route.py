@@ -3,8 +3,10 @@ import json
 import math
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
@@ -13,6 +15,7 @@ from rtp_llm.models.deepseek_v2 import DeepSeekV2
 from rtp_llm.models.direct_checkpoint import load_owned_model
 from rtp_llm.models_py.model_loader import NewLoaderLoadMethod
 from rtp_llm.models_py.new_models.deepseek_v3.language import DeepSeekV32ForCausalLM
+from rtp_llm.models_py.new_models.deepseek_v3.moe import DeepSeekV32MoEBlock
 from rtp_llm.ops import ParallelismConfig
 from rtp_llm.utils.model_weight import W
 
@@ -78,7 +81,47 @@ def _score_weights():
 
 
 
+def _check_expert_reduction(rank, rendezvous):
+    import torch.distributed as dist
+    from rtp_llm.models_py.distributed.collective_torch import Group
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2,
+                            timeout=timedelta(seconds=45))
+    try:
+        def tp_reduce(value, group):
+            assert group == Group.TP
+            dist.all_reduce(value)
+            return value
+
+        # Identical real BF16 collectives but deliberately different rounding
+        # when branches are reduced independently versus combined on each rank.
+        for ep_size, can_skip in ((1, True), (1, False), (2, True)):
+            expected_skip = ep_size == 1 and can_skip
+            class Routed:
+                fused_moe = SimpleNamespace(router=SimpleNamespace(
+                    tp_collective_size=2, supports_skip_tp_allreduce=can_skip))
+
+                def __call__(self, x, weights, ids, *, skip_tp_allreduce=False):
+                    assert skip_tp_allreduce == expected_skip
+                    routed = torch.tensor([256.0 if rank == 0 else -256.0], dtype=torch.bfloat16)
+                    return routed if skip_tp_allreduce else tp_reduce(routed, Group.TP)
+
+            owner = SimpleNamespace(ffn_tp_size=2, ep_size=ep_size, experts=Routed(),
+                                    shared_experts=lambda x: torch.ones(1, dtype=torch.bfloat16))
+            with patch("rtp_llm.models_py.distributed.collective_torch.all_reduce", tp_reduce):
+                result = DeepSeekV32MoEBlock._merge_experts(owner, None, None, None)
+            torch.testing.assert_close(result, torch.tensor([1.0 if expected_skip else 2.0],
+                                                            dtype=torch.bfloat16), rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
 class ScoreRouteTest(unittest.TestCase):
+    def test_shared_experts_round_after_the_correct_collective(self):
+        with tempfile.TemporaryDirectory() as root:
+            torch.multiprocessing.spawn(_check_expert_reduction,
+                                        args=((Path(root)/"rendezvous").as_uri(),), nprocs=2)
+
     def test_main_config_load_and_sparse_runtime_ownership(self):
         for tag, hf, sparse, interleave in (
             ("deepseek3", "deepseek_v3", False, False),

@@ -15,7 +15,7 @@ from safetensors.torch import save_file
 
 from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.config.quant_config import ModelOptFp4Config, MXFp4QuarkQuantConfig
-from rtp_llm.models_py.layers.linear import ColumnParallelLinear
+from rtp_llm.models_py.layers.linear import ColumnParallelLinear, QKVParallelLinear
 from rtp_llm.models_py.layers.moe_experts import BaseMoEExperts
 from rtp_llm.models_py.model_loader import NewLoaderConfig, NewModelLoader
 from rtp_llm.models_py.module_base import RtpModule
@@ -35,6 +35,18 @@ class _AcceleratorRoot(RtpModule):
                 params_dtype=torch.bfloat16,
                 quant_config=QuantizationConfig("modelopt_fp4"),
                 prefix="projection",
+            )
+            return
+        if config.recipe == "qkv_cache":
+            self.projection = QKVParallelLinear(
+                hidden_size=128,
+                num_heads=8,
+                num_kv_heads=4,
+                head_dim=16,
+                params_dtype=torch.bfloat16,
+                quant_config=QuantizationConfig("modelopt_fp4"),
+                prefix="projection",
+                bias=False,
             )
             return
         source = (
@@ -73,6 +85,18 @@ class _AcceleratorRoot(RtpModule):
 
 
 def _weights(recipe):
+    if recipe == "qkv_cache":
+        result = {
+            "projection.k_proj.k_scale": torch.tensor(77.0),
+            "projection.v_proj.v_scale": torch.tensor(99.0),
+        }
+        for proj, rows in (("q", 128), ("k", 64), ("v", 64)):
+            stem = f"projection.{proj}_proj."
+            result[stem + "weight"] = torch.full((rows, 64), 17, dtype=torch.uint8)
+            result[stem + "weight_scale"] = torch.ones(rows, 8).to(torch.float8_e4m3fn)
+            result[stem + "weight_scale_2"] = torch.tensor(0.25)
+            result[stem + "input_scale"] = torch.tensor(1.0)
+        return result
     if recipe == "dense":
         return {
             "projection.weight": torch.full((128, 64), 17, dtype=torch.uint8),
@@ -113,7 +137,7 @@ class Fp4AcceleratorCheckpointTest(unittest.TestCase):
         if platform == "sm100":
             self.assertIsNone(torch.version.hip)
             self.assertGreaterEqual(torch.cuda.get_device_capability()[0], 10)
-            recipes = ("dense", "offline", "online")
+            recipes = ("dense", "qkv_cache", "offline", "online")
         else:
             self.assertTrue(torch.version.hip)
             self.assertEqual(
@@ -145,6 +169,11 @@ class Fp4AcceleratorCheckpointTest(unittest.TestCase):
                         )
                         model = loader.load()
                         self.assertEqual(loader.loaded_method.value, method)
+                        if recipe == "qkv_cache":
+                            self.assertEqual(
+                                model.projection.weight_scale_2.item(), 0.25
+                            )
+                            self.assertEqual(model.projection.input_scale.item(), 1.0)
                         x = (
                             torch.arange(8 * 128, device="cuda")
                             .float()
@@ -153,7 +182,7 @@ class Fp4AcceleratorCheckpointTest(unittest.TestCase):
                             / 128
                         ).bfloat16()
                         with torch.inference_mode():
-                            if recipe == "dense":
+                            if recipe in ("dense", "qkv_cache"):
                                 output = model.projection(x)
                             else:
                                 output = model.experts(

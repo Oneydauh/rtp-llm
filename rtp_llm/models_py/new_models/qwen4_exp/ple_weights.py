@@ -132,17 +132,32 @@ class Qwen4PLEHostTable(FixedHostCheckpointStorage, RtpModule):
             if source.is_meta:
                 raise ValueError("PLE source must be materialized")
             if name == "weight_scale":
+                # The released FP8 checkpoint stores this global scale as BF16.
+                # OldLoader requested load_tensor(..., torch.float32) before
+                # validation; native FST and scratch now deliver the raw source
+                # dtype. Normalize at the owning module, not in the reader (the
+                # neighboring FP8 table shards must retain their original bytes).
                 if (
-                    source.dtype != torch.float32
+                    source.dtype not in (
+                        torch.float16,
+                        torch.bfloat16,
+                        torch.float32,
+                        torch.float64,
+                    )
                     or source.numel() != 1
                     or source.ndim > 1
-                    or not bool(torch.isfinite(source).all())
-                    or not bool((source > 0).all())
                 ):
                     raise ValueError(
-                        "PLE scale requires one finite positive FP32 scalar"
+                        "PLE scale requires one finite positive FP32-representable "
+                        f"floating scalar; got {source.dtype} shape {tuple(source.shape)}"
                     )
-                self.weight_scale.copy_(source.reshape(()).to(device="cpu"))
+                scale = source.reshape(()).to(device="cpu", dtype=torch.float32)
+                if not bool(torch.isfinite(scale)) or not bool(scale > 0):
+                    raise ValueError(
+                        "PLE scale requires one finite positive FP32-representable "
+                        f"floating scalar; got {source.dtype} value {source.tolist()}"
+                    )
+                self.weight_scale.copy_(scale)
                 self._mark_weight_loaded("weight_scale")
             else:
                 self._validate_shape(source.shape)

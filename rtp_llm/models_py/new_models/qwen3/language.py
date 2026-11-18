@@ -438,6 +438,7 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
 
     supports_checkpoint_weight_updates = True
     supports_custom_weight_mappings = True
+    supports_handler_projection_layers = True
 
     _decoder_layer = Qwen3DecoderLayer
     _dense_config = staticmethod(_extract_config_values)
@@ -574,6 +575,14 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
             self.WEIGHTS_MAPPER,
             cfg["hidden_size"],
             cfg["params_dtype"],
+            projection_layers=getattr(load_config, "custom_projection_layers", ()),
+            protected_roots={
+                "embed_tokens",
+                "lm_head",
+                "norm",
+                "layers",
+                "handler_heads",
+            },
         )
 
     def __init__(self, model_config: Any, load_config: Any):

@@ -46,6 +46,11 @@ class RMSNorm(RtpModule):
             torch.ones(hidden_size, dtype=params_dtype), requires_grad=False
         )
 
+    @property
+    def variance_epsilon(self) -> float:
+        """Epsilon consumed by runtimes that fuse the norm into another op."""
+        return self.eps
+
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         for name, tensor in weights.items():
             if name != "weight":

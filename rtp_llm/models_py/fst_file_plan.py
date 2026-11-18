@@ -7,7 +7,7 @@ import torch
 from safetensors import safe_open
 
 
-def plan_fst_files(files, root, process_group, model_filter, is_fixed_host):
+def plan_fst_files(files, root, process_group, model_filter, is_fixed_host, catalog=None):
     """Only share files whose collective tensor schedule agrees on every peer.
 
     Native FST brokers a file sequence, not a list of tensor names per rank.
@@ -18,19 +18,27 @@ def plan_fst_files(files, root, process_group, model_filter, is_fixed_host):
     """
     by_name = {os.path.relpath(path, root): path for path in files}
     world = process_group.size()
-    if world == 1 and is_fixed_host is None:
+    if world == 1 and is_fixed_host is None and catalog is None:
         return list(files), []
     local = {}
     error = None
     try:
         for name, path in by_name.items():
-            if model_filter is None and is_fixed_host is None:
+            if model_filter is None and is_fixed_host is None and catalog is None:
                 local[name] = ("all", False)
                 continue
             selected = []
             host = False
             with safe_open(path, framework="pt", device="cpu") as shard:
                 keys = shard.keys()
+                if catalog is not None and len(catalog.shard_keys(path, keys)) != len(keys):
+                    # A whole-file transport could stage unindexed weights or
+                    # cross-wire duplicate names from unrelated physical tails.
+                    local[name] = ("indexed subset", True)
+                    continue
+                if model_filter is None and is_fixed_host is None:
+                    local[name] = ("all", False)
+                    continue
                 for key in keys:
                     if model_filter is None or model_filter(key):
                         selected.append(key)

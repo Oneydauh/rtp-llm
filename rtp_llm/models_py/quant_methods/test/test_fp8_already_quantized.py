@@ -21,6 +21,7 @@ from typing import Optional
 from unittest import mock
 
 import torch
+
 from rtp_llm.config.quant_config import Fp8PerTensorCompressedQuantConfig
 from rtp_llm.models_py.kernels.cuda.fp8_quant import (
     create_per_token_group_quant_fp8_output_scale,
@@ -726,6 +727,7 @@ class TestRocmFp8PerChannelOnline(unittest.TestCase):
     def test_fp16_bf16_tp_weights_use_ptpc_runtime(self):
         import aiter
         from aiter.ops.shuffle import shuffle_weight
+
         from rtp_llm.models_py.kernels.rocm.fp8_kernel import rocm_per_token_quant_fp8
 
         # Match the production PTPC shape family used by the tuned AITer path:
@@ -1116,15 +1118,25 @@ class TestFp8BlockLoad(_LoadBackendMixin, unittest.TestCase):
                 sys.modules, {"deep_gemm": library}
             ), mock.patch.object(fp8, "fp8_gemm_nt", None), mock.patch.object(
                 torch.cuda, "is_available", return_value=True
-            ), mock.patch.object(fp8, "_is_hip_runtime", return_value=False), mock.patch.object(
+            ), mock.patch.object(
+                fp8, "_is_hip_runtime", return_value=False
+            ), mock.patch.object(
                 fp8, "_device_arch", return_value=((9, 0), "")
             ):
-                self.assertEqual(fp8.is_deep_gemm_runtime_available(torch.device("cuda:0")), expected)
-                self.assertFalse(fp8.is_deep_gemm_runtime_available(torch.device("cpu")))
+                self.assertEqual(
+                    fp8.is_deep_gemm_runtime_available(torch.device("cuda:0")), expected
+                )
+                self.assertFalse(
+                    fp8.is_deep_gemm_runtime_available(torch.device("cpu"))
+                )
 
-        with mock.patch.object(torch.cuda, "is_available", return_value=True), mock.patch.object(
+        with mock.patch.object(
+            torch.cuda, "is_available", return_value=True
+        ), mock.patch.object(
             fp8, "_is_hip_runtime", return_value=False
-        ), mock.patch.object(fp8, "_device_arch", return_value=((8, 9), "")), mock.patch.object(
+        ), mock.patch.object(
+            fp8, "_device_arch", return_value=((8, 9), "")
+        ), mock.patch.object(
             fp8, "_resolve_fp8_gemm_nt"
         ) as resolve:
             self.assertFalse(fp8.is_deep_gemm_runtime_available(torch.device("cuda:0")))
@@ -1397,7 +1409,9 @@ class TestFp8BlockForward(unittest.TestCase):
             self.skipTest(str(error))
 
     def test_forward_matches_online_path(self):
-        N, K, M = 256, 256, 32  # 2x2 weight blocks
+        # K must exceed 512: one packed UE8M0 column is also contiguous and
+        # cannot expose accidental destruction of the MN-major scale strides.
+        N, K, M = 256, 1024, 32
         device = "cuda"
 
         weight_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=device) * 0.05
@@ -1442,6 +1456,9 @@ class TestFp8BlockForward(unittest.TestCase):
         if is_deep_gemm_e8m0_used():
             self.assertEqual(offline.weight_scale.dtype, torch.int32)
             self.assertEqual(online.weight_scale.dtype, torch.int32)
+            self.assertGreater(online.weight_scale.shape[-1], 1)
+            self.assertEqual(offline.weight_scale.stride(-2), 1)
+            self.assertEqual(online.weight_scale.stride(-2), 1)
         else:
             self.assertEqual(offline.weight_scale.dtype, torch.float32)
             self.assertEqual(online.weight_scale.dtype, torch.float32)

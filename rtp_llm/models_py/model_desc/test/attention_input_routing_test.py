@@ -534,7 +534,8 @@ class AttentionInputRoutingTest(unittest.TestCase):
 
         module = "rtp_llm.models_py.model_desc.deepseek_v4_dspark_model"
         with patch(f"{module}.require_pool_tokens_per_block", return_value=16), patch(
-            f"{module}.create_write_cache_store_impl", side_effect=make_writer
+            "rtp_llm.models_py.modules.factory.attention.common.create_write_cache_store_impl",
+            side_effect=make_writer,
         ):
             model.commit_feature_rows(
                 torch.zeros(1, 4),
