@@ -114,9 +114,13 @@ def _extract_config_values(
     vocab_size = _positive_int(
         required_config_value(model_config, "vocab_size"), "vocab_size"
     )
-    inter_size = _positive_int(
-        required_config_value(model_config, "inter_size"), "inter_size"
-    )
+    inter_size = required_config_value(model_config, "inter_size")
+    if (
+        isinstance(inter_size, bool)
+        or not isinstance(inter_size, int)
+        or inter_size < 0
+    ):
+        raise ValueError("inter_size must be a non-negative integer")
 
     attn_config = required_config_value(model_config, "attn_config")
     num_heads = _positive_int(
@@ -201,6 +205,9 @@ def _extract_config_values(
         or expert_num < 0
     ):
         raise ValueError("expert_num must be a non-negative integer")
+    if not inter_size and len(moe_layer_index) < num_layers:
+        raise ValueError("dense Qwen layers need a positive FFN intermediate size")
+    shared_inter_size = 0
     if moe_layer_index or expert_num:
         expert_num = _positive_int(expert_num, "expert_num")
         moe_k = _positive_int(required_config_value(model_config, "moe_k"), "moe_k")
@@ -209,8 +216,13 @@ def _extract_config_values(
         moe_inter_size = _positive_int(
             required_config_value(model_config, "moe_inter_size"), "moe_inter_size"
         )
-        if required_config_value(model_config, "moe_style") != 2:
-            raise ValueError("Qwen3-Next newloader requires shared+routed MoE style 2")
+        moe_style = required_config_value(model_config, "moe_style")
+        if moe_style not in (1, 2):
+            raise ValueError(f"Invalid Qwen routed MoE style {moe_style!r}")
+        if moe_style == 2:
+            shared_inter_size = _positive_int(
+                inter_size, "shared expert intermediate size"
+            )
     else:
         moe_k = 0
         moe_inter_size = 0
@@ -309,6 +321,7 @@ def _extract_config_values(
         expert_num=expert_num,
         moe_inter_size=moe_inter_size,
         inter_size=inter_size,
+        shared_inter_size=shared_inter_size,
         moe_layer_index=moe_layer_index,
         has_moe_norm=has_moe_norm,
         partial_rotary_factor=partial_rotary_factor,
@@ -594,18 +607,22 @@ class Qwen3NextMoEBlock(RtpModule):
         )
 
         # Shared expert
-        self.shared_expert = Qwen3NextSharedExpert(
-            hidden_size,
-            shared_inter_size,
-            tp_size,
-            tp_rank,
-            params_dtype,
-            quant_config,
-            prefix=f"{prefix}.shared_expert",
+        self.shared_expert = (
+            Qwen3NextSharedExpert(
+                hidden_size,
+                shared_inter_size,
+                tp_size,
+                tp_rank,
+                params_dtype,
+                quant_config,
+                prefix=f"{prefix}.shared_expert",
+            )
+            if shared_inter_size
+            else None
         )
 
         # Shared expert gate
-        if has_shared_expert_gate:
+        if self.shared_expert is not None and has_shared_expert_gate:
             self.shared_expert_gate = ColumnParallelLinear(
                 input_size=hidden_size,
                 output_size=1,
@@ -649,6 +666,8 @@ class Qwen3NextMoEBlock(RtpModule):
             self.fake_balance_expert(topk_ids, topk_weights)
 
         experts_output = self.experts(hidden_states, topk_weights, topk_ids)
+        if self.shared_expert is None:
+            return experts_output
 
         use_ep_shared_allreduce = self.tp_size > 1 and self.ep_size > 1
         shared_output = self.shared_expert(
@@ -731,7 +750,7 @@ class Qwen3NextDecoderLayer(RtpModule):
                 moe_inter_size=cfg["moe_inter_size"],
                 expert_num=cfg["expert_num"],
                 top_k=cfg["moe_k"],
-                shared_inter_size=cfg["inter_size"],
+                shared_inter_size=cfg["shared_inter_size"],
                 layer_idx=layer_idx,
                 tp_size=cfg["ffn_tp_size"],
                 tp_rank=cfg["ffn_tp_rank"],
