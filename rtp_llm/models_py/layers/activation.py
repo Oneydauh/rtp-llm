@@ -14,20 +14,25 @@ def silu_and_mul(gate_up: torch.Tensor) -> torch.Tensor:
         raise ValueError(
             f"SwiGLU input width must be positive and even, got " f"{gate_up.shape[-1]}"
         )
-    if gate_up.is_cuda and _SILU_FUSED_ENABLED:
-        output = torch.empty(
-            gate_up.shape[:-1] + (gate_up.shape[-1] // 2,),
-            dtype=gate_up.dtype,
-            device=gate_up.device,
-        )
+    is_hip = torch.version.hip is not None
+    if (
+        gate_up.is_cuda
+        and _SILU_FUSED_ENABLED
+        and (is_hip or gate_up.dtype in (torch.float16, torch.bfloat16))
+    ):
         try:
-            if getattr(torch.version, "hip", None) is not None:
+            if is_hip:
                 import aiter
+
                 fused_op = aiter.silu_and_mul
             else:
-                from rtp_llm.ops.compute_ops import rtp_llm_ops
+                from rtp_llm.models_py.modules.base.cuda.activation import (
+                    FusedSiluAndMul,
+                )
 
-                fused_op = rtp_llm_ops.silu_and_mul
+                # Share the serving kernel and its vector-alignment guard. The
+                # CUDA compute-ops module does not export a plain silu_and_mul.
+                return FusedSiluAndMul.apply_cuda(gate_up)
         except (ImportError, AttributeError) as exc:
             _SILU_FUSED_ENABLED = False
             logger.warning(
@@ -36,11 +41,8 @@ def silu_and_mul(gate_up: torch.Tensor) -> torch.Tensor:
                 exc,
             )
         else:
-            if getattr(torch.version, "hip", None) is not None:
-                fused_op(output, gate_up)
-            else:
-                stream_id = torch.cuda.current_stream().cuda_stream
-                fused_op(output, gate_up, stream_id)
+            output = gate_up.new_empty(gate_up.shape[:-1] + (gate_up.shape[-1] // 2,))
+            fused_op(output, gate_up)
             return output
 
     gate, up = gate_up.chunk(2, dim=-1)
