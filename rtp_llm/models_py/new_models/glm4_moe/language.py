@@ -53,6 +53,9 @@ class GqaMoeForCausalLM(Qwen3ForCausalLM):
         cfg = _extract_config_values(
             model_config, load_config, validate_intermediate_size=False
         )
+        # Inherited checkpoint resolution, validation and runtime exports all
+        # consult this owner, including when the service requests no custom head.
+        self._init_handler_heads(load_config, cfg)
         cfg.update(
             num_experts=model_config.expert_num,
             top_k=model_config.moe_k,

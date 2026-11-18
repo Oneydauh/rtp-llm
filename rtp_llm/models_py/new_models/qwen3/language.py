@@ -558,6 +558,14 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
                 self.lm_head.weight.copy_(processed)
         self._lm_head_postprocessed = True
 
+    def _init_handler_heads(self, load_config, cfg):
+        self.handler_heads = ReplicatedHandlerHeads(
+            getattr(load_config, "custom_weight_mappings", ()),
+            self.WEIGHTS_MAPPER,
+            cfg["hidden_size"],
+            cfg["params_dtype"],
+        )
+
     def __init__(self, model_config: Any, load_config: Any):
         parallelism_config = getattr(load_config, "parallelism_config", None)
         if parallelism_config is None:
@@ -575,12 +583,7 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
         )
 
         cfg = self._dense_config(model_config, load_config)
-        self.handler_heads = ReplicatedHandlerHeads(
-            getattr(load_config, "custom_weight_mappings", ()),
-            self.WEIGHTS_MAPPER,
-            cfg["hidden_size"],
-            cfg["params_dtype"],
-        )
+        self._init_handler_heads(load_config, cfg)
         _validate_supported_parallelism(parallelism_config)
         pp_size = int(getattr(parallelism_config, "pp_size", 1))
         is_draft = bool(
