@@ -80,3 +80,18 @@ def prepare_moe_weight_layout(
     if tensor.device.type != "cuda" or torch.version.hip is None:
         return tensor
     return _rocm_moe_layout(tensor, projection=projection, is_scale=is_scale)
+
+
+def undo_rocm_moe_matrix_tiles(tensor: torch.Tensor) -> torch.Tensor:
+    """Inverse of the old writer's AITER shuffle_weight(layout=(16,16))."""
+    experts, n, k = tensor.shape
+    if n % 16 or k % 32:
+        raise ValueError("Invalid AITER shuffled expert extents")
+    lanes = 16 // tensor.element_size()
+    # FP8 indexing/permutation is byte-safe: this only moves whole elements.
+    return (
+        tensor.reshape(experts, n // 16, k // 32, 32 // lanes, 16, lanes)
+        .permute(0, 1, 4, 2, 3, 5)
+        .contiguous()
+        .reshape_as(tensor)
+    )

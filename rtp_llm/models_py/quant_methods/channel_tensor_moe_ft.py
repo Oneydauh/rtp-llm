@@ -11,6 +11,8 @@ from rtp_llm.models_py.quant_methods.block_fp8_ft import (
 
 def nonblock_moe_ft_bindings(owner, prefix, target, checkpoint, layer_id):
     family = owner._quant_family
+    if family == "none":
+        return _plain_expert_bindings(owner, prefix, target, checkpoint, layer_id)
     if family not in ("fp8_per_channel", "fp8_per_tensor"):
         raise ValueError(f"No non-block FT expert ABI for {family}")
     channel = family == "fp8_per_channel"
@@ -158,3 +160,49 @@ def nonblock_moe_ft_bindings(owner, prefix, target, checkpoint, layer_id):
             lambda: (*gu[2](), *down[2]()),
         )
     return out
+
+
+def _plain_expert_bindings(owner, prefix, target, checkpoint, layer_id):
+    """A quantized model can exclude entire expert leaves from quantization."""
+    from rtp_llm.models_py.quant_methods.moe_layout import undo_rocm_moe_matrix_tiles
+
+    declared = checkpoint.index_metadata.get("ft_export_backend")
+    if declared not in (None, "cuda", "rocm"):
+        raise ValueError(f"Unknown FT producer ABI: {declared!r}")
+    rocm = declared == "rocm" or (declared is None and torch.version.hip is not None)
+    result = []
+    for name, stem, projs in (
+        ("w13", "intermediate_weight", ("up_proj", "gate_proj")),
+        ("w2", "intermediate_weight2", ("down_proj",)),
+    ):
+        key = prefix + "partial_moe_weights." + stem + ".kernel"
+        param = getattr(owner, name)
+
+        def read(key=key):
+            return (
+                checkpoint.read_expert_rows(key, layer_id, owner._expert_placement),
+            )
+
+        def decode(vals, gate=name == "w13"):
+            x = vals[0]
+            if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+                raise TypeError(
+                    "Unquantized FT experts require an unquantized source dtype"
+                )
+            if rocm:
+                x = undo_rocm_moe_matrix_tiles(x)
+                if gate:
+                    a, b = x.chunk(2, dim=1)
+                    x = torch.cat((b, a), dim=1)
+            return x
+
+        def install(vals, decode=decode, param=param, projs=projs):
+            param.copy_(decode(vals))
+            for slot in range(owner.num_local_experts):
+                for proj in projs:
+                    owner._record_projection_loaded(slot, proj)
+
+        result.append(
+            RuntimeTensorBinding((key,), target + "." + name, decode, read, install)
+        )
+    return result

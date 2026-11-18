@@ -64,6 +64,51 @@ class ExpertOwner(RtpModule):
 
 
 class LegacyScalarFTTest(unittest.TestCase):
+    def test_float_expert_excluded_from_online_quantizer(self):
+        from dataclasses import replace
+
+        for abi in ("cuda", "rocm"):
+            ft = {}
+            expected = {}
+            for name, stem, rows in (
+                ("w13", "intermediate_weight", 256),
+                ("w2", "intermediate_weight2", 128),
+            ):
+                v = (torch.arange(2 * rows * 128).reshape(2, rows, 128) % 97).bfloat16()
+                expected[name] = v
+                if abi == "rocm":
+                    if name == "w13":
+                        v = torch.cat(v.chunk(2, dim=1)[::-1], dim=1)
+                    v = (
+                        v.reshape(2, rows // 16, 16, 128 // 32, 4, 8)
+                        .permute(0, 1, 3, 4, 2, 5)
+                        .contiguous()
+                        .reshape(2, rows, 128)
+                    )
+                ft["layers.0.partial_moe_weights." + stem + ".kernel"] = v
+            with tempfile.TemporaryDirectory() as root:
+                write_ft(root, ft)
+                source = Fp8BlockWiseQuantConfig(is_quanted=False)
+                cfg, lc = self.make(root, source)
+                q = QuantizationConfig(
+                    "fp8_block_online", source, ignored_layers=["layers.0.mlp.experts"]
+                )
+                loader = NewModelLoader(
+                    cfg, replace(lc, quant_config=q), model_path=root
+                )
+                for method in ("scratch", "fastsafetensors"):
+                    cp = FTCheckpoint.open(root, CheckpointTopology())
+                    cp.index_metadata["ft_export_backend"] = abi
+                    cp.read_backend = method
+                    model = loader._create_checkpoint_model(cp)
+                    self.assertEqual(model.experts._quant_family, "none")
+                    model.load_ft_checkpoint(cp)
+                    loader._validate_loaded_weights(model)
+                    for name, v in expected.items():
+                        torch.testing.assert_close(
+                            getattr(model.experts, name), v, rtol=0, atol=0
+                        )
+
     def test_rocm_dense_sources_for_scalar_and_channel(self):
         from rtp_llm.models_py.quant_methods.fp8_ft import (
             PerChannelFP8FTProjection,

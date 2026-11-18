@@ -32,18 +32,11 @@ def block_ft_weight(raw, logical_shape, packed, *, rocm_shuffle=False, gate_up=F
     if rocm_shuffle:
         if len(shape) != 3 or packed:
             raise ValueError("Invalid AITER expert serializer for block-FP8 tensor")
-        # Inverse of aiter.ops.shuffle.shuffle_weight(layout=(16,16)) for FP8.
-        e, n, k = shape
-        if n % 16 or k % 32:
-            raise ValueError("Invalid AITER shuffled expert extents")
-        value = (
-            value.view(torch.uint8)
-            .reshape(e, n // 16, k // 32, 2, 16, 16)
-            .permute(0, 1, 4, 2, 3, 5)
-            .contiguous()
-            .reshape(shape)
-            .view(raw.dtype)
+        from rtp_llm.models_py.quant_methods.moe_layout import (
+            undo_rocm_moe_matrix_tiles,
         )
+
+        value = undo_rocm_moe_matrix_tiles(value.view(torch.uint8)).view(raw.dtype)
         if gate_up:
             value = swap_halves(value)
     if value.dtype == torch.float8_e4m3fnuz:
