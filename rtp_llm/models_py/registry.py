@@ -146,6 +146,9 @@ register_lazy_model(
     "rtp_llm.models_py.new_models.qwen2",
     "Qwen2ForCausalLM",
 )
+register_lazy_model(
+    "qwen_7b", "rtp_llm.models_py.new_models.qwen1.language", "Qwen1ForCausalLM"
+)
 # qwen_tool changes tokenization/rendering and request output selection, not
 # the language-model parameters. Keep its complete causal LM projection.
 register_lazy_model(
