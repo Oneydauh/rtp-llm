@@ -16,7 +16,7 @@ import triton.language as tl
 def _qk_offset(token, head, token_stride: tl.constexpr, head_stride: tl.constexpr):
     # Cast BEFORE multiplying: fused QKV views retain the entire row stride,
     # and long/batched prefill can cross INT32_MAX even with small head sizes.
-    return token.to(tl.int64) * token_stride + head.to(tl.int64) * head_stride
+    return tl.cast(token, tl.int64) * token_stride + tl.cast(head, tl.int64) * head_stride
 
 
 @triton.jit

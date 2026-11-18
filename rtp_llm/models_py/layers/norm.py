@@ -76,19 +76,11 @@ class RMSNorm(RtpModule):
                     return output.reshape(original_shape)
             else:
                 try:
-                    from rtp_llm.ops.compute_ops import rtp_llm_ops
+                    from flashinfer.norm import rmsnorm
                 except ImportError as exc:
                     _disable_fused_rmsnorm(exc)
                 else:
-                    output = torch.empty_like(input_2d)
-                    stream_id = torch.cuda.current_stream().cuda_stream
-                    rtp_llm_ops.rmsnorm(
-                        output,
-                        input_2d,
-                        self.weight.data,
-                        self.eps,
-                        stream_id,
-                    )
+                    output = rmsnorm(input_2d, self.weight.data, eps=self.eps)
                     return output.reshape(original_shape)
 
         input_dtype = x.dtype
@@ -171,16 +163,9 @@ class RMSResNorm(RtpModule):
                 )
                 return output, residual_out
 
-            from rtp_llm.ops.compute_ops import rtp_llm_ops
+            from flashinfer.norm import fused_add_rmsnorm
 
-            stream_id = torch.cuda.current_stream().cuda_stream
-            rtp_llm_ops.fused_add_rmsnorm(
-                hidden_states,
-                residual,
-                self.weight.data,
-                self.eps,
-                stream_id,
-            )
+            fused_add_rmsnorm(hidden_states, residual, self.weight.data, eps=self.eps)
             return hidden_states, residual
 
         residual_out = hidden_states + residual

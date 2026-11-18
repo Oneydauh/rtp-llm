@@ -22,6 +22,7 @@ from rtp_llm.ops.compute_ops import (
     FusedRopeKVCachePrefillOpQOut,
     LayerKVCache,
     PyAttentionInputs,
+    get_typemeta,
 )
 
 
@@ -58,10 +59,10 @@ class ScaledRopeStagesTest(unittest.TestCase):
         r.factor1, r.factor2, r.index_factor = 1.0, 4.0, 1
         return c
 
-    def inputs(self, lengths, positions, table, graph):
+    def inputs(self, lengths, positions, table, graph, dtype):
         x = PyAttentionInputs()
         x.is_prefill, x.is_cuda_graph = False, graph
-        x.dtype = torch.bfloat16
+        x.dtype = get_typemeta(torch.empty(0, dtype=dtype))
         x.sequence_lengths = torch.tensor(lengths, dtype=torch.int32).pin_memory()
         x.sequence_lengths_plus_1_device = x.sequence_lengths.cuda() + 1
         x.combo_position_ids = positions
@@ -106,8 +107,8 @@ class ScaledRopeStagesTest(unittest.TestCase):
         # The PPU native CP path intentionally suppresses KV writes when
         # explicit positions are supplied. Test its ordinary cache-writing
         # path here; explicit positions are covered by FlashInfer and decode.
-        native_inputs = self.inputs(lengths, None, table, False)
-        native_inputs.is_prefill, native_inputs.dtype = True, raw.dtype
+        native_inputs = self.inputs(lengths, None, table, False, raw.dtype)
+        native_inputs.is_prefill = True
         native_inputs.sequence_lengths = torch.empty(0, dtype=torch.int32)
         native_inputs.input_lengths = torch.ones(batch, dtype=torch.int32).pin_memory()
         native_inputs.prefix_lengths = torch.tensor(
@@ -214,8 +215,7 @@ class ScaledRopeStagesTest(unittest.TestCase):
                                 1, batch * 4 + 1, device="cuda", dtype=torch.int32
                             ).reshape(batch, 4)
                             config = self.config(llama3, dtype, scale)
-                            inputs = self.inputs(lengths, positions, table, False)
-                            inputs.dtype = dtype
+                            inputs = self.inputs(lengths, positions, table, False, dtype)
                             op, cache, raw = (
                                 FusedRopeKVCacheDecodeOp(config),
                                 self.cache(batch, dtype),
@@ -238,7 +238,7 @@ class ScaledRopeStagesTest(unittest.TestCase):
                     table = torch.arange(
                         1, batch * 4 + 1, device="cuda", dtype=torch.int32
                     ).reshape(batch, 4)
-                    inputs = self.inputs(lengths, positions, table, True)
+                    inputs = self.inputs(lengths, positions, table, True, torch.bfloat16)
                     op = FusedRopeKVCacheDecodeOp(config)
                     params = op.prepare(inputs)
                     cache, raw = self.cache(batch, torch.bfloat16), self.raw(
@@ -266,7 +266,7 @@ class ScaledRopeStagesTest(unittest.TestCase):
                         # Same capture pointers, different page IDs and fresh
                         # caller-owned host lengths; no per-replay recapture.
                         table.copy_(table.flip(0))
-                        live = self.inputs(lengths, positions, table, True)
+                        live = self.inputs(lengths, positions, table, True, torch.bfloat16)
                         refreshed = op.prepare(live, forbid_reallocation=True)
                         self.assertEqual(
                             sequence_ptr, refreshed.sequence_lengths.data_ptr()
