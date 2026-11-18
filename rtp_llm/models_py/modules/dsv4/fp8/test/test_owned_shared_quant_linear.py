@@ -49,6 +49,9 @@ def test_rank_local_projections_reuse_nonunit_activation_scales(tmp_path):
         expected.append((x.float() @ scale_ref.cuda().T).bfloat16())
 
     assert attn._can_reuse_qkv_input_quant()
+    # Wrapping the factory dispatcher in a weight owner must not select a
+    # different RMSNorm kernel just because it can consume a shared pair.
+    assert not attn.can_fuse_prefill_attn_norm_input_quant(x, torch.ones_like(x[0]))
     pair = attn.wq_a.quantize_input(x)
     assert pair[0].dtype == torch.float8_e4m3fn
     assert pair[1].dtype == torch.int32

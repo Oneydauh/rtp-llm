@@ -51,13 +51,23 @@ class Dsv4FP8CheckpointTest(unittest.TestCase):
         layer.forward_quantized(*pair, out=out)
         backend.quantize_input.assert_called_once_with(x)
         backend.forward_quantized.assert_called_once_with(*pair, out=out)
+        self.assertFalse(layer.supports_fused_prefill_norm_quant)
         dispatcher.assert_not_called()
         layer(x)
         dispatcher.assert_called_once_with(x)
         # Device migration invalidates both execution paths.
         layer.to("cpu")
+        self.assertFalse(layer.supports_fused_prefill_norm_quant)
         with self.assertRaisesRegex(RuntimeError, "must be prepared"):
             layer.forward_quantized(*pair, out=out)
+        # A factory implementation which directly exposes the packed-input
+        # API retains its original fusion eligibility.
+        attention._v4_fp8_linear.return_value = backend
+        with mock.patch.dict(
+            "sys.modules", {attention.__name__: attention}
+        ), mock.patch.object(layer, "validate_runtime_device"):
+            layer.process_weights_after_loading()
+        self.assertTrue(layer.supports_fused_prefill_norm_quant)
 
     def test_preflight_requires_main_gemm_and_native_scale_packer(self):
         # Isolate symbol resolution, not a GPU execution test. main has no

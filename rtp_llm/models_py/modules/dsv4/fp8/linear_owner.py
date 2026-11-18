@@ -164,6 +164,15 @@ class Dsv4FP8Linear(Dsv4FP8Parameters):
         return True
 
     @property
+    def supports_fused_prefill_norm_quant(self):
+        # The owner can reuse a pair via a dispatcher's DeepGEMM backend.
+        # That does not opt the dispatcher into replacing the model's BF16
+        # RMSNorm: other attention consumers see that normalized tensor too.
+        return callable(getattr(self._executor, "quantize_input", None)) and callable(
+            getattr(self._executor, "forward_quantized", None)
+        )
+
+    @property
     def _shared_input_backend(self):
         executor = self._executor
         if executor is None:

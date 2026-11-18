@@ -2106,6 +2106,8 @@ class AttentionFP8(RtpModule):
     ) -> bool:
         return (
             self._can_reuse_qkv_input_quant()
+            and getattr(self.wq_a, "supports_fused_prefill_norm_quant", True)
+            and getattr(self.wkv, "supports_fused_prefill_norm_quant", True)
             and getattr(self.wq_a, "scale_ue8m0", False)
             and x.dim() == 2
             and x.dtype == torch.bfloat16
