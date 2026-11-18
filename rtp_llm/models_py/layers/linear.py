@@ -4,7 +4,6 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
 
-from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
 from rtp_llm.models_py.lora_checkpoint import prepare_lora_checkpoint_factors
 from rtp_llm.models_py.module_base import RtpModule, copy_weight_
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
@@ -593,6 +592,8 @@ class RowParallelLinear(LinearBase):
             )
         output = self.quant_method.apply(self, x, None)
         if self.reduce_output and self.tp_size > 1:
+            from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
+
             output = all_reduce(output, group=Group.TP)
         if self.bias is not None:
             output = output + self.bias

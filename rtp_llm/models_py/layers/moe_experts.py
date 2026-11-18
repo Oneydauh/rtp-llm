@@ -133,7 +133,9 @@ class BaseMoEExperts(RtpModule):
             from rtp_llm.ops import ActivationType
 
             if activation_type != ActivationType.Swiglu:
-                raise ValueError(f"Expected SiGLU MoE activation, got {activation_type!r}")
+                raise ValueError(
+                    f"Expected SiGLU MoE activation, got {activation_type!r}"
+                )
         # The fused executor API accepts its canonical string spelling.  Model
         # configs may carry the equivalent enum, so normalize at construction.
         self.activation_type = "SiGLU"
@@ -1107,6 +1109,7 @@ class BaseMoEExperts(RtpModule):
         from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
             MoEConfigAdapter,
         )
+
         # MoEConfigAdapter.quant_config must be the CONFIG-side QuantizationConfig
         # (rtp_llm.config.quant_config, exposing is_quanted()/get_method()), which
         # the strategy resolver and the DeepEP wrapper rely on. self._quant_config
