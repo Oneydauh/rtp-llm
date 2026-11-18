@@ -6,7 +6,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import torch
@@ -18,6 +18,47 @@ from rtp_llm.models_py.weight_mapper import get_all_weights
 
 
 class Dsv4FP8CheckpointTest(unittest.TestCase):
+    def test_loaded_owner_selects_shared_backend_but_retains_regular_dispatch(self):
+        layer = Dsv4FP8Linear(512, 256)
+        layer.load_weights(self._weights())
+        backend = SimpleNamespace(
+            quantize_input=mock.Mock(), forward_quantized=mock.Mock()
+        )
+        dispatcher = mock.Mock(spec=["prequantized_input_backend"])
+        dispatcher.prequantized_input_backend = backend
+        attention = ModuleType("rtp_llm.models_py.modules.dsv4.fp8.attention")
+        attention._v4_fp8_linear = mock.Mock(return_value=dispatcher)
+        with mock.patch.dict(
+            "sys.modules", {attention.__name__: attention}
+        ), mock.patch.object(layer, "validate_runtime_device"):
+            dispatcher.prequantized_input_backend = object()
+            with self.assertRaisesRegex(
+                RuntimeError, "cannot consume shared input scales"
+            ):
+                layer.process_weights_after_loading()
+            self.assertIsNone(layer._executor)
+            dispatcher.prequantized_input_backend = backend
+            layer.process_weights_after_loading()
+
+        x = torch.zeros(2, 512, dtype=torch.bfloat16)
+        pair = (
+            x.to(torch.float8_e4m3fn),
+            torch.full((2, 1), 0x797B7D7F, dtype=torch.int32),
+        )
+        out = torch.empty(2, 256, dtype=torch.bfloat16)
+        backend.quantize_input.return_value = pair
+        self.assertIs(layer.quantize_input(x), pair)
+        layer.forward_quantized(*pair, out=out)
+        backend.quantize_input.assert_called_once_with(x)
+        backend.forward_quantized.assert_called_once_with(*pair, out=out)
+        dispatcher.assert_not_called()
+        layer(x)
+        dispatcher.assert_called_once_with(x)
+        # Device migration invalidates both execution paths.
+        layer.to("cpu")
+        with self.assertRaisesRegex(RuntimeError, "must be prepared"):
+            layer.forward_quantized(*pair, out=out)
+
     def test_preflight_requires_main_gemm_and_native_scale_packer(self):
         # Isolate symbol resolution, not a GPU execution test. main has no
         # recovery-branch is_deep_gemm_runtime_available() helper.

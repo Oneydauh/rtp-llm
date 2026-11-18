@@ -144,7 +144,16 @@ class Dsv4FP8Linear(Dsv4FP8Parameters):
         self.validate_runtime_device(self.weight.device)
         from rtp_llm.models_py.modules.dsv4.fp8.attention import _v4_fp8_linear
 
-        object.__setattr__(self, "_executor", _v4_fp8_linear(self.weight, self.scale))
+        executor = _v4_fp8_linear(self.weight, self.scale)
+        backend = getattr(executor, "prequantized_input_backend", executor)
+        if not all(
+            callable(getattr(backend, name, None))
+            for name in ("quantize_input", "forward_quantized")
+        ):
+            raise RuntimeError(
+                f"V4 FP8 executor {type(executor).__name__} cannot consume shared input scales"
+            )
+        object.__setattr__(self, "_executor", executor)
 
     @property
     def K(self):
@@ -154,19 +163,20 @@ class Dsv4FP8Linear(Dsv4FP8Parameters):
     def scale_ue8m0(self):
         return True
 
-    def quantize_input(self, *args, **kwargs):
-        if self._executor is None:
+    @property
+    def _shared_input_backend(self):
+        executor = self._executor
+        if executor is None:
             raise RuntimeError(
                 "V4 FP8 executor must be prepared after checkpoint loading"
             )
-        return self._executor.quantize_input(*args, **kwargs)
+        return getattr(executor, "prequantized_input_backend", executor)
+
+    def quantize_input(self, *args, **kwargs):
+        return self._shared_input_backend.quantize_input(*args, **kwargs)
 
     def forward_quantized(self, *args, **kwargs):
-        if self._executor is None:
-            raise RuntimeError(
-                "V4 FP8 executor must be prepared after checkpoint loading"
-            )
-        return self._executor.forward_quantized(*args, **kwargs)
+        return self._shared_input_backend.forward_quantized(*args, **kwargs)
 
     @property
     def weight_scales(self):
