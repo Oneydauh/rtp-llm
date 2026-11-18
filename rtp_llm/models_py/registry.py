@@ -131,14 +131,20 @@ register_lazy_model(
     "Qwen2ForCausalLM",
 )
 
-# Both use main's DeepSeekV2 config parser and GenericMoeModel MLA runtime.
-# GLM-4.7-Flash uses the compressed-Q branch; V2-Lite uses direct Q.
-for _model_type in ("deepseek2", "glm4_moe_lite"):
+# The owner selects direct Q, compressed Q or the sparse indexer from the
+# parsed attention config; it does not replace a sparse model with dense MLA.
+for _model_type in ("deepseek2", "glm4_moe_lite", "deepseek3", "deepseek_v32", "glm_5"):
     register_lazy_model(
         _model_type,
         "rtp_llm.models_py.new_models.deepseek_v3.language",
         "DeepSeekV32ForCausalLM",
     )
+
+register_lazy_model(
+    "kimi_linear",
+    "rtp_llm.models_py.new_models.kimi_linear.language",
+    "KimiLinearForCausalLM",
+)
 
 # Use the service model_type, not the Hugging Face architecture string. Draft
 # models need different checkpoint prefixes and cannot alias the target class.
