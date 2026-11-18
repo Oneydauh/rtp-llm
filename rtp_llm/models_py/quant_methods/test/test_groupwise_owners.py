@@ -197,6 +197,214 @@ class GroupwiseOwnerTest(unittest.TestCase):
             self.assertTrue(all(p.device.type == "cpu" for p in owner.parameters()))
             return owner
 
+    def test_qwen2_gptq_checkpoint_biases_use_production_owner_and_pp_stage(self):
+        from rtp_llm.ops import ParallelismConfig
+
+        # Use the production Qwen2 decoder: Q/K/V biases are real parameters;
+        # o_proj/down_proj/gate_proj/up_proj have no bias in the old or new model.
+        source = source_config("gptq", 4)
+        config = SimpleNamespace(
+            model_type="qwen_2",
+            num_layers=2,
+            is_mtp=False,
+            vocab_size=64,
+            hidden_size=64,
+            inter_size=64,
+            attn_config=SimpleNamespace(head_num=4, kv_head_num=1, size_per_head=16),
+            layernorm_eps=1e-6,
+            enable_fp32_lm_head=False,
+            tie_word_embeddings=True,
+            capture_aux_hidden_layer_ids=[],
+            hidden_state_capture_layer_ids=[],
+            quant_config=source,
+        )
+        values = {
+            "model.embed_tokens.weight": torch.arange(4096).reshape(64, 64).half(),
+            "model.norm.weight": torch.ones(64, dtype=torch.float16),
+        }
+        expected_biases = {}
+        for layer in range(2):
+            prefix = f"model.layers.{layer}."
+            for norm in ("input_layernorm", "post_attention_layernorm"):
+                values[prefix + norm + ".weight"] = torch.ones(64, dtype=torch.float16)
+            biases = []
+            for index, (name, width) in enumerate(
+                (
+                    ("self_attn.q_proj", 64),
+                    ("self_attn.k_proj", 16),
+                    ("self_attn.v_proj", 16),
+                    ("self_attn.o_proj", 64),
+                    ("mlp.gate_proj", 64),
+                    ("mlp.up_proj", 64),
+                    ("mlp.down_proj", 64),
+                )
+            ):
+                packed, _ = material("gptq", 4, 64, width, index)
+                values.update({prefix + name + "." + k: v for k, v in packed.items()})
+                bias = (
+                    torch.arange(width).half() + layer * 10 + index
+                    if index < 3
+                    else torch.zeros(width).half()
+                )
+                values[prefix + name + ".bias"] = bias
+                if index < 3:
+                    biases.append(bias)
+            expected_biases[layer] = torch.cat(biases)
+        for backend in ("scratch", "fastsafetensors"):
+            # Scratch checks each real PP ownership interval; the separate
+            # leaf regression below exercises real FST TP groups with Gloo.
+            for stage in (0, 1) if backend == "scratch" else (0,):
+                with self.subTest(
+                    backend=backend, stage=stage
+                ), tempfile.TemporaryDirectory() as root:
+                    save_file(values, str(Path(root) / "model.safetensors"))
+                    pc = ParallelismConfig()
+                    pc.tp_size = pc.ep_size = pc.dp_size = 1
+                    pc.tp_rank = pc.ep_rank = pc.dp_rank = 0
+                    pc.pp_size, pc.pp_rank = (2 if backend == "scratch" else 1), stage
+                    pc.world_size = pc.local_world_size = pc.pp_size
+                    pc.world_rank = pc.local_rank = stage
+                    pc.pp_stage_layer_counts = [1, 1] if pc.pp_size == 2 else []
+                    load = NewLoaderConfig(
+                        device="cpu",
+                        compute_dtype=torch.float16,
+                        load_method=backend,
+                        parallelism_config=pc,
+                        quant_config=QuantizationConfig("gptq", source),
+                    )
+                    loader = NewModelLoader(config, load, model_path=root)
+                    model = loader.load()
+                    self.assertEqual(loader.loaded_method.value, backend)
+                    owned = (stage,) if pc.pp_size == 2 else (0, 1)
+                    if pc.pp_size == 2:
+                        self.assertEqual(set(model.layers), {str(i) for i in owned})
+                    else:
+                        self.assertEqual(len(model.layers), len(owned))
+                    for i in owned:
+                        layer = (
+                            model.layers[str(i)] if pc.pp_size == 2 else model.layers[i]
+                        )
+                        torch.testing.assert_close(
+                            layer.self_attn.qkv_proj.bias,
+                            expected_biases[i],
+                            rtol=0,
+                            atol=0,
+                        )
+                        for projection in (
+                            layer.self_attn.o_proj,
+                            layer.mlp.gate_up_proj,
+                            layer.mlp.down_proj,
+                        ):
+                            self.assertIsNone(projection.bias)
+                    # Missing a semantic QKV bias is still a load-time failure.
+                    broken = dict(values)
+                    del broken[f"model.layers.{stage}.self_attn.q_proj.bias"]
+                    save_file(broken, str(Path(root) / "model.safetensors"))
+                    with self.assertRaisesRegex(
+                        RuntimeError, "[Mm]issing|not loaded|complete checkpoint"
+                    ):
+                        NewModelLoader(config, load, model_path=root).load()
+
+    def test_gptq_zero_bias_buffers_for_biasless_modules(self):
+        for backend in ("scratch", "fastsafetensors"):
+            for kind in ("column", "row", "merged"):
+                parts = ("gate_proj", "up_proj") if kind == "merged" else ("",)
+                values, dense_parts = {}, []
+                for index, part in enumerate(parts):
+                    packed, dense = material("gptq", 4, 64, 64, index)
+                    prefix = "proj." + (part + "." if part else "")
+                    values.update({prefix + k: v for k, v in packed.items()})
+                    values[prefix + "bias"] = torch.zeros(64, dtype=torch.float16)
+                    dense_parts.append(dense)
+                for rank in range(2):
+                    with self.subTest(backend=backend, kind=kind, rank=rank):
+                        owner = self.load(
+                            values,
+                            SimpleNamespace(
+                                model_type="_groupwise_dense_cpu_owner",
+                                kind=kind,
+                                bias=False,
+                            ),
+                            "gptq",
+                            4,
+                            backend,
+                            tp=2,
+                            rank=rank,
+                        )
+                        self.assertIsNone(owner.proj.bias)
+                        self.assertNotIn("proj.bias", dict(owner.named_parameters()))
+                        expected = torch.cat(
+                            [
+                                dense.chunk(2, 0 if kind == "row" else 1)[rank]
+                                for dense in dense_parts
+                            ],
+                            dim=1,
+                        )
+                        torch.testing.assert_close(
+                            decode(owner.proj), expected, rtol=0, atol=0
+                        )
+
+    def test_gptq_biasless_buffers_are_strict_not_silently_discarded(self):
+        packed, _ = material("gptq", 4, 64, 64)
+        base = {"proj." + k: v for k, v in packed.items()}
+        config = SimpleNamespace(
+            model_type="_groupwise_dense_cpu_owner", kind="column", bias=False
+        )
+        bad_values = {
+            "nonzero": torch.cat((torch.zeros(63), torch.ones(1))).half(),
+            "nan": torch.full((64,), float("nan"), dtype=torch.float16),
+            "shape": torch.zeros(63, dtype=torch.float16),
+            "dtype": torch.zeros(64, dtype=torch.int32),
+        }
+        for backend in ("scratch", "fastsafetensors"):
+            for case, bias in bad_values.items():
+                with self.subTest(backend=backend, case=case):
+                    with self.assertRaises((ValueError, TypeError)):
+                        self.load(
+                            dict(base, **{"proj.bias": bias}),
+                            config,
+                            "gptq",
+                            4,
+                            backend,
+                        )
+        # A nonzero value outside TP rank 0's output rows must still fail.
+        with self.assertRaisesRegex(ValueError, "must be all zero"):
+            self.load(
+                dict(base, **{"proj.bias": bad_values["nonzero"]}),
+                config,
+                "gptq",
+                4,
+                "scratch",
+                tp=2,
+                rank=0,
+            )
+        # The compatibility rule is GPTQ-specific; AWQ remains strict.
+        awq, _ = material("awq", 4, 64, 64)
+        awq = {"proj." + k: v for k, v in awq.items()}
+        awq["proj.bias"] = torch.zeros(64, dtype=torch.float16)
+        with self.assertRaisesRegex(ValueError, "Unexpected grouped bias"):
+            self.load(awq, config, "awq", 4, "scratch")
+        from rtp_llm.models_py.read_spec import make_sharded_read_spec
+
+        source = source_config("gptq", 4)
+        owner = DenseOwner(
+            config,
+            NewLoaderConfig(
+                device="cpu",
+                tp_size=2,
+                tp_rank=0,
+                quant_config=QuantizationConfig("gptq", source),
+            ),
+        )
+        spec = owner.proj.checkpoint_read_spec("bias", (64,))
+        self.assertIsNone(spec.slices)
+        self.assertTrue(spec.load)
+        partial = make_sharded_read_spec("bias", (64,), 0, 2, 0).materialize(
+            torch.zeros(64).half()
+        )
+        with self.assertRaisesRegex(ValueError, "another projection/rank"):
+            owner.proj.load_weights({"bias": partial})
+
     def test_dense_real_scratch_and_fst_all_formats_tp_and_gqa(self):
         for method in ("awq", "gptq"):
             for bits in (4, 8):

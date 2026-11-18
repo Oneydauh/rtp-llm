@@ -145,8 +145,7 @@ class GroupwiseLinearMethod(QuantizeMethodBase):
             sources[""] = (source, dim, tp, rank, 0)
         layer._groupwise_sources = sources
 
-    @staticmethod
-    def _role(layer, name):
+    def _role(self, layer, name):
         parts = name.split(".")
         parameter = parts[-1]
         if parameter not in ("qweight", "qzeros", "scales", "bias", "g_idx"):
@@ -156,7 +155,7 @@ class GroupwiseLinearMethod(QuantizeMethodBase):
             if len(parts) > 1 and parts[-2] in layer._groupwise_sources
             else ""
         )
-        if parameter == "bias" and layer.bias is None:
+        if parameter == "bias" and layer.bias is None and self.method != "gptq":
             raise ValueError(f"Unexpected grouped bias {name}")
         return projection, parameter
 
@@ -180,6 +179,11 @@ class GroupwiseLinearMethod(QuantizeMethodBase):
         projection, parameter = self._role(layer, name)
         if projection in layer._groupwise_sources:
             source, dim, shards, rank, _ = layer._groupwise_sources[projection]
+            if parameter == "bias" and layer.bias is None:
+                # GPTQ exporters may serialize an all-zero bias buffer even
+                # when the original model linear has no bias. Validate the
+                # complete buffer on every TP rank, not only its local slice.
+                shards, rank = 1, 0
             return self._source_spec(name, shape, source, dim, shards, rank, parameter)
         # A fused source has disjoint TP ranges for its constituent projections.
         # Keep that source whole, then copy each logical range exactly once.
@@ -242,6 +246,24 @@ class GroupwiseLinearMethod(QuantizeMethodBase):
             )
         for name, value in weights.items():
             projection, parameter = self._role(layer, name)
+            if parameter == "bias" and layer.bias is None:
+                key = (projection, parameter)
+                if key in layer._groupwise_seen:
+                    raise RuntimeError(f"Duplicate grouped projection tensor {name}")
+                tensor, spec = unwrap_checkpoint_tensor(value)
+                shape = spec.source_shape if spec is not None else tuple(tensor.shape)
+                tensor = checked_piece(
+                    value, name, self.checkpoint_read_spec(layer, name, shape)
+                )
+                if torch.count_nonzero(tensor).item() != 0:
+                    raise ValueError(
+                        "GPTQ checkpoint bias for a biasless linear must be all zero: "
+                        f"owner={layer.prefix}, tensor={name}"
+                    )
+                # This is checkpoint-only metadata, not an owned parameter or
+                # an excuse to add a bias to the production model architecture.
+                layer._groupwise_seen.add(key)
+                continue
             if projection in layer._groupwise_sources:
                 self._copy_projection(layer, projection, parameter, value, name)
                 continue
