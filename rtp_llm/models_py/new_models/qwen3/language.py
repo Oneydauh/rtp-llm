@@ -6,6 +6,7 @@ from typing import Any, Optional
 import torch
 import torch.nn as nn
 
+from rtp_llm.models_py.downstream_heads import ReplicatedHandlerHeads
 from rtp_llm.models_py.layers.activation import silu_and_mul
 from rtp_llm.models_py.layers.embedding import (
     ParallelLMHead,
@@ -430,6 +431,7 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
     """
 
     supports_checkpoint_weight_updates = True
+    supports_custom_weight_mappings = True
 
     _decoder_layer = Qwen3DecoderLayer
     _dense_config = staticmethod(_extract_config_values)
@@ -447,6 +449,8 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
 
         def owns(name):
             mapped = self.WEIGHTS_MAPPER.map_name(name)
+            if mapped in self.handler_heads.sources:
+                return True
             if mapped.startswith("layers."):
                 index = mapped.split(".", 2)[1]
                 return not index.isdigit() or int(index) in self._owned_layer_ids
@@ -461,6 +465,10 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
         return owns
 
     def resolve_checkpoint_load_plan(self, name, shape):
+        if name in self.handler_heads.sources:
+            # Both consumers must see the full incoming tensor. The language
+            # projection still takes its own normal TP/vocabulary slice.
+            return None, None
         if (
             name == "embed_tokens.weight"
             and self.embed_tokens is None
@@ -483,6 +491,18 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
         def _track(it):
             nonlocal has_lm_head
             for name, tensor in it:
+                if name in self.handler_heads.sources:
+                    tensor = self.handler_heads.capture(name, tensor)
+                    if name not in self.handler_heads.vocabulary_sources:
+                        continue
+                    if name == "lm_head.weight" and self.lm_head is None:
+                        continue
+                    if (
+                        name == "embed_tokens.weight"
+                        and self.embed_tokens is None
+                        and (self.lm_head is None or not self.tie_word_embeddings)
+                    ):
+                        continue
                 if name == "embed_tokens.weight" and self.embed_tokens is None:
                     value, spec = unwrap_checkpoint_tensor(tensor)
                     self.lm_head.load_tied_checkpoint_weight(value, spec)
@@ -539,6 +559,12 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
         )
 
         cfg = self._dense_config(model_config, load_config)
+        self.handler_heads = ReplicatedHandlerHeads(
+            getattr(load_config, "custom_weight_mappings", ()),
+            self.WEIGHTS_MAPPER,
+            cfg["hidden_size"],
+            cfg["params_dtype"],
+        )
         _validate_supported_parallelism(parallelism_config)
         pp_size = int(getattr(parallelism_config, "pp_size", 1))
         is_draft = bool(
@@ -654,7 +680,7 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
         return self.norm(hidden_states)
 
     def runtime_weight_view(self) -> dict[str, torch.Tensor]:
-        result = {}
+        result = self.handler_heads.exports()
         if self.embed_tokens is not None:
             result["embedding"] = self.embed_tokens.weight
         if self.lm_head is not None:
@@ -664,6 +690,10 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
 
     def _input_embeddings(self, inputs):
         return self.embed_tokens(inputs.input_ids)
+
+    def validate_weights_loaded(self, loaded_tensor_ids=None):
+        self.handler_heads.validate()
+        super().validate_weights_loaded(loaded_tensor_ids)
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
         hidden_states = (

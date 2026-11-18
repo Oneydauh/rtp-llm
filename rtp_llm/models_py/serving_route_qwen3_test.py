@@ -8,6 +8,10 @@ from types import SimpleNamespace
 import torch
 from safetensors.torch import save_file
 
+from rtp_llm.models.downstream_modules.custom_module import CustomModule
+from rtp_llm.models.downstream_modules.reranker.qwen3_reranker import (
+    Qwen3RerankerHandler,
+)
 from rtp_llm.models.qwen_v3 import QwenV3
 from rtp_llm.models_py.model_loader import NewLoaderLoadMethod
 from rtp_llm.models_py.new_models.qwen3.language import Qwen3ForCausalLM
@@ -38,7 +42,7 @@ class CheckpointOnlyQwen3(QwenV3):
 
 
 class Qwen3ServiceRouteTest(unittest.TestCase):
-    def _load(self, root, method):
+    def _load(self, root, method, cls=CheckpointOnlyQwen3):
         fixture = service(root, method)
         config = model_config()
         config.model_type = "qwen_3"
@@ -47,9 +51,10 @@ class Qwen3ServiceRouteTest(unittest.TestCase):
         config.lora_infos = {}
         config.generate_env_config = None
         config.compute_dtype = torch.float32
+        config.data_type = torch.float32
         config.eplb_config = fixture.model_config.eplb_config
         config.enable_output_vocab_pruning = False
-        return CheckpointOnlyQwen3.from_config(
+        return cls.from_config(
             model_config=config,
             kv_cache_config=SimpleNamespace(
                 multi_task_prompt="", multi_task_prompt_str=""
@@ -66,6 +71,26 @@ class Qwen3ServiceRouteTest(unittest.TestCase):
             merge_lora=False,
             vit_config=None,
         )
+
+    def test_shared_reranker_source_reaches_both_consumers(self):
+        class RerankerQwen3(CheckpointOnlyQwen3):
+            def _init_custom_module(self):
+                custom = CustomModule(self.model_config, self.tokenizer)
+                custom.handler = Qwen3RerankerHandler(self.model_config, 0, 1)
+                return custom
+
+        for method in ("scratch", "fastsafetensors"):
+            with self.subTest(method=method), tempfile.TemporaryDirectory() as root:
+                data = checkpoint()
+                save_file(data, os.path.join(root, "model.safetensors"))
+                model = self._load(root, method, RerankerQwen3)
+                weight = data["model.embed_tokens.weight"]
+                torch.testing.assert_close(
+                    model.py_model.embed_tokens.weight.cpu(), weight
+                )
+                torch.testing.assert_close(
+                    model.custom_module.handler.linear.weight.cpu(), weight
+                )
 
     def test_scratch_and_native_fst(self):
         for method in ("scratch", "fastsafetensors"):

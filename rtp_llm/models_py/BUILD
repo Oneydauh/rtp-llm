@@ -8,6 +8,7 @@ py_library(
     srcs = [
         "__init__.py",
         "borrowed_parameters.py",
+        "downstream_heads.py",
         "expert_placement.py",
         "fastsafetensors_read_spec.py",
         "finetune_overlay.py",

@@ -9,9 +9,38 @@ import torch
 from safetensors.torch import save_file
 
 from rtp_llm.models.direct_checkpoint import load_owned_model
-from rtp_llm.models_py.model_loader import NewLoaderLoadMethod
+from rtp_llm.models_py.downstream_heads import ReplicatedHandlerHeads
+from rtp_llm.models_py.model_loader import (
+    NewLoaderConfig,
+    NewLoaderLoadMethod,
+    NewModelLoader,
+)
 from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.registry import register_model
+from rtp_llm.models_py.weight_mapper import WeightsMapper
+
+
+@register_model("_service_direct_handler")
+class HandlerCheckpoint(RtpModule):
+    supports_custom_weight_mappings = True
+    WEIGHTS_MAPPER = WeightsMapper(prefix_mapping={"model.": ""})
+
+    def __init__(self, config, load_config):
+        super().__init__()
+        self.heads = ReplicatedHandlerHeads(
+            load_config.custom_weight_mappings,
+            self.WEIGHTS_MAPPER,
+            2,
+            load_config.compute_dtype,
+        )
+
+    def load_weights(self, weights):
+        for name, tensor in self.WEIGHTS_MAPPER.apply(weights):
+            self.heads.capture(name, tensor)
+
+    def validate_weights_loaded(self, loaded_tensor_ids=None):
+        self.heads.validate()
+        super().validate_weights_loaded(loaded_tensor_ids)
 
 
 @register_model("_service_direct_leaf")
@@ -71,6 +100,38 @@ def service(path, method, model_type="_service_direct_leaf"):
 
 
 class DirectServingBoundaryTest(unittest.TestCase):
+    def test_full_handler_sources_survive_reader_destruction(self):
+        values = {
+            "model.embed_tokens.weight": torch.arange(8).reshape(4, 2).float(),
+            "classifier.weight": torch.arange(6).reshape(3, 2).float(),
+            "classifier.bias": torch.tensor([3.0, 1.0, -1.0]),
+        }
+        mappings = tuple(("__custom__." + key, key) for key in values)
+        for method in ("scratch", "fastsafetensors"):
+            with self.subTest(method=method), tempfile.TemporaryDirectory() as root:
+                cfg = service(root, method, "_service_direct_handler").model_config
+                path = os.path.join(root, "model.safetensors")
+                save_file(values, path)
+                load = NewLoaderConfig(
+                    device="cpu",
+                    load_method=method,
+                    compute_dtype=torch.float32,
+                    custom_weight_mappings=mappings,
+                )
+                loader = NewModelLoader(cfg, load, model_path=root)
+                model = loader.load()
+                os.remove(path)
+                self.assertEqual(loader.loaded_method, NewLoaderLoadMethod(method))
+                for name, value in values.items():
+                    torch.testing.assert_close(
+                        model.heads.exports()["__custom__." + name], value
+                    )
+                bad = dict(values)
+                del bad["classifier.bias"]
+                save_file(bad, path)
+                with self.assertRaisesRegex(RuntimeError, "Missing downstream"):
+                    NewModelLoader(cfg, load, model_path=root).load()
+
     def test_exact_backend_and_publication_preserve_identity(self):
         for method in ("scratch", "fastsafetensors"):
             with self.subTest(method=method), tempfile.TemporaryDirectory() as root:
