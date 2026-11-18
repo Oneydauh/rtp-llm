@@ -61,7 +61,12 @@ py_test(
 py_test(
     name = "test_pp_layer_filter",
     srcs = ["test_pp_layer_filter.py"],
-    deps = py_test_deps,
+    env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1"},
+    deps = [
+        "//rtp_llm/models_py:new_weight_loader",
+        "//rtp_llm/tools/convert:ft_export_metadata",
+        "//rtp_llm/tools/convert:ft_export_writer",
+    ],
 )
 
 py_test(

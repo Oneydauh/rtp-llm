@@ -85,8 +85,8 @@ py_test(
     env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1"},
     deps = [
         ":new_weight_loader",
-        "//rtp_llm/model_loader:loader",
-        "//rtp_llm/tools/convert:convert",
+        "//rtp_llm/tools/convert:ft_export_metadata",
+        "//rtp_llm/tools/convert:ft_export_writer",
     ],
 )
 

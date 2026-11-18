@@ -6,10 +6,10 @@ from types import SimpleNamespace
 
 import torch
 
-from rtp_llm.model_loader.loader import ModelLoader
 from rtp_llm.models_py.model_loader import NewLoaderConfig, NewModelLoader
 from rtp_llm.models_py.quant_methods import QuantizationConfig
-from rtp_llm.tools.convert.weights_convert import WeightConverter
+from rtp_llm.tools.convert.ft_export_metadata import generate_ft_index
+from rtp_llm.tools.convert.ft_export_writer import write_ft_shards
 
 
 def produce_records(rank):
@@ -41,22 +41,10 @@ class MainFTStageTest(unittest.TestCase):
         # already-converted records, not a mock of FT or a full HF conversion.
         with tempfile.TemporaryDirectory() as directory:
             for rank in (0, 1):
-                writer = object.__new__(ModelLoader)
-                writer._load_config = SimpleNamespace(
-                    is_ft_style_weight=False,
-                    layer_range=range(3),
-                    num_layers=3,
-                    tp_rank=rank,
-                    dp_rank=0,
-                    ep_rank=rank,
-                    compute_dtype=torch.float32,
+                write_ft_shards(
+                    produce_records(rank), directory, tp_rank=rank, ep_rank=rank
                 )
-                writer._global_weight_aliases = {}
-                writer.prepare_weights = lambda device, rank=rank: produce_records(rank)
-                writer.dump_weight_as_ft_style("cpu", directory)
-            converter = object.__new__(WeightConverter)
-            converter.env_params = {"TP_SIZE": 2, "DP_SIZE": 1, "EP_SIZE": 0}
-            converter._generate_safetensor_meta_info(directory)
+            generate_ft_index(directory, {"TP_SIZE": 2, "DP_SIZE": 1, "EP_SIZE": 0})
             config = SimpleNamespace(
                 model_type="qwen_2",
                 num_layers=3,
@@ -104,7 +92,10 @@ class MainFTStageTest(unittest.TestCase):
                         )
                         loader = NewModelLoader(config, load, model_path=directory)
                         model = loader.load()
-                        self.assertEqual(loader._selected_load_method.value, method)
+                        self.assertEqual(loader.loaded_method.value, method)
+                        self.assertEqual(
+                            tuple(model.layers), ("1", "2") if stage else ("0",)
+                        )
                         expected = (
                             torch.arange(32, dtype=torch.float32)
                             .reshape(8, 4)

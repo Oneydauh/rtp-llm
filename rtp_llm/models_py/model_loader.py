@@ -1684,6 +1684,11 @@ class NewModelLoader:
             total += tensor.numel() * tensor.element_size()
         return total
 
+    @staticmethod
+    def fst_staging_required_bytes(model_bytes, max_shard_bytes, bbuf_bytes):
+        """The destination parameters and up to three staging buffers overlap."""
+        return model_bytes + 3 * max(max_shard_bytes, bbuf_bytes)
+
     def _fastsafetensors_prerequisite_reason(
         self,
         model: nn.Module,
@@ -1859,7 +1864,9 @@ class NewModelLoader:
                 )
             except (OSError, RuntimeError, ValueError) as exc:
                 return f"cannot determine fastsafetensors memory safety: {exc}"
-            required_bytes = model_bytes + 3 * max(max_shard_bytes, bbuf_bytes)
+            required_bytes = self.fst_staging_required_bytes(
+                model_bytes, max_shard_bytes, bbuf_bytes
+            )
             logger.info(
                 "NewLoader fastsafetensors memory check: free=%.2fGiB, "
                 "model=%.2fGiB, max_shard=%.2fGiB, bbuf=%.2fGiB, "
