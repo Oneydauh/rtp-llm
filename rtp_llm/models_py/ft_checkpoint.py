@@ -80,6 +80,21 @@ class RuntimeTensorBinding:
     install: Callable[[tuple[torch.Tensor, ...]], None] | None = None
 
 
+def ft_layer_bindings(model):
+    """Pair source global layer ids with *actual* registered destination names."""
+    ids = tuple(
+        model.layer_ids() if hasattr(model, "layer_ids") else range(len(model.layers))
+    )
+    children = tuple(model.layers.named_children())
+    if len(children) != len(ids):
+        raise ValueError("FT pipeline range disagrees with local decoder layers")
+    if isinstance(model.layers, torch.nn.ModuleDict):
+        # main PP owners key their modules by global id, not stage-local offset.
+        if tuple(key for key, _ in children) != tuple(map(str, ids)):
+            raise ValueError("FT pipeline layer keys disagree with source global ids")
+    return tuple((index, key, child) for index, (key, child) in zip(ids, children))
+
+
 class FTCheckpoint:
     def __init__(
         self,

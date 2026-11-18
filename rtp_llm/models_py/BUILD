@@ -72,6 +72,17 @@ py_test(
     ],
 )
 
+py_test(
+    name = "qwen2_main_ft_stage_test",
+    srcs = ["qwen2_main_ft_stage_test.py"],
+    env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1"},
+    deps = [
+        ":new_weight_loader",
+        "//rtp_llm/model_loader:loader",
+        "//rtp_llm/tools/convert:convert",
+    ],
+)
+
 # Direct parameter owners use main's existing runtime models/helpers, never a
 # backported scheduler/cache/PP engine. Production routing is integrated later.
 py_library(

@@ -6,7 +6,7 @@ registry or OldLoader/device conversion dependency is introduced here.
 
 import torch
 
-from rtp_llm.models_py.ft_checkpoint import RuntimeTensorBinding
+from rtp_llm.models_py.ft_checkpoint import RuntimeTensorBinding, ft_layer_bindings
 from rtp_llm.models_py.quant_methods.unquantized import UnquantizedLinearMethod
 
 
@@ -64,7 +64,8 @@ def load_dense_ft_checkpoint(model, checkpoint):
             value = decode_dense_weight(value)
         return value
 
-    for layer in model.layers:
+    layers = ft_layer_bindings(model)
+    for _, _, layer in layers:
         for linear in (
             layer.self_attn.qkv_proj,
             layer.self_attn.o_proj,
@@ -316,14 +317,9 @@ def load_dense_ft_checkpoint(model, checkpoint):
                 raise ValueError("Dense RMSNorm FT final beta must be exactly zero")
 
         validators["global.final_layernorm.beta"] = zero_final_beta
-    layer_ids = (
-        model.layer_ids() if hasattr(model, "layer_ids") else range(len(model.layers))
-    )
-    if len(layer_ids) != len(model.layers):
-        raise ValueError("FT pipeline range disagrees with local decoder layers")
-    for index, (layer_id, layer) in enumerate(zip(layer_ids, model.layers)):
+    for layer_id, key, layer in layers:
         src = f"layers.{layer_id}."
-        dst = f"layers.{index}."
+        dst = f"layers.{key}."
         for old, target, convert in (
             ("pre_layernorm_weights.gamma", "input_layernorm.weight", _identity),
             (
@@ -365,7 +361,9 @@ def load_dense_ft_checkpoint(model, checkpoint):
                 RuntimeTensorBinding(
                     (src + "self_attention_weights.query_weight.bias",),
                     dst + "self_attn.qkv_proj.bias",
-                    _bias,
+                    lambda values, shape=layer.self_attn.qkv_proj.bias.shape: _bias(
+                        values
+                    ).reshape(shape),
                 )
             )
         down_names = (src + "ffn_weights.intermediate_weight2.kernel",)

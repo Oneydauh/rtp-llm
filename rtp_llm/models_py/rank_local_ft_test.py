@@ -11,6 +11,7 @@ from rtp_llm.models_py.ft_checkpoint import (
     CheckpointTopology,
     FTCheckpoint,
     RuntimeTensorBinding,
+    ft_layer_bindings,
 )
 from rtp_llm.models_py.model_loader import NewLoaderConfig, NewModelLoader
 from rtp_llm.models_py.module_base import RtpModule
@@ -100,6 +101,18 @@ def _gloo_load(rank, folder, rendezvous):
 
 
 class RankLocalFTTest(unittest.TestCase):
+    def test_pp_keys_are_actual_module_paths_not_stage_local_offsets(self):
+        leaf = torch.nn.Linear(2, 2)
+        model = SimpleNamespace(
+            layer_ids=lambda: range(2, 3), layers=torch.nn.ModuleDict({"2": leaf})
+        )
+        self.assertEqual(ft_layer_bindings(model), ((2, "2", leaf),))
+        model.layers = torch.nn.ModuleList([leaf])
+        self.assertEqual(ft_layer_bindings(model), ((2, "0", leaf),))
+        model.layers = torch.nn.ModuleDict({"0": leaf})
+        with self.assertRaisesRegex(ValueError, "global ids"):
+            ft_layer_bindings(model)
+
     def export(self, path):
         for tp, ep in ((0, 0), (1, 1)):
             layers = [
