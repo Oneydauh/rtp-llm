@@ -344,6 +344,71 @@ class GroupwiseOwnerTest(unittest.TestCase):
                             decode(owner.proj), expected, rtol=0, atol=0
                         )
 
+    def test_gptq_zero_bias_buffer_dtype_checked_before_zero_acceptance(self):
+        packed, _ = material("gptq", 4, 64, 64)
+        values = {"proj." + name: tensor for name, tensor in packed.items()}
+        config = SimpleNamespace(
+            model_type="_groupwise_dense_cpu_owner", kind="row", bias=False
+        )
+        for backend in ("scratch", "fastsafetensors"):
+            for dtype in (torch.float16, torch.bfloat16, torch.float32):
+                with self.subTest(backend=backend, dtype=dtype):
+                    owner = self.load(
+                        dict(values, **{"proj.bias": torch.zeros(64, dtype=dtype)}),
+                        config,
+                        "gptq",
+                        4,
+                        backend,
+                    )
+                    self.assertIsNone(owner.proj.bias)
+            for dtype in (
+                torch.bool,
+                torch.uint8,
+                torch.int32,
+                torch.int64,
+                torch.float64,
+            ):
+                with self.subTest(backend=backend, dtype=dtype):
+                    bias = torch.zeros(64, dtype=dtype)
+                    source = source_config("gptq", 4)
+                    owner = DenseOwner(
+                        config,
+                        NewLoaderConfig(
+                            device="cpu",
+                            quant_config=QuantizationConfig("gptq", source),
+                        ),
+                    )
+                    # Independently prove the owner checks dtype before it
+                    # accepts zero values, without the FST coordinator.
+                    with self.assertRaisesRegex(
+                        TypeError, "Grouped scales/bias must be floating point"
+                    ):
+                        owner.proj.load_weights({"bias": bias})
+                    with self.assertRaises((TypeError, RuntimeError)) as rejected:
+                        self.load(
+                            dict(values, **{"proj.bias": bias}),
+                            config,
+                            "gptq",
+                            4,
+                            backend,
+                        )
+                    if isinstance(rejected.exception, TypeError):
+                        self.assertIn(
+                            "Grouped scales/bias must be floating point",
+                            str(rejected.exception),
+                        )
+                    else:
+                        # FST can group byte tensors after packed weights and
+                        # reject them before calling an already-finalized leaf.
+                        # Do not weaken that earlier guard just to change the
+                        # exception class of an invalid checkpoint.
+                        self.assertEqual(backend, "fastsafetensors")
+                        self.assertIn(dtype, (torch.bool, torch.uint8))
+                        self.assertIn(
+                            "Checkpoint tensor arrived after staged postprocessing completed",
+                            str(rejected.exception),
+                        )
+
     def test_gptq_biasless_buffers_are_strict_not_silently_discarded(self):
         packed, _ = material("gptq", 4, 64, 64)
         base = {"proj." + k: v for k, v in packed.items()}
