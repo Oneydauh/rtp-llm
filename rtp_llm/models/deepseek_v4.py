@@ -733,7 +733,7 @@ class DeepSeekV4(DeepSeekV2):
 
         model_config.kv_cache_spec_descs = descs
 
-    def create_model_loader(self):
+    def load(self, skip_python_model: bool = False):
         if _is_ppu_flash(self.model_config):
             from rtp_llm.models_py.modules.dsv4.ppu.metadata.cache import (
                 configure_indexer_cache,
@@ -751,7 +751,7 @@ class DeepSeekV4(DeepSeekV2):
                     self.parallelism_config,
                     options={"DSV4_PPU_TP_COMM_WARMUP": "1", **os.environ},
                 )
-        return super().create_model_loader()
+        return super().load(skip_python_model=skip_python_model)
 
     def _create_python_model(self):
         if _is_ppu_flash(self.model_config):

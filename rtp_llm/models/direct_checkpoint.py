@@ -72,7 +72,7 @@ def _runtime_view(module, config, device):
     )
 
 
-def load_owned_model(service):
+def load_owned_model(service, *, publish_runtime=True):
     """Build locally first; never expose a half-loaded module to serving."""
     config = service.model_config
     owner_cls = get_model_class(config.model_type)
@@ -90,6 +90,12 @@ def load_owned_model(service):
             owner_cls.runtime_parameter_paths,
         )
     device = service._get_device_str()
+    if (
+        not publish_runtime
+        and torch.device(device).type == "cuda"
+        and not torch.cuda.is_available()
+    ):
+        device = "cpu"
     source_quant = config.quant_config
     quant_type = "none"
     if source_quant is not None:
@@ -141,6 +147,13 @@ def load_owned_model(service):
 
         for name, path in adapters.items():
             merge_startup_lora_checkpoint(module, loader, name, path)
+    if not publish_runtime:
+        # Offline conversion needs the loaded, postprocessed parameter owner,
+        # not serving state, a second loader, or a second checkpoint read.
+        service.checkpoint_owner = module
+        service.model_weights_loader = loader
+        service.device = device
+        return
     view = _runtime_view(module, config, device)
     module.weight = view
     controller = None
@@ -153,6 +166,7 @@ def load_owned_model(service):
     service.device = device
     service.weight = view
     service.py_model = module
+    service.checkpoint_owner = module
     service.model_weights_loader = loader
     service.py_eplb = controller
     logging.info(

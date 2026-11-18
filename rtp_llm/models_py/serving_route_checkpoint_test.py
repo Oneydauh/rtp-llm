@@ -103,6 +103,24 @@ def service(path, method, model_type="_service_direct_leaf"):
 
 
 class DirectServingBoundaryTest(unittest.TestCase):
+    def test_offline_conversion_keeps_owner_without_publishing_runtime(self):
+        for method in ("scratch", "fastsafetensors"):
+            with self.subTest(method=method), tempfile.TemporaryDirectory() as root:
+                tensor = torch.tensor([[3.0, 4.0], [-2.0, 1.0]])
+                save_file(
+                    {"weight_param": tensor}, os.path.join(root, "model.safetensors")
+                )
+                model = service(root, method)
+                load_owned_model(model, publish_runtime=False)
+                self.assertIsNone(model.py_model)
+                self.assertIsNone(model.weight)
+                self.assertIsNone(model.py_eplb)
+                self.assertEqual(
+                    model.model_weights_loader.loaded_method,
+                    NewLoaderLoadMethod(method),
+                )
+                torch.testing.assert_close(model.checkpoint_owner.weight_param, tensor)
+
     def test_forced_cpu_stages_with_native_fst_and_never_retries(self):
         with tempfile.TemporaryDirectory() as root:
             path = os.path.join(root, "model.safetensors")

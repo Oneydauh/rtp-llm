@@ -48,14 +48,6 @@ class ModelFactory:
             return json.loads(text)
 
     @staticmethod
-    def get_weight_cls(model_type: str):
-        global _model_factory
-        if not ensure_model_registered(model_type):
-            raise KeyError(f"model type [{model_type}] is not registered")
-        model_cls = _model_factory[model_type]
-        return model_cls.get_weight_cls()
-
-    @staticmethod
     def get_model_cls(model_type: str):
         global _model_factory
         if not ensure_model_registered(model_type):
@@ -112,7 +104,6 @@ class ModelFactory:
             force_cpu_load_weights=engine_config.load_config.force_cpu_load_weights,
             loader_recycle_handles=engine_config.load_config.loader_recycle_handles,
             moe_pure_tp_preshard=engine_config.load_config.moe_pure_tp_preshard,
-            use_new_loader=getattr(engine_config.load_config, "use_new_loader", False),
         )
         return model
 
@@ -178,12 +169,6 @@ class ModelFactory:
                 return None
 
             load_method = engine_config.load_config.load_method
-            use_new_loader = getattr(engine_config.load_config, "use_new_loader", False)
-            if parallelism_config.pp_size > 1 and not use_new_loader:
-                # Only the last PP stage loads draft weights, but fastsafetensors
-                # requires all WORLD ranks to participate in its collectives.
-                # Force SCRATCH here because AUTO may select fastsafetensors.
-                load_method = "scratch"
 
             # Need to create GPT model for propose model
             model_cls = ModelFactory.get_model_cls(propose_model_config.model_type)
@@ -237,16 +222,11 @@ class ModelFactory:
                 max_generate_batch_size=engine_config.runtime_config.max_generate_batch_size,
                 vit_config=None,  # Propose model doesn't need vit_config
                 merge_lora=False,  # Propose model doesn't need merge_lora
-                force_cpu_load_weights=(
-                    engine_config.load_config.force_cpu_load_weights
-                    if use_new_loader
-                    else False
-                ),
+                force_cpu_load_weights=engine_config.load_config.force_cpu_load_weights,
                 loader_recycle_handles=engine_config.load_config.loader_recycle_handles,
                 moe_pure_tp_preshard=engine_config.load_config.moe_pure_tp_preshard,
                 weight_alias_owner=target_model if alias_names else None,
                 weight_alias_names=alias_names,
-                use_new_loader=use_new_loader,
             )
             aliased_local_bytes = 0
             for name in alias_names:

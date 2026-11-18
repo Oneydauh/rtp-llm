@@ -164,23 +164,17 @@ class DraftModelLoadingTest(unittest.TestCase):
             SpeculativeType.EAGLE,
             SpeculativeType.DSPARK,
         ):
-            for direct, pp_size, pp_rank, load_method, expected_method in (
-                (False, 1, 0, "auto", "auto"),
-                (False, 1, 0, "fastsafetensors", "fastsafetensors"),
-                (False, 1, 0, "scratch", "scratch"),
-                (False, 3, 0, "fastsafetensors", None),
-                (False, 3, 1, "fastsafetensors", None),
-                (False, 3, 2, "auto", "scratch"),
-                (False, 3, 2, "fastsafetensors", "scratch"),
-                (False, 3, 2, "scratch", "scratch"),
-                (True, 3, 0, "fastsafetensors", None),
-                (True, 3, 1, "fastsafetensors", None),
-                (True, 3, 2, "auto", "auto"),
-                (True, 3, 2, "fastsafetensors", "fastsafetensors"),
-                (True, 3, 2, "scratch", "scratch"),
+            for pp_size, pp_rank, load_method, expected_method in (
+                (1, 0, "auto", "auto"),
+                (1, 0, "scratch", "scratch"),
+                (1, 0, "fastsafetensors", "fastsafetensors"),
+                (3, 0, "fastsafetensors", None),
+                (3, 1, "fastsafetensors", None),
+                (3, 2, "auto", "auto"),
+                (3, 2, "fastsafetensors", "fastsafetensors"),
+                (3, 2, "scratch", "scratch"),
             ):
                 with self.subTest(
-                    direct=direct,
                     sp_type=sp_type,
                     pp_size=pp_size,
                     pp_rank=pp_rank,
@@ -188,7 +182,6 @@ class DraftModelLoadingTest(unittest.TestCase):
                 ):
                     engine_config = make_engine_config(sp_type, pp_size, pp_rank)
                     engine_config.load_config.load_method = load_method
-                    engine_config.load_config.use_new_loader = direct
                     target_config = SimpleNamespace(
                         max_seq_len=128, gen_num_per_cycle=2
                     )
@@ -214,7 +207,6 @@ class DraftModelLoadingTest(unittest.TestCase):
                     self.assertEqual(propose.sp_type, sp_type)
                     self.assertEqual(propose.gen_num_per_circle, 2)
                     args = model_cls.from_config.call_args.kwargs
-                    self.assertIs(args["use_new_loader"], direct)
                     self.assertEqual(args["load_method"], expected_method)
                     self.assertIs(args["model_config"], draft_config)
                     self.assertEqual(
@@ -300,9 +292,8 @@ class DraftModelLoadingTest(unittest.TestCase):
                     reject = pp_size > 1 and not is_mtp and not supports_pp
                     with patch.object(
                         model, "_init_custom_module", return_value=None
-                    ), patch.object(
-                        model,
-                        "create_model_loader",
+                    ), patch(
+                        "rtp_llm.models.direct_checkpoint.load_owned_model",
                         side_effect=RuntimeError("reached loader"),
                     ) as loader:
                         expected = (
@@ -315,7 +306,7 @@ class DraftModelLoadingTest(unittest.TestCase):
                         if reject:
                             loader.assert_not_called()
                         else:
-                            loader.assert_called_once_with()
+                            loader.assert_called_once_with(model, publish_runtime=True)
 
 
 if __name__ == "__main__":

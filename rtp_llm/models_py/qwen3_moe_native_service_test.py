@@ -26,12 +26,6 @@ class _Server(Qwen3Moe):
     def _init_custom_module(self):
         return None
 
-    def create_model_loader(self):
-        raise AssertionError("explicit NewLoader route must not construct OldLoader")
-
-    def _create_python_model(self):
-        raise AssertionError("service must publish the already-loaded owner")
-
 
 class Qwen3MoeServingTest(unittest.TestCase):
     def test_real_registered_owner(self):
@@ -77,7 +71,6 @@ class Qwen3MoeServingTest(unittest.TestCase):
                         enable_cuda_graph=False, use_swizzleA=False
                     ),
                     load_method=method,
-                    use_new_loader=True,
                     merge_lora=False,
                     vit_config=None,
                 )

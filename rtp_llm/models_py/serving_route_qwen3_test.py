@@ -34,12 +34,6 @@ class CheckpointOnlyQwen3(QwenV3):
     def _init_custom_module(self):
         return None
 
-    def create_model_loader(self):
-        raise AssertionError("explicit direct route leaked into the legacy loader")
-
-    def _create_python_model(self):
-        raise AssertionError("explicit direct route reconstructed a legacy model")
-
 
 class Qwen3ServiceRouteTest(unittest.TestCase):
     def _load(self, root, method, cls=CheckpointOnlyQwen3):
@@ -67,7 +61,6 @@ class Qwen3ServiceRouteTest(unittest.TestCase):
                 enable_cuda_graph=False, use_swizzleA=False
             ),
             load_method=method,
-            use_new_loader=True,
             merge_lora=False,
             vit_config=None,
         )
