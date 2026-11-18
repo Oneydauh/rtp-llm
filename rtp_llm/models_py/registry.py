@@ -139,3 +139,17 @@ for _model_type in ("deepseek2", "glm4_moe_lite"):
         "rtp_llm.models_py.new_models.deepseek_v3.language",
         "DeepSeekV32ForCausalLM",
     )
+
+# Use the service model_type, not the Hugging Face architecture string. Draft
+# models need different checkpoint prefixes and cannot alias the target class.
+for _model_type, _owner in (
+    ("qwen3_next", "Qwen3NextForCausalLM"),
+    ("qwen35_dense", "Qwen3NextForCausalLM"),
+    ("qwen35_moe", "Qwen3NextForCausalLM"),
+    ("qwen3_next_mtp", "Qwen3NextMTPForCausalLM"),
+    ("qwen35_dense_mtp", "Qwen35DenseMTPForCausalLM"),
+    ("qwen35_moe_mtp", "Qwen35MoeMTPForCausalLM"),
+):
+    register_lazy_model(
+        _model_type, "rtp_llm.models_py.new_models.qwen3_next.language", _owner
+    )
