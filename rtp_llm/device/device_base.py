@@ -92,6 +92,13 @@ class DeviceBase:
     ) -> torch.Tensor:
         return weight
 
+    def shuffle_moe_weight(
+        self, x: torch.Tensor, datatype: torch.dtype, name: str
+    ) -> torch.Tensor:
+        # Portable CPU FT files and CUDA use canonical [expert, N, K] order.
+        # Backends with a specialized packed layout (ROCm) override this.
+        return x
+
     def maybe_prepare_static_weights_for_fp4_moe(
         self,
         kernel_name: str,

@@ -323,11 +323,6 @@ class GpuImpl(DeviceBase):
         processed_scalses = torch.stack(processed_scalses, dim=0)
         return processed_weights, processed_zeros, processed_scalses
 
-    def shuffle_moe_weight(
-        self, x: torch.Tensor, datatype: torch.dtype, name: str
-    ) -> torch.Tensor:
-        return x
-
     def shuffle_gemm_weight(self, x: torch.Tensor) -> torch.Tensor:
         return x
 
