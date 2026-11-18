@@ -36,6 +36,7 @@ from rtp_llm.utils.model_weight import W
 from .model import DeepSeekV32DecoderLayer
 from .moe import normalize_topk_method
 from .rope_cache import build_rope_cache
+from .score_checkpoint import score_name_filter
 
 logger = logging.getLogger(__name__)
 
@@ -650,17 +651,7 @@ class DeepSeekV32ForCausalLM(MlaRuntimeLayoutMixin, GenericMoeModel, RtpModule):
         return int(layer_text)
 
     def checkpoint_weight_name_filter(self) -> Callable[[str], bool]:
-        num_layers = len(self.layers)
-
-        def should_load(name: str) -> bool:
-            if name.startswith("model.layers."):
-                layer_idx = self._checkpoint_layer_index(name)
-                if layer_idx is None:
-                    return True
-                return layer_idx < num_layers
-            return name.startswith(("model.", "lm_head."))
-
-        return should_load
+        return self._score_name_filter
 
     @staticmethod
     def _read_config_json(ckpt_path: str) -> Dict[str, Any]:
@@ -735,6 +726,10 @@ class DeepSeekV32ForCausalLM(MlaRuntimeLayoutMixin, GenericMoeModel, RtpModule):
             )
 
         cfg = extract_config_values(model_config, load_config, config_json)
+        self._score_name_filter = score_name_filter(
+            cfg["num_layers"], config_json.get("num_hidden_layers", cfg["num_layers"]),
+            config_json.get("num_nextn_predict_layers", 0),
+        )
         self.tie_word_embeddings = cfg["tie_word_embeddings"]
 
         # --- RoPE cache: read config.json directly for full rope fields ---
