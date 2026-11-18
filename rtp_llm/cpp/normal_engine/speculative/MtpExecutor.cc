@@ -648,10 +648,14 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
     if (params.eplb_config.enable_eplb() && params.model_config_.moe_style != 0) {
         // use first moe layer weight as moe weight type
         int         first_moe_layer = params.model_config_.moe_layer_index.front();
-        const auto& moe_kernel      = params.gpt_weights.layers[first_moe_layer].ffn_weights.moe_gate_weight->kernel;
-        auto        moe_weight_type = torchDTypeToDataType(moe_kernel.dtype());
-        bool        is_gated_activation = params.model_config_.isGatedActivation();
-        auto        moe_inter_size      = is_gated_activation ? moe_kernel.size(1) / 2 : moe_kernel.size(1);
+        // Python-owned experts do not populate legacy DenseWeights.
+        DataType moe_weight_type = DataType::TYPE_FP16;
+        int64_t moe_inter_size = 0;
+        if (!ExpertBalancerPythonWrapper::usesDirectInstall(params.py_eplb)) {
+            const auto& moe_kernel = params.gpt_weights.layers[first_moe_layer].ffn_weights.moe_gate_weight->kernel;
+            moe_weight_type = torchDTypeToDataType(moe_kernel.dtype());
+            moe_inter_size = params.model_config_.isGatedActivation() ? moe_kernel.size(1) / 2 : moe_kernel.size(1);
+        }
 
         expert_balancer_ =
             std::make_shared<ExpertBalancer>(params.model_config_.expert_num,

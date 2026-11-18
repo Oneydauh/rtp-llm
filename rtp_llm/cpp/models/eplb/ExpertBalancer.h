@@ -1,5 +1,6 @@
 #pragma once
 
+#include <thread>
 #include <utility>
 #include <torch/extension.h>
 #include "rtp_llm/cpp/models/eplb/ExpertBalancerPythonWrapper.h"
@@ -39,7 +40,8 @@ struct EplbPlanBuffers {
               size_t    moe_size,
               size_t    ep_size,
               DataType  dtype,
-              QuantAlgo quant_algo);
+              QuantAlgo quant_algo,
+              bool allocate_weights = true);
 };
 
 struct BalanceStatsBuffers {
@@ -59,7 +61,10 @@ struct LoadFlags {
 
     void init();
 
+    enum class SyncStatus { LOADING, READY, FAILED };
     void setReady(bool ready);
+    void setFailed();
+    SyncStatus sync(size_t group_size, ParallelMode mode);
     bool isReady(size_t eplb_group_size, ParallelMode parallel_mode);
 };
 
@@ -67,7 +72,8 @@ enum class EplbPlanStatus {
     INIT,
     PREPARING,
     LOADING,
-    LOADED
+    LOADED,
+    FAILED
 };
 
 class EplbController {
@@ -121,6 +127,11 @@ private:
     void updateStats(OverallExpertStats& stats);
     void loadPlanWeights();
     bool syncPlanWeightsLoadStatus();
+    void startPlanWeightLoad();
+    void joinPlanWeightLoad();
+    void finishPlan(bool committed);
+    std::thread load_thread_;
+    bool direct_install_ = false;
     void processPlanWeights();
     void applyPlanWeights(ModelBase& model);
 

@@ -892,6 +892,12 @@ void PyWrappedModel::updateKVCacheKernelBlockId(const GptModelInputs& inputs) {
 
 GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
     RTP_LLM_PROFILE_SCOPE("py_model.forward");
+    if (direct_eplb_stats_) {
+        // Eager and graph replay both write into these same address-stable
+        // buffers. Each forward publishes one batch, not a cumulative count.
+        overall_expert_stats_.stats_buf.log_stats_buf.zero_();
+        overall_expert_stats_.stats_buf.gpu_loads_buf.zero_();
+    }
 
     // Establish the cleanup guard before touching inputs: both the performance
     // wrapper and host-buffer retention can throw. A failed async prepare must
