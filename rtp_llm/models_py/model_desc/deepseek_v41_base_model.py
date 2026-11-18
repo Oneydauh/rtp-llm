@@ -28,10 +28,12 @@ mode reads tensors from `mw.global_weights[W.*]` and
 `mw.weights[layer_id][W.v4_*]` (W tag enum, no string keys).
 """
 
+from __future__ import annotations
+
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
 
@@ -53,7 +55,6 @@ from rtp_llm.models_py.modules.dsv41.decode.forward import (
     forward_decode,
 )
 from rtp_llm.models_py.modules.dsv41.kv_cache_utils import as_tagged_attention_inputs
-from rtp_llm.models_py.modules.dsv41.prefill.forward import forward_prefill
 from rtp_llm.models_py.modules.dsv41.transformer import V4Args, V4Transformer
 from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.chunked_layer import (
     cp_padded_batch_tokens_per_rank_bound,
@@ -62,6 +63,13 @@ from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.chunked_layer imp
 )
 from rtp_llm.ops import RoleType
 from rtp_llm.utils.warmup import model_warm_up_enabled
+
+if TYPE_CHECKING:
+    from rtp_llm.ops.compute_ops import (
+        PyModelInitResources,
+        PyModelInputs,
+        PyModelOutputs,
+    )
 
 
 def _materialize_meta_buffers(module: torch.nn.Module, device: str) -> int:
@@ -82,9 +90,6 @@ def _materialize_meta_buffers(module: torch.nn.Module, device: str) -> int:
                 )
                 count += 1
     return count
-
-
-from rtp_llm.ops.compute_ops import PyModelInitResources, PyModelInputs, PyModelOutputs
 
 
 def _is_decode_fmha(fmha_impl: Any) -> bool:
@@ -1164,6 +1169,8 @@ class DeepSeekV4Model(GptModelBase):
             hidden = torch.zeros(
                 T, self._v4_args.dim, dtype=torch.bfloat16, device=device
             )
+            from rtp_llm.ops.compute_ops import PyModelOutputs
+
             return PyModelOutputs(hidden)
         attn = as_tagged_attention_inputs(inputs.attention_inputs)
         self.v4._image_token_mask = None
@@ -1203,6 +1210,8 @@ class DeepSeekV4Model(GptModelBase):
                 prepare_hidden_fn=prep_decode,
             )
         elif attn.is_prefill:
+            from rtp_llm.models_py.modules.dsv41.prefill.forward import forward_prefill
+
             return forward_prefill(
                 self.v4,
                 self.kv_cache,
@@ -1230,5 +1239,7 @@ class DeepSeekV4Model(GptModelBase):
             # First-class outputs survive CUDA graph replay; Python mutable
             # state alone cannot represent the target's current auxiliary rows.
             aux = self.get_mtp_target_hidden_states(int(inputs.input_ids.numel()))
+            from rtp_llm.ops.compute_ops import PyModelOutputs
+
             return PyModelOutputs(result.hidden_states, aux)
         return result

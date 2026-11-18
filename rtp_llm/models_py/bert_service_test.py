@@ -183,6 +183,8 @@ class BertServiceTest(unittest.TestCase):
                 ):
                     public_load(root, method, TaskType.DENSE_EMBEDDING)
 
+
+class BertNativeOutputTest(unittest.TestCase):
     @torch.inference_mode()
     def test_registered_dense_and_classifier_outputs(self):
         for classifier in (False, True):

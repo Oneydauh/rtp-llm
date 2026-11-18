@@ -24,11 +24,6 @@ from rtp_llm.ops import (
     ParallelismConfig,
     TaskType,
 )
-from rtp_llm.ops.compute_ops import (
-    BertEmbeddingInputs,
-    PyAttentionInputs,
-    PyModelInputs,
-)
 from rtp_llm.utils.model_weight import W
 
 
@@ -39,8 +34,8 @@ class CpuJinaBert(JinaBert):
         return "cpu"
 
 
-class JinaRuntimeCheckpointTest(unittest.TestCase):
-    def test_native_forward_and_noncausal_pooling(self):
+class _JinaServiceFixture(unittest.TestCase):
+    def check_service(self, *, native_output):
         with tempfile.TemporaryDirectory() as directory:
             with open(os.path.join(directory, "config.json"), "w") as cfg:
                 json.dump(
@@ -103,6 +98,14 @@ class JinaRuntimeCheckpointTest(unittest.TestCase):
                 self.assertEqual(
                     service.model_weights_loader.loaded_method.value, method
                 )
+                if not native_output:
+                    continue
+                from rtp_llm.ops.compute_ops import (
+                    BertEmbeddingInputs,
+                    PyAttentionInputs,
+                    PyModelInputs,
+                )
+
                 ids = torch.tensor([1, 3, 9, 2, 14], dtype=torch.int32)
                 types = torch.tensor([1, 1, 0, 1, 0], dtype=torch.int32)
                 lengths = torch.tensor([2, 3], dtype=torch.int32)
@@ -143,6 +146,16 @@ class JinaRuntimeCheckpointTest(unittest.TestCase):
                 self.assertIsNone(incomplete.weight)
                 self.assertIsNone(incomplete.weight_manager)
                 self.assertIsNone(incomplete.rank_local_lora)
+
+
+class JinaServiceCheckpointTest(_JinaServiceFixture):
+    def test_service_publishes_only_complete_checkpoint(self):
+        self.check_service(native_output=False)
+
+
+class JinaRuntimeCheckpointTest(_JinaServiceFixture):
+    def test_native_forward_and_noncausal_pooling(self):
+        self.check_service(native_output=True)
 
 
 if __name__ == "__main__":

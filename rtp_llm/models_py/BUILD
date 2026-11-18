@@ -1,6 +1,7 @@
 load("@arch_config//:arch_select.bzl", "requirement", "triton_deps")
 load("@local_config_cuda//cuda:build_defs.bzl", "cuda_default_copts_without_arch")
 load("//rtp_llm/models_py/test:defs.bzl", "models_py_test")
+load(":checkpoint_service_tests.bzl", "checkpoint_service_tests")
 
 py_test(
     name = "qwen4_media_embedding_test",
@@ -80,6 +81,12 @@ py_test(
             "new_models/qwen4_exp/test/test_target_weights.py",
         ] + extra,
         main = main,
+        # Service publication constructs the original Qwen4 attention/cache
+        # runtime and needs its accelerator compute DSO. Keep CPU tensor
+        # staging, but schedule these two integration targets on CUDA workers;
+        # the independent precision owner test remains on ordinary CPU workers.
+        tags = ["L20_CU13"] if native_runtime else [],
+        exec_properties = {"gpu": "L20_CU13", "gpu_count": "1"} if native_runtime else {},
         env = {
             "CUDA_VISIBLE_DEVICES": "",
             "HIP_VISIBLE_DEVICES": "",
@@ -90,10 +97,10 @@ py_test(
         },
         deps = [":new_weight_loader", ":new_loader_core", ":models", "//rtp_llm:models", "//rtp_llm:fastsafetensors"],
     )
-    for name, main, extra in [
-        ("qwen4_native_service_checkpoint_test", "new_models/qwen4_exp/test/test_native_service.py", []),
-        ("qwen4_precision_source_checkpoint_test", "new_models/qwen4_exp/test/test_precision_profiles.py", ["new_models/qwen4_exp/test/test_precision_profiles.py"]),
-        ("qwen4_mtp_native_service_checkpoint_test", "new_models/qwen4_exp_mtp/native_draft_service_test.py", ["new_models/qwen4_exp_mtp/native_draft_service_test.py", "new_models/qwen4_exp/test/test_precision_profiles.py"]),
+    for name, main, extra, native_runtime in [
+        ("qwen4_native_service_checkpoint_test", "new_models/qwen4_exp/test/test_native_service.py", ["new_models/qwen4_exp/test/test_precision_profiles.py"], True),
+        ("qwen4_precision_source_checkpoint_test", "new_models/qwen4_exp/test/test_precision_profiles.py", ["new_models/qwen4_exp/test/test_precision_profiles.py"], False),
+        ("qwen4_mtp_native_service_checkpoint_test", "new_models/qwen4_exp_mtp/native_draft_service_test.py", ["new_models/qwen4_exp_mtp/native_draft_service_test.py", "new_models/qwen4_exp/test/test_precision_profiles.py"], True),
     ]
 ]
 
@@ -303,6 +310,23 @@ py_test(
 )
 
 py_test(
+    name = "v41_dspark_cold_native_forward_test",
+    srcs = [
+        "new_models/deepseek_v41_dspark/native_forward_test.py",
+        "new_models/deepseek_v41_dspark/service_test.py",
+        "new_models/deepseek_v41_dspark/checkpoint_test.py",
+        "new_models/deepseek_v41/service_test.py",
+        "new_models/deepseek_v41/backbone_test.py",
+    ],
+    main = "new_models/deepseek_v41_dspark/native_forward_test.py",
+    data = ["//:rtp_compute_ops"],
+    tags = ["L20_CU13"],
+    exec_properties = {"gpu": "L20_CU13", "gpu_count": "1"},
+    env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+    deps = [":new_weight_loader", "//rtp_llm:models"],
+)
+
+py_test(
     name = "v41_service_routes_test",
     srcs = [
         "new_models/deepseek_v41/routes_test.py",
@@ -437,7 +461,18 @@ py_test(
 )
 
 py_test(
+    name = "bert_input_vocab_test",
+    srcs = ["bert_input_vocab_test.py", "bert_service_test.py", "serving_route_checkpoint_test.py"],
+    main = "bert_input_vocab_test.py",
+    env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "ROCR_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+    deps = [":new_weight_loader", "//rtp_llm:models", "//rtp_llm:transformers"],
+)
+
+checkpoint_service_tests(
     name = "bert_service_test",
+    native_name = "bert_native_output_test",
+    cpu_case = "BertServiceTest",
+    native_case = "BertNativeOutputTest",
     srcs = [
         "bert_service_test.py",
         "serving_route_checkpoint_test.py",
@@ -465,8 +500,11 @@ py_test(
     deps = [":new_weight_loader"],
 )
 
-py_test(
+checkpoint_service_tests(
     name = "jina_native_checkpoint_test",
+    native_name = "jina_native_output_test",
+    cpu_case = "JinaServiceCheckpointTest",
+    native_case = "JinaRuntimeCheckpointTest",
     srcs = [
         "new_models/jina_bert/jina_checkpoint_test.py",
         "new_models/jina_bert/jina_runtime_checkpoint_test.py",
@@ -512,8 +550,11 @@ py_test(
     deps = [":new_weight_loader"],
 )
 
-py_test(
+checkpoint_service_tests(
     name = "qwen3_dspark_native_service_test",
+    native_name = "qwen3_dspark_native_output_test",
+    cpu_case = "PublicDraftLoadingTest",
+    native_case = "DraftNativeOutputTest",
     srcs = [
         "new_models/qwen3_dspark/checkpoint_test.py",
         "qwen3_dspark_native_service_test.py",
@@ -579,8 +620,11 @@ py_test(
     deps = [":new_weight_loader", "//rtp_llm:models"],
 )
 
-py_test(
+checkpoint_service_tests(
     name = "qwen3_vl_native_service_test",
+    native_name = "qwen3_vl_native_output_test",
+    cpu_case = "PublicVLTest",
+    native_case = "VLNativeOutputTest",
     srcs = [
         "new_models/qwen3_vl/service_test.py",
         "qwen3_moe_checkpoint_test.py",
@@ -588,7 +632,12 @@ py_test(
     ],
     main = "new_models/qwen3_vl/service_test.py",
     env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1"},
-    deps = [":new_weight_loader", "//rtp_llm:models"],
+    deps = [
+        ":new_weight_loader",
+        "//rtp_llm:models",
+        "//rtp_llm:multimodal",
+        "//rtp_llm/cpp/model_rpc/proto:model_rpc_service_py_proto",
+    ],
 )
 
 py_test(
@@ -667,8 +716,11 @@ py_test(
     deps = [":new_weight_loader", "//rtp_llm:fastsafetensors", "//rtp_llm:transformers"],
 )
 
-py_test(
+checkpoint_service_tests(
     name = "megatron_bert_native_checkpoint_test",
+    native_name = "megatron_bert_native_output_test",
+    cpu_case = "MegatronServiceCheckpointTest",
+    native_case = "NativeMegatronTest",
     srcs = [
         "new_models/megatron_bert/native_checkpoint_test.py",
         "new_models/megatron_bert/test_checkpoint.py",
@@ -1112,8 +1164,11 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
-py_test(
+checkpoint_service_tests(
     name = "roberta_checkpoint_test",
+    native_name = "roberta_native_output_test",
+    cpu_case = "RobertaCheckpointTest",
+    native_case = "RobertaNativeOutputTest",
     srcs = ["new_models/roberta/test_roberta_checkpoint.py"],
     main = "new_models/roberta/test_roberta_checkpoint.py",
     env = {
@@ -1128,4 +1183,25 @@ py_test(
         "//rtp_llm:models",
         "//rtp_llm:transformers",
     ],
+)
+
+py_test(
+    name = "bert_input_vocab_native_output_test",
+    srcs = [
+        "bert_input_vocab_native_output_test.py",
+        "bert_input_vocab_test.py",
+        "bert_service_test.py",
+        "serving_route_checkpoint_test.py",
+    ],
+    main = "bert_input_vocab_native_output_test.py",
+    tags = ["L20_CU13"],
+    exec_properties = {"gpu": "L20_CU13", "gpu_count": "1"},
+    env = {
+        "CUDA_VISIBLE_DEVICES": "",
+        "HIP_VISIBLE_DEVICES": "",
+        "ROCR_VISIBLE_DEVICES": "",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+    },
+    deps = [":new_weight_loader", "//rtp_llm:models", "//rtp_llm:transformers"],
 )

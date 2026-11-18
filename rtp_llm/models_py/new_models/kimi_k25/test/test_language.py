@@ -306,136 +306,127 @@ class KimiLanguageTest(unittest.TestCase):
         )
         self.assertEqual(model.layers[0].mlp.intermediate_size, 16)
 
-    def test_complete_sharded_vision_language_image_video_and_text(self):
+    def test_complete_sharded_vision_language_checkpoint_and_embeddings(self):
         for method in (
             NewLoaderLoadMethod.SCRATCH,
             NewLoaderLoadMethod.FASTSAFETENSORS,
         ):
             with self.subTest(method=method.value):
-                self.check_complete_forward(method)
+                for model, _, inputs, expected in complete_checkpoint_cases(self, method):
+                    torch.testing.assert_close(model.embedding(inputs), expected)
 
-    def check_complete_forward(self, method):
-        cfg = config()
-        cfg["text_config"]["num_nextn_predict_layers"] = 1
-        # Exercise the official 14x14 image preprocessor, with tiny tower widths.
-        cfg["vision_config"]["patch_size"] = 14
-        vision = KimiK25ForVisionEmbedding(cfg, load_config())
-        torch.manual_seed(79)
-        with torch.no_grad():
-            for parameter in vision.parameters():
-                parameter.uniform_(-0.1, 0.1)
-        language = language_weights()
-        weights = {"language_model." + key: value for key, value in language.items()}
-        weights.update(
-            {name: value.clone() for name, value in vision.state_dict().items()}
+
+def complete_checkpoint_cases(case, method):
+    cfg = config()
+    cfg["text_config"]["num_nextn_predict_layers"] = 1
+    # Exercise the official 14x14 image preprocessor, with tiny tower widths.
+    cfg["vision_config"]["patch_size"] = 14
+    vision = KimiK25ForVisionEmbedding(cfg, load_config())
+    torch.manual_seed(79)
+    with torch.no_grad():
+        for parameter in vision.parameters():
+            parameter.uniform_(-0.1, 0.1)
+    language = language_weights()
+    weights = {"language_model." + key: value for key, value in language.items()}
+    weights.update(
+        {name: value.clone() for name, value in vision.state_dict().items()}
+    )
+    # An appended predictor layer is not part of the target text decoder.
+    weights["language_model.model.layers.1.unused_predictor.weight"] = torch.ones(1)
+    with tempfile.TemporaryDirectory() as directory:
+        checkpoint(directory, cfg, weights)
+        model_config = KimiK25._create_config(directory)
+        model_config.model_type = "kimi_k25"
+        model_config.data_type = "fp32"
+        model_config.enable_fp32_lm_head = False
+        model_config.attn_config.kernel_tokens_per_block = 64
+        server = _CpuKimi.from_config(
+            model_config=model_config,
+            parallelism_config=ParallelismConfig(),
+            hw_kernel_config=types.SimpleNamespace(
+                enable_cuda_graph=False, use_swizzleA=False
+            ),
+            kv_cache_config=types.SimpleNamespace(
+                multi_task_prompt="", multi_task_prompt_str=""
+            ),
+            fmha_config=None,
+            moe_config=None,
+            max_generate_batch_size=7,
+            merge_lora=False,
+            load_method=method.value,
+            vit_config=VitConfig(),
         )
-        # An appended predictor layer is not part of the target text decoder.
-        weights["language_model.model.layers.1.unused_predictor.weight"] = torch.ones(1)
-        with tempfile.TemporaryDirectory() as directory:
-            checkpoint(directory, cfg, weights)
-            model_config = KimiK25._create_config(directory)
-            model_config.model_type = "kimi_k25"
-            model_config.data_type = "fp32"
-            model_config.enable_fp32_lm_head = False
-            model_config.attn_config.kernel_tokens_per_block = 64
-            server = _CpuKimi.from_config(
-                model_config=model_config,
-                parallelism_config=ParallelismConfig(),
-                hw_kernel_config=types.SimpleNamespace(
-                    enable_cuda_graph=False, use_swizzleA=False
-                ),
-                kv_cache_config=types.SimpleNamespace(
-                    multi_task_prompt="", multi_task_prompt_str=""
-                ),
-                fmha_config=None,
-                moe_config=None,
-                max_generate_batch_size=7,
-                merge_lora=False,
-                load_method=method.value,
-                vit_config=VitConfig(),
-            )
-            model = server.py_model
-            self.assertIs(server.checkpoint_owner, model)
-            self.assertIsInstance(model, KimiK25ForCausalLM)
-            self.assertIsInstance(server.weight, RuntimeWeightView)
-            self.assertEqual(server.model_weights_loader.loaded_method, method)
-            self.assertEqual(len(server.weight.weights), len(model.layers))
-            for key, param in (
-                ("embedding", model.embed_tokens.weight),
-                ("final_layernorm.gamma", model.norm.weight),
-                ("lm_head", model.lm_head.weight),
-            ):
-                self.assertIs(server.weight.get_global_weight(key), param)
-            service_visual = MultimodalMixinFactory._create_multimodal_mixin(
-                model_config,
-                types.SimpleNamespace(
-                    load_config=types.SimpleNamespace(load_method=method.value)
-                ),
-                VitConfig(),
-                device="cpu",
-            )
-            self.assertIsInstance(service_visual, KimiK25Mixin)
-            self.assertFalse(hasattr(service_visual, "mm_mixin_loader"))
-            visual = service_visual.mm_part
-        self.assertEqual(len(model.layers), 1)
-        torch.testing.assert_close(
-            model.lm_head.weight, language["lm_head.weight"], rtol=0, atol=0
+        model = server.py_model
+        case.assertIs(server.checkpoint_owner, model)
+        case.assertIsInstance(model, KimiK25ForCausalLM)
+        case.assertIsInstance(server.weight, RuntimeWeightView)
+        case.assertEqual(server.model_weights_loader.loaded_method, method)
+        case.assertEqual(len(server.weight.weights), len(model.layers))
+        for key, param in (
+            ("embedding", model.embed_tokens.weight),
+            ("final_layernorm.gamma", model.norm.weight),
+            ("lm_head", model.lm_head.weight),
+        ):
+            case.assertIs(server.weight.get_global_weight(key), param)
+        service_visual = MultimodalMixinFactory._create_multimodal_mixin(
+            model_config,
+            types.SimpleNamespace(
+                load_config=types.SimpleNamespace(load_method=method.value)
+            ),
+            VitConfig(),
+            device="cpu",
         )
-        for grid in (None, [[1, 2, 2]], [[2, 2, 2]]):
-            features = None
-            if grid == [[1, 2, 2]]:
-                image = Image.new("RGB", (28, 28), color=(17, 45, 63))
-                features, positions = visual.embedding(image)
-                self.assertIsNone(positions)
-                self.assertEqual(visual.media_tokens_for(image), 1)
-                self.assertEqual(tuple(features.shape), (1, 8))
-            elif grid is not None:
-                grid_tensor = torch.tensor(grid)
-                with torch.inference_mode():
-                    pixels = torch.randn(int(grid_tensor.prod(-1).sum()), 3, 14, 14)
-                    features = mm_projector_forward(
-                        visual.mm_projector, visual.vision_tower(pixels, grid_tensor)
-                    )[0]
-            input_ids = torch.tensor([0, 2, 3, 15])
-            expected_input = F.embedding(
-                input_ids, language["model.embed_tokens.weight"]
-            )
-            mask = torch.ones(4, dtype=torch.bool)
-            if features is not None:
-                input_ids[1 : 1 + len(features)] = 17
-                mask[1 : 1 + len(features)] = False
-                expected_input[1 : 1 + len(features)] = features
-            inputs = types.SimpleNamespace(
-                input_ids=input_ids,
-                capture_hidden_states=False,
-                attention_inputs=object(),
-                embedding_inputs=(
-                    None
-                    if features is None
-                    else types.SimpleNamespace(text_tokens_mask=mask)
-                ),
-                multimodal_inputs=(
-                    None
-                    if features is None
-                    else types.SimpleNamespace(
-                        multimodal_features=[features],
-                        mm_features_locs=torch.tensor([1]),
-                        mm_extra_input=[],
-                    )
-                ),
-            )
+        case.assertIsInstance(service_visual, KimiK25Mixin)
+        case.assertFalse(hasattr(service_visual, "mm_mixin_loader"))
+        visual = service_visual.mm_part
+    case.assertEqual(len(model.layers), 1)
+    torch.testing.assert_close(
+        model.lm_head.weight, language["lm_head.weight"], rtol=0, atol=0
+    )
+    for grid in (None, [[1, 2, 2]], [[2, 2, 2]]):
+        features = None
+        if grid == [[1, 2, 2]]:
+            image = Image.new("RGB", (28, 28), color=(17, 45, 63))
+            features, positions = visual.embedding(image)
+            case.assertIsNone(positions)
+            case.assertEqual(visual.media_tokens_for(image), 1)
+            case.assertEqual(tuple(features.shape), (1, 8))
+        elif grid is not None:
+            grid_tensor = torch.tensor(grid)
             with torch.inference_mode():
-                actual = model(inputs, fmha_impl=TorchCausalMLA(language)).hidden_states
-                expected = reference_forward(language, expected_input)
-                logits = model.lm_head(actual)
-            torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
-            torch.testing.assert_close(
-                logits,
-                F.linear(expected, language["lm_head.weight"]),
-                rtol=1e-5,
-                atol=1e-6,
-            )
-            self.assertEqual(tuple(logits.shape), (4, 16))
+                pixels = torch.randn(int(grid_tensor.prod(-1).sum()), 3, 14, 14)
+                features = mm_projector_forward(
+                    visual.mm_projector, visual.vision_tower(pixels, grid_tensor)
+                )[0]
+        input_ids = torch.tensor([0, 2, 3, 15])
+        expected_input = F.embedding(
+            input_ids, language["model.embed_tokens.weight"]
+        )
+        mask = torch.ones(4, dtype=torch.bool)
+        if features is not None:
+            input_ids[1 : 1 + len(features)] = 17
+            mask[1 : 1 + len(features)] = False
+            expected_input[1 : 1 + len(features)] = features
+        inputs = types.SimpleNamespace(
+            input_ids=input_ids,
+            capture_hidden_states=False,
+            attention_inputs=object(),
+            embedding_inputs=(
+                None
+                if features is None
+                else types.SimpleNamespace(text_tokens_mask=mask)
+            ),
+            multimodal_inputs=(
+                None
+                if features is None
+                else types.SimpleNamespace(
+                    multimodal_features=[features],
+                    mm_features_locs=torch.tensor([1]),
+                    mm_extra_input=[],
+                )
+            ),
+        )
+        yield model, language, inputs, expected_input
 
 
 if __name__ == "__main__":

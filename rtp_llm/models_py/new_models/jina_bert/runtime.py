@@ -5,7 +5,6 @@ import torch
 from rtp_llm.models_py.model_desc.block_map import get_primary_attention_inputs
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
 from rtp_llm.models_py.new_models.jina_bert.encoder import JinaEncoder
-from rtp_llm.ops.compute_ops import PyModelOutputs
 
 
 class JinaBertForEmbedding(JinaEncoder, GptModelBase):
@@ -63,4 +62,6 @@ class JinaBertForEmbedding(JinaEncoder, GptModelBase):
             inputs.bert_embedding_inputs.input_embedding_scalar,
             sequence_ids=seq_ids,
         )
+        from rtp_llm.ops.compute_ops import PyModelOutputs
+
         return PyModelOutputs(hidden.squeeze(0))

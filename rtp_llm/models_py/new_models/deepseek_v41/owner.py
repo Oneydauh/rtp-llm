@@ -64,6 +64,13 @@ class OwnedV41Mixin:
         "lm_head": "v4.head.weight",
     }
 
+    def validate_runtime_device(self, device):
+        super().validate_runtime_device(device)
+        if torch.device(device).type != "cpu":
+            from rtp_llm.models_py.modules.dsv4.native_ops import require_serving_bindings
+
+            require_serving_bindings()
+
     def __init__(self, model_config, load_config):
         if (
             type(load_config.max_generate_batch_size) is not int

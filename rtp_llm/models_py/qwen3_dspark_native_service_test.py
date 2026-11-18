@@ -26,7 +26,6 @@ from rtp_llm.models_py.new_models.qwen3_dspark import Qwen3DSparkForCausalLM
 from rtp_llm.models_py.new_models.qwen3_dspark.checkpoint_test import checkpoint
 from rtp_llm.models_py.serving_route_checkpoint_test import service
 from rtp_llm.ops import SpeculativeType
-from rtp_llm.ops.compute_ops import PyAttentionInputs
 
 
 def _write_model(path, *, draft=False, vocab=8, loans=(), bad_order=False):
@@ -109,8 +108,10 @@ def _engine(root, method):
     )
 
 
-class PublicDraftLoadingTest(unittest.TestCase):
+class DraftNativeOutputTest(unittest.TestCase):
     def test_target_exports_decoder_boundaries_for_draft(self):
+        from rtp_llm.ops.compute_ops import PyAttentionInputs
+
         # All decoder layers and checkpoint parameters are real. The tiny CPU
         # attention stand-in supplies the four output channels of this example.
         with tempfile.TemporaryDirectory() as tmp, patch.object(
@@ -168,6 +169,8 @@ class PublicDraftLoadingTest(unittest.TestCase):
                 for handle in handles:
                     handle.remove()
 
+
+class PublicDraftLoadingTest(unittest.TestCase):
     def test_factory_scratch_and_fst_keep_requested_storage(self):
         for method in ("scratch", "fastsafetensors"):
             for vocab, loans in (

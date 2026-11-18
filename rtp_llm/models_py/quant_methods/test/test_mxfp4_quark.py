@@ -12,7 +12,6 @@ from unittest import mock
 import torch
 from safetensors.torch import save_file
 
-from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.config.quant_config import MXFp4QuarkQuantConfig
 from rtp_llm.models_py import weight_mapper
 from rtp_llm.models_py.layers.moe_experts import BaseMoEExperts
@@ -22,7 +21,6 @@ from rtp_llm.models_py.model_loader import (
     _ExpertRangeFilter,
 )
 from rtp_llm.models_py.module_base import RtpModule
-from rtp_llm.models_py.new_models.qwen3_moe.language import Qwen3MoeForCausalLM
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 from rtp_llm.models_py.quant_methods.moe_quant_key import moe_checkpoint_method_key
 from rtp_llm.models_py.quant_methods.mxfp4_moe import MXFp4QuarkMoEMethod
@@ -182,6 +180,9 @@ class MXFp4CheckpointTest(unittest.TestCase):
         layer.validate_weights_loaded()
 
     def test_real_qwen3_model_tree_checkpoint_dispatch(self):
+        from rtp_llm.config.model_config import ModelConfig
+        from rtp_llm.models_py.new_models.qwen3_moe.language import Qwen3MoeForCausalLM
+
         # This test loads the CPU parameter owner. The router is only
         # constructed on an accelerator; do not import it as a precondition.
         config = ModelConfig()

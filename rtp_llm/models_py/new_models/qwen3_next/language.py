@@ -1,9 +1,11 @@
 """Qwen3-Next core model for the streaming newloader."""
 
+from __future__ import annotations
+
 import logging
 import math
 from numbers import Real
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -28,11 +30,7 @@ from rtp_llm.models_py.layers.linear import (
 from rtp_llm.models_py.layers.norm import RMSNorm, RMSResNorm
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
 from rtp_llm.models_py.module_base import CheckpointLoadTarget, RtpModule
-from rtp_llm.models_py.modules import (
-    FakeBalanceExpert,
-    MultimodalEmbeddingInjector,
-    SelectTopk,
-)
+from rtp_llm.models_py.modules import MultimodalEmbeddingInjector
 from rtp_llm.models_py.new_models.model_base import required_config_value
 from rtp_llm.models_py.new_models.qwen3.language import (
     Qwen3Attention,
@@ -42,12 +40,8 @@ from rtp_llm.models_py.new_models.qwen3.language import (
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 from rtp_llm.models_py.weight_mapper import WeightsMapper
 from rtp_llm.ops import HybridAttentionType
-from rtp_llm.ops.compute_ops import (
-    LayerKVCache,
-    PyAttentionInputs,
-    PyModelInputs,
-    PyModelOutputs,
-)
+if TYPE_CHECKING:
+    from rtp_llm.ops.compute_ops import LayerKVCache, PyAttentionInputs, PyModelInputs
 
 logger = logging.getLogger(__name__)
 
@@ -569,12 +563,13 @@ class Qwen3NextMoEBlock(RtpModule):
             bias=False,
             params_dtype=params_dtype,
         )
-        self.select_topk = SelectTopk(config=model_config)
+        self._router_config = model_config
+        self.select_topk = None
         fake_balance = getattr(moe_config, "fake_balance_expert", False)
         if not isinstance(fake_balance, bool):
             raise TypeError("moe_config.fake_balance_expert must be a bool")
-        self.fake_balance_expert = (
-            FakeBalanceExpert(
+        self._fake_balance_config = (
+            dict(
                 expert_num=expert_num,
                 moe_k=top_k,
                 dp_rank=parallelism_config.dp_rank,
@@ -584,6 +579,7 @@ class Qwen3NextMoEBlock(RtpModule):
             if fake_balance
             else None
         )
+        self.fake_balance_expert = None
 
         # Routed experts (reuse Qwen3Experts)
         from rtp_llm.models_py.layers.moe_experts import BaseMoEExperts
@@ -639,6 +635,24 @@ class Qwen3NextMoEBlock(RtpModule):
         else:
             self.shared_expert_gate = None
 
+    def _bind_router(self) -> None:
+        if self.select_topk is not None:
+            return
+        from rtp_llm.models_py.modules import SelectTopk
+
+        selector = SelectTopk(config=self._router_config)
+        if self._fake_balance_config is not None:
+            from rtp_llm.models_py.modules import FakeBalanceExpert
+
+            self.fake_balance_expert = FakeBalanceExpert(**self._fake_balance_config)
+        self.select_topk = selector
+
+    def validate_runtime_device(self, device: torch.device) -> None:
+        # A CPU staging load needs no accelerator routing kernel. Preserve
+        # load-time failure for any device that will execute this model.
+        if device.type != "cpu":
+            self._bind_router()
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.experts.fused_moe is None:
             raise RuntimeError(
@@ -661,6 +675,7 @@ class Qwen3NextMoEBlock(RtpModule):
             dtype=self.experts.topk_ids_dtype,
             device=hidden_states.device,
         )
+        self._bind_router()
         self.select_topk(router_logits, topk_ids, topk_weights)
         if self.fake_balance_expert is not None:
             self.fake_balance_expert(topk_ids, topk_weights)

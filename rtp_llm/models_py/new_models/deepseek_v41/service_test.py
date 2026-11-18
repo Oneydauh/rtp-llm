@@ -6,9 +6,11 @@ the native-only executor before the service publishes a model.
 
 import json
 import os
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
@@ -91,6 +93,13 @@ def config_and_load(folder, rank=0, *, engram=False, method="scratch"):
 
 
 class V41ServiceOwnerTest(unittest.TestCase):
+    def test_accelerator_preflight_requires_the_serving_binding_before_allocation(self):
+        with tempfile.TemporaryDirectory() as root:
+            model, _, _, _ = self.staged(root)
+            with patch.dict(sys.modules, {"rtp_llm.ops.compute_ops": None}):
+                with self.assertRaisesRegex(ImportError, "rtp_llm.ops.compute_ops"):
+                    NewModelLoader._validate_runtime_backends(model, "cuda")
+
     def staged(self, root, rank=0, *, engram=False, method="scratch"):
         values = checkpoint()
         path = os.path.join(root, "model.safetensors")

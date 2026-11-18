@@ -22,11 +22,10 @@ from rtp_llm.models_py.model_loader import NewLoaderConfig, NewModelLoader
 from rtp_llm.models_py.new_models.megatron_bert.language import MegatronBertForEmbedding
 from rtp_llm.models_py.new_models.megatron_bert.test_checkpoint import PackedSdpa
 from rtp_llm.ops import ParallelismConfig, TaskType
-from rtp_llm.ops.compute_ops import BertEmbeddingInputs, PyModelInputs
 
 
-class NativeMegatronTest(unittest.TestCase):
-    def test_public_service_publishes_classifier_owner(self):
+class _MegatronServiceFixture(unittest.TestCase):
+    def check_service(self, *, native_output):
         self.assertTrue(ensure_model_registered("megatron_bert"))
         service_class = _model_factory["megatron_bert"]
         self.assertIs(service_class, MegatronBert)
@@ -103,6 +102,10 @@ class NativeMegatronTest(unittest.TestCase):
                         "__custom__.classifier.weight"
                     ).data_ptr(),
                 )
+                if not native_output:
+                    continue
+                from rtp_llm.ops.compute_ops import BertEmbeddingInputs, PyModelInputs
+
                 inputs = PyModelInputs()
                 inputs.input_ids = ids[0]
                 inputs.bert_embedding_inputs = BertEmbeddingInputs(
@@ -118,7 +121,19 @@ class NativeMegatronTest(unittest.TestCase):
                     logits, ref(input_ids=ids).logits.to(logits.dtype)
                 )
 
+
+class MegatronServiceCheckpointTest(_MegatronServiceFixture):
+    def test_service_loads_and_publishes_classifier(self):
+        self.check_service(native_output=False)
+
+
+class NativeMegatronTest(_MegatronServiceFixture):
+    def test_public_service_publishes_classifier_owner(self):
+        self.check_service(native_output=True)
+
     def test_registered_class_and_native_inputs_outputs(self):
+        from rtp_llm.ops.compute_ops import BertEmbeddingInputs, PyModelInputs
+
         config = MegatronBertConfig(
             hidden_size=16,
             num_attention_heads=4,

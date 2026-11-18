@@ -56,6 +56,56 @@ def native_config(directory):
 
 
 class NativeQwen4ServiceTest(unittest.TestCase):
+    def test_mixed_cpu_staging_cannot_publish_a_fake_gpu_runtime(self):
+        # Runtime publication imports the real attention/cache native bindings.
+        # This is not a portable checkpoint-only test, even with CPU tensors.
+        from rtp_llm.models_py.new_models.qwen4_exp.test.test_precision_profiles import source_checkpoint
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"LOAD_METHOD": ""}):
+            config, _ = source_checkpoint(directory, "fp8")
+            pc = ParallelismConfig()
+            pc.world_size = pc.tp_size = pc.ep_size = 1
+            pc.world_rank = pc.tp_rank = pc.ep_rank = pc.local_rank = 0
+            model = CheckpointOnlyQwen4(
+                model_config=config, parallelism_config=pc,
+                hw_kernel_config=HWKernelConfig(), kv_cache_config=KVCacheConfig(),
+                fmha_config=None, moe_config=MoeConfig(), load_method="scratch",
+                max_generate_batch_size=2, vit_config=None, merge_lora=False,
+            )
+            with self.assertRaisesRegex(ValueError, "FP8 vocabulary requires contiguous CUDA"):
+                model.load()
+            self.assertIsNone(model.py_model)
+            self.assertIsNone(model.weight)
+
+    def test_bf16_actual_service_scratch_and_fst(self):
+        from rtp_llm.models_py.new_models.qwen4_exp.test.test_precision_profiles import source_checkpoint
+
+        for method in ("scratch", "fastsafetensors"):
+            with self.subTest(method=method), tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"LOAD_METHOD": ""}):
+                config, values = source_checkpoint(directory, "bf16")
+                parallel = ParallelismConfig()
+                parallel.world_size = parallel.tp_size = parallel.ep_size = 1
+                parallel.world_rank = parallel.tp_rank = parallel.ep_rank = parallel.local_rank = 0
+                hw = HWKernelConfig()
+                hw.enable_cuda_graph = hw.use_swizzleA = False
+                model = CheckpointOnlyQwen4.from_config(
+                    model_config=config, parallelism_config=parallel,
+                    hw_kernel_config=hw, kv_cache_config=KVCacheConfig(),
+                    fmha_config=None, moe_config=MoeConfig(), load_method=method,
+                    max_generate_batch_size=2, vit_config=None, merge_lora=False,
+                )
+                self.addCleanup(model.py_model.close)
+                self.assertEqual(model.py_model.checkpoint_plan.source_kind, "bf16")
+                self.assertEqual(model.model_weights_loader.loaded_method.value, method)
+                self.assertEqual(model.py_model.layers[0].mlp.experts.w13.dtype, torch.bfloat16)
+                self.assertIs(model.weight.get_global_weight("embedding"), model.py_model.embed_tokens.weight)
+                qsa = model.py_model.layers[1].self_attn.qsa_indexer
+                torch.testing.assert_close(
+                    qsa.index_qk_proj.weight,
+                    values["model.language_model.layers.1.self_attn.indexer.index_qk_proj.weight"],
+                    rtol=0, atol=0,
+                )
+
     def test_actual_service_publishes_complete_target_owner(self):
         for method in ("scratch","fastsafetensors"):
             with self.subTest(method=method):

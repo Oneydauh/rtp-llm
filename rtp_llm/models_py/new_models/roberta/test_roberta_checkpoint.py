@@ -222,7 +222,7 @@ def _tp_checkpoint_worker(rank, directory, rendezvous, method):
         torch.distributed.destroy_process_group()
 
 
-class RobertaCheckpointTest(unittest.TestCase):
+class RobertaNativeOutputTest(unittest.TestCase):
     @torch.inference_mode()
     def test_public_roberta_service_and_actual_handlers(self):
         from tokenizers import ByteLevelBPETokenizer
@@ -350,6 +350,8 @@ class RobertaCheckpointTest(unittest.TestCase):
                             actual, expected.to(actual.dtype), rtol=2e-5, atol=5e-6
                         )
 
+
+class RobertaCheckpointTest(unittest.TestCase):
     @torch.inference_mode()
     def test_encoder_matches_transformers_with_offsets_and_padding(self):
         torch.manual_seed(41)

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
@@ -174,6 +175,13 @@ class NativeServiceTest(unittest.TestCase):
                                 )
                             if kind != "qwen35_dense":
                                 block = model.py_model.layers[0].mlp
+                                self.assertIsNone(block.select_topk)
+                                # Backend failures still surface in accelerator
+                                # preflight, before serving the first request.
+                                with patch.object(block, "_bind_router", side_effect=ImportError("router unavailable")):
+                                    block.validate_runtime_device(torch.device("cpu"))
+                                    with self.assertRaisesRegex(ImportError, "router unavailable"):
+                                        block.validate_runtime_device(torch.device("cuda"))
                                 self.assertEqual(
                                     block.shared_expert is not None,
                                     kind == "qwen35_moe",

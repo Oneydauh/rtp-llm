@@ -4,8 +4,6 @@ from __future__ import annotations
 from rtp_llm.models_py.modules.dsv4.fp8.indexer import (
     _as_bf16_contig,
     _flat_1d,
-    _TOPK_V3_OK,
-    _FAST_PREFILL_TOPK_OK,
     _TOPK_V3_WORKSPACE_SIZE,
     _FAST_PREFILL_TOPK_MAX_INPUT_TOKENS,
     _topk_v3_workspace_cache,

@@ -17,8 +17,14 @@ Top-level model: DeepSeekV32MTPForCausalLM
       post_attention_layernorm.* -> layers.0.post_attention_layernorm.*
 """
 
+from __future__ import annotations
+
 from collections.abc import Callable, Mapping
-from typing import Any, Dict
+
+from typing import TYPE_CHECKING, Any, Dict
+
+if TYPE_CHECKING:
+    from rtp_llm.ops.compute_ops import PyModelInputs
 
 import torch
 import torch.nn as nn
@@ -43,7 +49,6 @@ from rtp_llm.models_py.new_models.deepseek_v3.language import (
 )
 from rtp_llm.models_py.new_models.deepseek_v3.model import DeepSeekV32DecoderLayer
 from .mtp_block import MTPBlock
-from rtp_llm.ops.compute_ops import PyModelInputs
 
 # ------------------------------------------------------------------ #
 #  Key remapping helpers

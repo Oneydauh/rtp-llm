@@ -22,7 +22,6 @@ from rtp_llm.models_py.new_models.qwen3_moe_eagle3.draft_body_test import (
     _CPUAttention,
     _oracle,
 )
-from rtp_llm.ops.compute_ops import PyAttentionInputs, PyModelInputs
 from rtp_llm.ops import FMHAConfig, HWKernelConfig, SpeculativeType
 
 
@@ -258,6 +257,8 @@ class ServiceTest(unittest.TestCase):
                 layer.register_forward_hook(
                     lambda _m, _a, res, i=i: captures.update({i: res[0] + res[1]})
                 )
+            from rtp_llm.ops.compute_ops import PyAttentionInputs, PyModelInputs
+
             inp = PyModelInputs()
             inp.input_ids = torch.tensor([1, 2, 3])
             inp.attention_inputs = PyAttentionInputs()

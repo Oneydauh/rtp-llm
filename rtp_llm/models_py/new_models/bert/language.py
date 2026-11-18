@@ -12,8 +12,8 @@ from rtp_llm.models_py.model_desc.module_base import GptModelBase
 from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.read_spec import ReadSpec, unwrap_checkpoint_tensor
 from rtp_llm.models_py.weight_mapper import WeightsMapper
-from rtp_llm.ops.compute_ops import PyModelOutputs
 
+from .checkpoint_metadata import checkpoint_input_vocab_size, publish_input_vocab
 from .parameters import BertEmbeddings, BertLayer, PackedBertAttention
 
 
@@ -100,9 +100,12 @@ class BertEncoderOwner(GptModelBase, RtpModule):
         self.first = 0 in owned
         self.last = config.num_layers - 1 in owned
         self.owned = frozenset(owned)
+        self.checkpoint_input_vocab_size = checkpoint_input_vocab_size(
+            config, self.checkpoint_prefix, tp_rank=load.tp_rank, tp_size=load.tp_size
+        )
         self.embeddings = (
             BertEmbeddings(
-                config.vocab_size,
+                self.checkpoint_input_vocab_size,
                 int(hf.get("max_position_embeddings", 512)),
                 int(hf.get("type_vocab_size", 2)),
                 config.hidden_size,
@@ -136,6 +139,9 @@ class BertEncoderOwner(GptModelBase, RtpModule):
             if mappings
             else ReplicatedHandlerHeads(*args)
         )
+
+    def finalize_runtime_input_vocab(self, config, tokenizer):
+        publish_input_vocab(config, tokenizer, self.checkpoint_input_vocab_size)
 
     def checkpoint_weight_name_filter(self):
         def keep(source):
@@ -220,6 +226,8 @@ class BertEncoderOwner(GptModelBase, RtpModule):
 
     def forward(self, inputs, fmha_impl=None):
         hidden = self.forward_hidden(inputs, fmha_impl)
+        from rtp_llm.ops.compute_ops import PyModelOutputs
+
         result = PyModelOutputs(hidden)
         if not self.last:
             result.pp_intermediates = {"hidden_states": hidden}

@@ -425,3 +425,14 @@ class Qwen2ForCausalLM(Qwen3ForCausalLM):
         )
 
         load_dense_ft_checkpoint(self, checkpoint)
+
+
+class Qwen2EmbeddingBackbone(Qwen2ForCausalLM):
+    """Bidirectional Qwen2 blocks; the service handler owns sentence pooling."""
+
+    def __init__(self, model_config: Any, load_config: Any):
+        # Both the FMHA selector and the default pooling handler consult this
+        # same config. A causal config can yield plausible but wrong vectors.
+        if model_config.attn_config.is_causal:
+            raise ValueError("qwen_2_embedding requires bidirectional attention")
+        super().__init__(model_config, load_config)

@@ -12,7 +12,6 @@ from rtp_llm.models_py.new_models.model_base import select_fmha_impl_for_layer
 from rtp_llm.models_py.new_models.qwen3.language import Qwen3MLP
 from rtp_llm.models_py.new_models.qwen3_moe_eagle3.body import Eagle3DraftBody
 from rtp_llm.models_py.weight_mapper import WeightsMapper
-from rtp_llm.ops.compute_ops import PyModelOutputs
 
 
 class _Attention(RtpModule):
@@ -142,6 +141,8 @@ class Qwen3MoeEagle3ForCausalLM(GptModelBase, RtpModule):
         return self.body.fc(captured)
 
     def forward(self, inputs, fmha_impl=None):
+        from rtp_llm.ops.compute_ops import PyModelOutputs
+
         if fmha_impl is None:
             fmha_impl = self.prepare_fmha_impl(inputs)
         state = inputs.input_hiddens

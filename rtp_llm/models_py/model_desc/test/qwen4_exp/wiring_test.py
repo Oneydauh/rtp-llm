@@ -83,13 +83,13 @@ class Qwen4ExpDecoderLayerTest(TestCase):
         with (
             patch.object(qwen3_next, "Qwen3NextGatedDeltaNet", return_value=attention),
             patch.object(
-                generic_moe.LinearFactory,
+                generic_moe.runtime_modules.LinearFactory,
                 "create_linear_from_weights",
                 return_value=nn.Linear(_HIDDEN, _EXPERTS, bias=False),
             ),
-            patch.object(generic_moe, "SelectTopk", return_value=_select_topk),
+            patch.object(generic_moe.runtime_modules, "SelectTopk", return_value=_select_topk),
             patch.object(
-                generic_moe.FusedMoeFactory,
+                generic_moe.runtime_modules.FusedMoeFactory,
                 "create_fused_moe",
                 return_value=_RoutedBackend(),
             ),
@@ -129,13 +129,13 @@ class Qwen4ExpDecoderLayerTest(TestCase):
                 qwen3_next, "Qwen3NextGatedDeltaNet", return_value=attention
             ) as gdn_cls,
             patch.object(
-                generic_moe.LinearFactory,
+                generic_moe.runtime_modules.LinearFactory,
                 "create_linear_from_weights",
                 return_value=nn.Linear(_HIDDEN, _EXPERTS, bias=False),
             ),
-            patch.object(generic_moe, "SelectTopk", return_value=_select_topk),
+            patch.object(generic_moe.runtime_modules, "SelectTopk", return_value=_select_topk),
             patch.object(
-                generic_moe.FusedMoeFactory,
+                generic_moe.runtime_modules.FusedMoeFactory,
                 "create_fused_moe",
                 return_value=_RoutedBackend(),
             ),

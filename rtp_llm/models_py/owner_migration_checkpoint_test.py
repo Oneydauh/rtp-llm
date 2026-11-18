@@ -6,8 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
-from safetensors.torch import save_file
 from safetensors import safe_open
+from safetensors.torch import save_file
 
 from rtp_llm.config.quant_config import Fp8PerChannelCompressedQuantConfig
 from rtp_llm.models_py.layers.moe_experts import BaseMoEExperts
@@ -111,12 +111,16 @@ def check_stacked_routing(test):
         _load(bad, "scratch", 2)
 
 
-def check_stacked_online_fp8(test):
+def check_stacked_online_fp8_cpu_staging(test):
     gate, up, down = _weights()
     with tempfile.TemporaryDirectory() as d:
         source = Fp8PerChannelCompressedQuantConfig(is_quanted=False)
         config = SimpleNamespace(
-            num_layers=1, activation_type="SiGLU", quant_config=source
+            model_type="_stacked_expert_source_contract",
+            num_layers=1,
+            expert_num=4,
+            activation_type="SiGLU",
+            quant_config=source,
         )
         load = NewLoaderConfig(
             device="cpu",
@@ -124,35 +128,62 @@ def check_stacked_online_fp8(test):
             ep_rank=0,
             quant_config=QuantizationConfig("fp8_per_channel_online", source),
         )
-        owned = _Owner(config, load).experts
         path = str(Path(d, "model.safetensors"))
         save_file(
             {"gate_up_proj": torch.cat((gate, up), dim=1), "down_proj": down}, path
         )
+        # This is the staging module inside accelerator loading, not a claim
+        # that NewModelLoader supports CPU FP8 inference as its runtime target.
+        owned = _Owner(config, load).experts
         with safe_open(path, framework="pt", device="cpu") as file:
             for name in file.keys():
                 owned.load_weights({name: file.get_tensor(name)})
         owned.validate_weights_loaded()
-        # CPU checkpoint staging intentionally has no accelerator executor.
-        # Exercise the same per-channel conversion separately, without building it.
-        owned.quant_method.process_weights_after_loading(owned)
-        for weights, scale, expected in (
-            (owned.w13, owned.w13_scale, torch.cat((up, gate), 1)),
-            (owned.w2, owned.w2_scale, down),
-        ):
-            reference_scale = (
-                expected.abs().amax(dim=-1) / torch.finfo(weights.dtype).max
-            )
-            torch.testing.assert_close(scale, reference_scale)
-            reference = (expected / reference_scale.unsqueeze(-1)).to(weights.dtype)
-            test.assertTrue(
-                torch.equal(weights.view(torch.uint8), reference.view(torch.uint8))
-            )
+        # This public hook must retain checkpoint bytes, not choose a runtime
+        # FP8 encoding from whichever accelerator happens to be visible.
+        pointers = (owned.w13.data_ptr(), owned.w2.data_ptr())
+        owned.process_weights_after_loading()
+        test.assertEqual((owned.w13.data_ptr(), owned.w2.data_ptr()), pointers)
+        test.assertEqual(owned.w13.device.type, "cpu")
+        test.assertEqual(owned.w13.dtype, torch.float32)
+        test.assertEqual(owned.w2.dtype, torch.float32)
+        torch.testing.assert_close(owned.w13, torch.cat((up, gate), 1), rtol=0, atol=0)
+        torch.testing.assert_close(owned.w2, down, rtol=0, atol=0)
+        test.assertFalse(owned._post_load_done)
+        test.assertIsNone(owned.fused_moe)
+        return owned
+
+
+def check_stacked_online_fp8(test, runtime_device):
+    from rtp_llm.models_py.quant_methods.fp8 import _runtime_fp8_dtype
+
+    owned = check_stacked_online_fp8_cpu_staging(test)
+    target = torch.device(runtime_device)
+    test.assertEqual(target.type, "cuda")
+    # Like ordinary load and EPLB reload, migrate before device-specific
+    # quantization. The tiny fixture tests quantization, not fused-MoE execution.
+    owned.to(target)
+    runtime_dtype = _runtime_fp8_dtype(target)
+    owned.quant_method.process_weights_after_loading(owned)
+    gate, up, down = _weights()
+    for weights, scale, expected in (
+        (owned.w13, owned.w13_scale, torch.cat((up, gate), 1)),
+        (owned.w2, owned.w2_scale, down),
+    ):
+        test.assertEqual(weights.dtype, runtime_dtype)
+        test.assertEqual(weights.device, target)
+        expected = expected.to(target)
+        reference_scale = expected.abs().amax(dim=-1) / torch.finfo(runtime_dtype).max
+        torch.testing.assert_close(scale, reference_scale, rtol=0, atol=0)
+        reference = (expected / reference_scale.unsqueeze(-1)).to(runtime_dtype)
+        test.assertTrue(
+            torch.equal(weights.view(torch.uint8), reference.view(torch.uint8))
+        )
 
 
 class OwnerCheckpointTest(unittest.TestCase):
     test_stacked_routing = check_stacked_routing
-    test_stacked_online_fp8 = check_stacked_online_fp8
+    test_stacked_online_fp8 = check_stacked_online_fp8_cpu_staging
 
 
 if __name__ == "__main__":

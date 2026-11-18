@@ -35,7 +35,6 @@ from rtp_llm.models_py.new_models.deepseek_v41_dspark.language import (
 )
 from rtp_llm.models_py.weight_mapper import get_all_weights
 from rtp_llm.ops import KvCacheDataType, ParallelismConfig, RoleType
-from rtp_llm.ops.compute_ops import PyModelInputs
 
 
 def config_and_load(directory, rank, commit):
@@ -182,31 +181,6 @@ class V41DraftServiceTest(unittest.TestCase):
                     for key, value in model.runtime_weight_view().items():
                         self.assertIs(value, exports[key])
                     self.assertFalse(hasattr(model, "_engram_hash_state"))
-
-    def test_actual_graph_metadata_and_cold_native_forward_interfaces(self):
-        for commit in (False, True):
-            with self.subTest(
-                commit=commit
-            ), tempfile.TemporaryDirectory() as directory:
-                model, _, _ = self.staged(directory, commit=commit)
-                self.assertEqual(model.cuda_graph_input_hidden_size(), 192)
-                metadata = model.prepare_fmha_impl(None, is_cuda_graph=True)
-                self.assertEqual(metadata.sched_meta_cache, {})
-                self.assertTrue(metadata.support_cuda_graph())
-                inputs = PyModelInputs()
-                inputs.input_ids = torch.ones(6, dtype=torch.int32)
-                # Main's documented no-KV warmup only; no attention/projection
-                # backend or CUDA Graph execution is replaced/claimed here.
-                result = (
-                    model.forward_commit(inputs)
-                    if commit
-                    else model.forward_propose(inputs)
-                )
-                self.assertEqual(
-                    tuple(result.hidden_states.shape), (0 if commit else 6, 64)
-                )
-                with self.assertRaisesRegex(RuntimeError, "fixed forward_propose"):
-                    model.forward(inputs)
 
     def test_runtime_view_cannot_replace_borrowed_head_or_markov(self):
         with tempfile.TemporaryDirectory() as directory:

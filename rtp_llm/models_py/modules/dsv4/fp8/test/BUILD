@@ -15,9 +15,8 @@ _DSV4_FP8_TEST_DEPS = [
         srcs = [name + ".py"],
         env = {"GPU_COUNT": "0", "CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "",
                "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
-        # The linear-only test needs no native ops. The other tests import
-        # production attention/compressor/indexer, including config and both
-        # native bindings; use the same closure as the model checkpoint tests.
+        # The other tests load the production owners and typed config but do
+        # not execute the serving bindings. Match the model checkpoint closure.
         deps = (
             ["//rtp_llm/models_py:modules", "//rtp_llm/models_py:new_loader_core"]
             if name == "dsv4_fp8_checkpoint_test"

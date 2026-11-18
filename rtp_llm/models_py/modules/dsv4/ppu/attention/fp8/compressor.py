@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from rtp_llm.models_py.modules.dsv4.fp8.compressor import (
-    _CUBLAS_GEMM_BF16_BF16_FP32,
+    _cublas_gemm_bf16_bf16_fp32,
     _SHARED_COS_SIN_CACHE,
     _CPStateReadSelection,
     _select_cp_state_read_tail_blocks,
@@ -52,10 +52,7 @@ from rtp_llm.models_py.modules.dsv4.fp8._kv_cache_utils import PoolBackedModule
 from rtp_llm.models_py.modules.dsv4.fp8.compressor import CompressorFP8 as _BaseCompressorFP8
 
 def _default_bf16_fp32_linear(activation, linear_weight):
-    assert (
-        _CUBLAS_GEMM_BF16_BF16_FP32 is not None
-    ), "cublas_gemm_bf16_bf16_fp32 op is not built"
-    return _CUBLAS_GEMM_BF16_BF16_FP32(activation, linear_weight)
+    return _cublas_gemm_bf16_bf16_fp32(activation, linear_weight)
 
 def _linear_bf16_bf16_fp32(
     x: torch.Tensor, weight: torch.Tensor, *, linear_op=_default_bf16_fp32_linear

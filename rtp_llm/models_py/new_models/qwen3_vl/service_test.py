@@ -174,9 +174,9 @@ class _CpuExpertMath(torch.nn.Module):
         return output
 
 
-class PublicVLTest(unittest.TestCase):
+class _VLServiceFixture(unittest.TestCase):
     @torch.inference_mode()
-    def test_vl(self):
+    def check_vl(self, *, native_output):
         for moe, server, owner in (
             (False, _Dense, Qwen3VLForCausalLM),
             (True, _Moe, Qwen3VLMoeForCausalLM),
@@ -262,6 +262,8 @@ class PublicVLTest(unittest.TestCase):
                         torch.testing.assert_close(
                             result[1:], features + extra.reshape_as(features)
                         )
+                        if not native_output:
+                            continue
                         inputs.capture_hidden_states = False
                         prefill = _CpuPrefill()
                         # Independently assemble main's reference layer/deepstack/final
@@ -295,6 +297,16 @@ class PublicVLTest(unittest.TestCase):
                         actual = model.py_model(inputs, prefill).hidden_states
                         torch.testing.assert_close(actual, ref_hidden)
                         self.assertTrue(torch.isfinite(actual).all())
+
+
+class PublicVLTest(_VLServiceFixture):
+    def test_checkpoint_vision_and_deepstack(self):
+        self.check_vl(native_output=False)
+
+
+class VLNativeOutputTest(_VLServiceFixture):
+    def test_vl(self):
+        self.check_vl(native_output=True)
 
 
 if __name__ == "__main__":

@@ -95,8 +95,18 @@ class TestTensorCollectorFp8(unittest.TestCase):
 
 class TestStackedOnlineFp8(unittest.TestCase):
     def test_stacked_kernel_generates_scales_without_shadowing_weights(self):
-        from rtp_llm.models_py.owner_migration_checkpoint_test import check_stacked_online_fp8
-        check_stacked_online_fp8(self)
+        from rtp_llm.models_py.owner_migration_checkpoint_test import (
+            check_stacked_online_fp8,
+        )
+
+        # This target reserves a GPU. Missing accelerator setup must fail, not
+        # silently turn the runtime byte/scale regression into CPU staging.
+        self.assertTrue(
+            torch.cuda.is_available(), "inline FP8 test requires its reserved GPU"
+        )
+        check_stacked_online_fp8(
+            self, torch.device("cuda", torch.cuda.current_device())
+        )
 
 
 class TestPerChannelCastToFp8Expert(unittest.TestCase):
@@ -189,10 +199,7 @@ class TestTransposeStackMoeW1Swap(unittest.TestCase):
         up_data = torch.randn(num_experts, gate_dim, hidden_dim)
         fused_experts = torch.cat([gate_data, up_data], dim=1)
 
-        expert_keys = {
-            f"layers.0.moe.{W.moe_w1}.{eid}.0"
-            for eid in range(num_experts)
-        }
+        expert_keys = {f"layers.0.moe.{W.moe_w1}.{eid}.0" for eid in range(num_experts)}
         collector = TensorCollector(expert_keys, FakeDatabase())
         for eid in range(num_experts):
             key = f"layers.0.moe.{W.moe_w1}.{eid}.0"

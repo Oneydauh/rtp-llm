@@ -31,7 +31,7 @@ from rtp_llm.models_py.new_models.model_base import (
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 from rtp_llm.models_py.read_spec import unwrap_checkpoint_tensor
 from rtp_llm.models_py.weight_mapper import WeightsMapper
-from rtp_llm.ops import TaskType
+
 if TYPE_CHECKING:
     from rtp_llm.ops.compute_ops import (
         LayerKVCache,
@@ -681,11 +681,19 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
         )
         # Embedding/classification/reranking consumes normalized hidden states.
         # A handler may independently own the raw full LM projection.
+        unspecified = object()
         task_type = (
-            model_config.get("task_type", TaskType.LANGUAGE_MODEL)
+            model_config.get("task_type", unspecified)
             if isinstance(model_config, dict)
-            else getattr(model_config, "task_type", TaskType.LANGUAGE_MODEL)
+            else getattr(model_config, "task_type", unspecified)
         )
+        # A plain HF/draft config defaults to language modeling and does not
+        # need native serving config bindings just to construct its parameters.
+        needs_lm_head = owns_head
+        if needs_lm_head and task_type is not unspecified:
+            from rtp_llm.ops import TaskType
+
+            needs_lm_head = task_type == TaskType.LANGUAGE_MODEL
         self.lm_head = (
             ParallelLMHead(
                 vocab_size=cfg["vocab_size"],
@@ -695,7 +703,7 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
                 params_dtype=cfg["lm_head_params_dtype"],
                 **output_vocab_head_kwargs(model_config),
             )
-            if owns_head and task_type == TaskType.LANGUAGE_MODEL
+            if needs_lm_head
             else None
         )
         if (

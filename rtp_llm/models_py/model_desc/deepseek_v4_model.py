@@ -29,10 +29,12 @@ mode reads tensors from `mw.global_weights[W.*]` and
 `mw.weights[layer_id][W.v4_*]` (W tag enum, no string keys).
 """
 
+from __future__ import annotations
+
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
 
@@ -55,7 +57,6 @@ from rtp_llm.models_py.modules.dsv4.decode.forward import (
     forward_decode,
 )
 from rtp_llm.models_py.modules.dsv4.kv_cache_utils import primary_attention_inputs
-from rtp_llm.models_py.modules.dsv4.prefill.forward import forward_prefill
 from rtp_llm.models_py.modules.dsv4.transformer import V4Args, V4Transformer
 from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.chunked_layer import (
     cp_padded_tokens_per_rank_bound,
@@ -63,6 +64,13 @@ from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.chunked_layer imp
 )
 from rtp_llm.ops import RoleType
 from rtp_llm.utils.warmup import model_warm_up_enabled
+
+if TYPE_CHECKING:
+    from rtp_llm.ops.compute_ops import (
+        PyModelInitResources,
+        PyModelInputs,
+        PyModelOutputs,
+    )
 
 
 def _materialize_meta_buffers(module: torch.nn.Module, device: str) -> int:
@@ -85,9 +93,6 @@ def _materialize_meta_buffers(module: torch.nn.Module, device: str) -> int:
                 )
                 count += 1
     return count
-
-
-from rtp_llm.ops.compute_ops import PyModelInitResources, PyModelInputs, PyModelOutputs
 
 
 def _is_decode_fmha(fmha_impl: Any) -> bool:
@@ -1333,6 +1338,8 @@ class DeepSeekV4Model(GptModelBase):
             hidden = torch.zeros(
                 T, self._v4_args.dim, dtype=torch.bfloat16, device=device
             )
+            from rtp_llm.ops.compute_ops import PyModelOutputs
+
             return PyModelOutputs(hidden)
         # Group-invariant view of ``PyModelInputs.attention_inputs``; the
         # per-tag block tables are resolved inside forward_prefill /
@@ -1378,6 +1385,8 @@ class DeepSeekV4Model(GptModelBase):
         elif attn.is_prefill:
             with _profiler.moe_record_function_scope():
                 capture = self.capture_context(inputs.capture_hidden_states)
+            from rtp_llm.models_py.modules.dsv4.prefill.forward import forward_prefill
+
             return forward_prefill(
                 self.v4,
                 self.kv_cache,

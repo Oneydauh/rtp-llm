@@ -10,12 +10,17 @@ Top-level model: DeepSeekV32ForCausalLM
   - RoPE cos/sin cache is computed on-the-fly from config.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import math
 import os
 from collections.abc import Callable
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
+
+if TYPE_CHECKING:
+    from rtp_llm.ops.compute_ops import PyModelInputs
 
 import torch
 import torch.nn as nn
@@ -30,7 +35,6 @@ from rtp_llm.models_py.model_desc.generic_moe import GenericMoeModel
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
 from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.weight_mapper import WeightsMapper
-from rtp_llm.ops.compute_ops import PyModelInputs
 from rtp_llm.utils.model_weight import W
 
 from .model import DeepSeekV32DecoderLayer

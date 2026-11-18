@@ -69,6 +69,8 @@ class DeepSeekServiceRouteTest(unittest.TestCase):
                     config = parser._create_config(root)
                     config.ckpt_path = root
                     config.model_type = model_type
+                    # Match the engine configuration step after parsing the checkpoint.
+                    config.attn_config.tokens_per_block = config.attn_config.kernel_tokens_per_block = 64
                     config.max_seq_len = 16
                     config.data_type = "bf16"
                     config.lora_infos = {}

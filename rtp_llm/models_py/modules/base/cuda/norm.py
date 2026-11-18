@@ -11,7 +11,6 @@ from rtp_llm.models_py.modules.base.common.norm import (  # noqa: F401
     BaseResNorm,
     LayerNorm,
 )
-from rtp_llm.ops.compute_ops import rtp_llm_ops
 
 
 class RMSNorm(BaseNorm):
@@ -137,6 +136,8 @@ class AddBiasResLayerNorm(BaseAddBiasResLayerNorm):
     def forward(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, bias: torch.Tensor
     ):
+        from rtp_llm.ops.compute_ops import rtp_llm_ops
+
         rtp_llm_ops.fused_add_layernorm(
             hidden_states,
             residual,

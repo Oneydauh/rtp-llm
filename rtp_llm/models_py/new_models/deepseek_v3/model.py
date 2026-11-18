@@ -12,7 +12,13 @@ Orchestrates:
       model.layers.{i}.self_attn.indexer.weights_proj.weight
 """
 
-from typing import Any, Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from rtp_llm.ops.compute_ops import LayerKVCache
+    from rtp_llm.models_py.modules.factory.attention.attn_factory import MlaImplBase
 
 import torch
 
@@ -20,10 +26,8 @@ from rtp_llm.models_py.layers.norm import RMSResNorm
 from rtp_llm.models_py.model_desc.generic_moe import DecodeLayerOutput
 from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.modules import IndexerOp
-from rtp_llm.models_py.modules.factory.attention.attn_factory import MlaImplBase
 from rtp_llm.models_py.modules.hybrid.indexer import Indexer
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
-from rtp_llm.ops.compute_ops import LayerKVCache
 
 from .attention import DeepSeekV32MlaAttention
 from .indexer_parameters import SparseIndexerParameters

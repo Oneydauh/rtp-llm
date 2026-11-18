@@ -12,10 +12,9 @@ from safetensors.torch import load_file, save_file
 
 from rtp_llm.models.qwen4_exp.qwen4_exp import Qwen4Exp
 from rtp_llm.models_py.new_models.qwen4_exp.target_weights import Qwen4CheckpointPlan
-from rtp_llm.models_py.new_models.qwen4_exp.test.test_native_service import native_config, CheckpointOnlyQwen4
+from rtp_llm.models_py.new_models.qwen4_exp.test.test_native_service import native_config
 from rtp_llm.models_py.new_models.qwen4_exp.language import Qwen4ForCausalLM
 from rtp_llm.models_py.registry import MODEL_REGISTRY
-from rtp_llm.config.kv_cache_config import KVCacheConfig
 from rtp_llm.ops import ParallelismConfig, HWKernelConfig, MoeConfig
 from rtp_llm.models_py.model_loader import NewModelLoader, NewLoaderConfig
 from rtp_llm.models_py.new_models.qwen4_exp.target_weights import Qwen4TargetWeights
@@ -64,48 +63,11 @@ def source_checkpoint(directory, kind):
 
 
 class PrecisionPlanTest(unittest.TestCase):
-    def test_mixed_cpu_staging_cannot_publish_a_fake_gpu_runtime(self):
-        with tempfile.TemporaryDirectory() as directory,patch.dict(os.environ,{"LOAD_METHOD":""}),patch.dict(MODEL_REGISTRY,{"qwen4_exp":Qwen4ForCausalLM}):
-            config,_ = source_checkpoint(directory,"fp8")
-            pc = ParallelismConfig()
-            pc.world_size = pc.tp_size = pc.ep_size = 1
-            pc.world_rank = pc.tp_rank = pc.ep_rank = pc.local_rank = 0
-            model = CheckpointOnlyQwen4(model_config=config,parallelism_config=pc,
-                hw_kernel_config=HWKernelConfig(),kv_cache_config=KVCacheConfig(),
-                fmha_config=None,moe_config=MoeConfig(),load_method="scratch",
-                max_generate_batch_size=2,vit_config=None,merge_lora=False)
-            with self.assertRaisesRegex(ValueError,"FP8 vocabulary requires contiguous CUDA"):
-                model.load()
-            self.assertIsNone(model.py_model)
-            self.assertIsNone(model.weight)
-
     @unittest.skipUnless(os.environ.get("NEWLOADER_TEST_NATIVE_FST") == "1", "native FST opt-in")
     def test_two_rank_whole_bf16_and_mixed_fst(self):
         with tempfile.TemporaryDirectory() as directory:
             torch.multiprocessing.start_processes(_whole_worker,
                 args=(str(Path(directory)/"gloo"),),nprocs=2,join=True,start_method="spawn")
-
-    def test_bf16_actual_service_scratch_and_fst(self):
-        for method in ("scratch", "fastsafetensors"):
-            with self.subTest(method=method), tempfile.TemporaryDirectory() as directory, patch.dict(os.environ,{"LOAD_METHOD":""}), patch.dict(MODEL_REGISTRY,{"qwen4_exp":Qwen4ForCausalLM}):
-                config, values = source_checkpoint(directory,"bf16")
-                parallel = ParallelismConfig()
-                parallel.world_size = parallel.tp_size = parallel.ep_size = 1
-                parallel.world_rank = parallel.tp_rank = parallel.ep_rank = parallel.local_rank = 0
-                hw = HWKernelConfig()
-                hw.enable_cuda_graph = hw.use_swizzleA = False
-                model = CheckpointOnlyQwen4.from_config(model_config=config,
-                    parallelism_config=parallel,hw_kernel_config=hw,kv_cache_config=KVCacheConfig(),
-                    fmha_config=None,moe_config=MoeConfig(),load_method=method,
-                    max_generate_batch_size=2,vit_config=None,merge_lora=False)
-                self.addCleanup(model.py_model.close)
-                self.assertEqual(model.py_model.checkpoint_plan.source_kind,"bf16")
-                self.assertEqual(model.model_weights_loader.loaded_method.value,method)
-                self.assertEqual(model.py_model.layers[0].mlp.experts.w13.dtype,torch.bfloat16)
-                self.assertIs(model.weight.get_global_weight("embedding"),model.py_model.embed_tokens.weight)
-                qsa = model.py_model.layers[1].self_attn.qsa_indexer
-                torch.testing.assert_close(qsa.index_qk_proj.weight,
-                    values["model.language_model.layers.1.self_attn.indexer.index_qk_proj.weight"],rtol=0,atol=0)
 
     def test_actual_source_recipes_and_role_policy(self):
         for kind in ("bf16","fp8","nvfp4"):

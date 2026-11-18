@@ -142,6 +142,9 @@ def load_owned_model(service, *, publish_runtime=True):
         service.model_weights_loader = loader
         service.device = device
         return
+    finalize_input_vocab = getattr(module, "finalize_runtime_input_vocab", None)
+    if callable(finalize_input_vocab):
+        finalize_input_vocab(config, service.tokenizer)
     view = _runtime_view(module, config, device)
     module.weight = view
     controller = None

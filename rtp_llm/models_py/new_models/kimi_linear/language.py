@@ -6,11 +6,13 @@ required by the existing attention factory; checkpoint loading itself never
 uses ``ModelWeightInfo``, ``ModelWeights`` or the legacy loader layout.
 """
 
+from __future__ import annotations
+
 import logging
 import math
 import weakref
 from collections.abc import Callable, Iterable
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -43,12 +45,10 @@ from rtp_llm.models_py.new_models.deepseek_v3.moe import DeepSeekV32MoEBlock
 from .kda_parameters import KimiKDAParameters
 from rtp_llm.models_py.weight_mapper import WeightsMapper
 from rtp_llm.ops import HybridAttentionType, RopeStyle
-from rtp_llm.ops.compute_ops import (
-    LayerKVCache,
-    PyAttentionInputs,
-    PyModelInputs,
-)
 from rtp_llm.utils.util import to_torch_dtype
+
+if TYPE_CHECKING:
+    from rtp_llm.ops.compute_ops import LayerKVCache, PyAttentionInputs
 
 logger = logging.getLogger(__name__)
 

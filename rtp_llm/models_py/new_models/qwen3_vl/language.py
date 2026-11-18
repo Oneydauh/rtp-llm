@@ -7,7 +7,6 @@ from rtp_llm.models_py.new_models.qwen3.language import Qwen3ForCausalLM
 from rtp_llm.models_py.new_models.qwen3_moe.language import Qwen3MoeForCausalLM
 from rtp_llm.models_py.new_models.qwen3_vl.multimodal import Qwen3VLMultimodalMixin
 from rtp_llm.models_py.weight_mapper import WeightsMapper
-from rtp_llm.ops.compute_ops import PyModelOutputs
 
 
 class _LanguageRuntime(Qwen3VLMultimodalMixin):
@@ -48,6 +47,8 @@ class _LanguageRuntime(Qwen3VLMultimodalMixin):
                 capture.capture_layer(layer_id, hidden)
         if self.norm is None:
             intermediate = hidden + residual if self._is_moe else hidden
+            from rtp_llm.ops.compute_ops import PyModelOutputs
+
             out = PyModelOutputs(intermediate)
             out.pp_intermediates = {"hidden_states": intermediate}
             return out
