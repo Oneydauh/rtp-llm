@@ -86,16 +86,6 @@ def load_gqa_ffn_ft_checkpoint(model, checkpoint):
                 raise ValueError(
                     "Dense FT has no declared adapter for this quantized runtime layout"
                 )
-            if (
-                isinstance(
-                    linear.quant_method, (Fp8LinearMethod, Fp8PerChannelLinearMethod)
-                )
-                and not isinstance(linear.quant_method, Fp8BlockLinearMethod)
-                and swizzled
-            ):
-                raise ValueError(
-                    "FP8 FT swizzled source requires an explicit quantized layout decoder"
-                )
     if getattr(model.lm_head, "output_vocab_ids", None):
         raise ValueError(
             "Legacy FT checkpoints cannot be combined with vocabulary pruning"
@@ -123,7 +113,7 @@ def load_gqa_ffn_ft_checkpoint(model, checkpoint):
         scale = source.removesuffix(".kernel") + ".weight_only_quant_scale"
         if isinstance(linear.quant_method, Fp8PerChannelLinearMethod):
             state = PerChannelFP8FTProjection(
-                linear, checkpoint, source, scale, projection
+                linear, checkpoint, source, scale, projection, swizzled=swizzled
             )
             return [
                 RuntimeTensorBinding(
@@ -139,7 +129,9 @@ def load_gqa_ffn_ft_checkpoint(model, checkpoint):
                     lambda: (state.scale(),),
                 ),
             ]
-        state = PerTensorFP8FTProjection(linear, checkpoint, source, scale, projection)
+        state = PerTensorFP8FTProjection(
+            linear, checkpoint, source, scale, projection, swizzled=swizzled
+        )
         # These spellings are only legacy serializer boundary names. The quant
         # module owns all tensor layout, fusion and activation-scale semantics.
         stems = {

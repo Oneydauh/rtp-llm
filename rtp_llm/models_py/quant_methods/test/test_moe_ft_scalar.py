@@ -64,6 +64,60 @@ class ExpertOwner(RtpModule):
 
 
 class LegacyScalarFTTest(unittest.TestCase):
+    def test_rocm_dense_sources_for_scalar_and_channel(self):
+        from rtp_llm.models_py.quant_methods.fp8_ft import (
+            PerChannelFP8FTProjection,
+            PerTensorFP8FTProjection,
+        )
+        from rtp_llm.utils.swizzle_utils import swizzle_tensor
+
+        n, k = 128, 256
+        w = (torch.arange(n * k).reshape(n, k) % 53 - 26).to(torch.float8_e4m3fn)
+        for swizzled in (False, True):
+            encoded = (
+                swizzle_tensor(w, False)
+                if swizzled
+                else w.reshape(n // 16, 16, k // 32, 2, 16)
+                .permute(0, 2, 3, 1, 4)
+                .contiguous()
+                .reshape(n, k)
+            )
+            for channel in (False, True):
+                with tempfile.TemporaryDirectory() as root:
+                    keys = "layers.0.k", "layers.0.s"
+                    s = (
+                        torch.arange(n).float() / 128 + 0.5
+                        if channel
+                        else torch.tensor([2.0])
+                    )
+                    write_ft(
+                        root,
+                        {
+                            keys[0]: encoded.reshape(k, n) if channel else encoded,
+                            keys[1]: s.reshape(1, n) if channel else s,
+                        },
+                    )
+                    checkpoint = FTCheckpoint.open(root, CheckpointTopology())
+                    checkpoint.index_metadata["ft_export_backend"] = "rocm"
+                    for method in ("scratch", "fastsafetensors"):
+                        checkpoint.read_backend = method
+                        cls = (
+                            PerChannelFP8FTProjection
+                            if channel
+                            else PerTensorFP8FTProjection
+                        )
+                        obj = cls(
+                            SimpleNamespace(weight=w, tp_size=1, tp_rank=0),
+                            checkpoint,
+                            *keys,
+                            "out",
+                            swizzled=swizzled,
+                        )
+                        torch.testing.assert_close(
+                            obj.weight().view(torch.uint8), w.view(torch.uint8)
+                        )
+                        torch.testing.assert_close(obj.scale().flatten(), s)
+
     def test_ep_rank_aggregate_tracks_selected_physical_rows(self):
         from safetensors.torch import save_file
         from rtp_llm.models_py.expert_placement import ExpertPlacement

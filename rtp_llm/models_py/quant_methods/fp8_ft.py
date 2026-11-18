@@ -16,8 +16,11 @@ def _cat_fp8(values, dim):
 
 
 class PerTensorFP8FTProjection:
-    def __init__(self, layer, checkpoint, kernel_name, scale_name, projection):
+    def __init__(
+        self, layer, checkpoint, kernel_name, scale_name, projection, *, swizzled=False
+    ):
         self.layer, self.checkpoint = layer, checkpoint
+        self.swizzled = swizzled
         self.kernel_name, self.scale_name, self.projection = (
             kernel_name,
             scale_name,
@@ -38,6 +41,28 @@ class PerTensorFP8FTProjection:
 
     def _kernel_shape(self, peer):
         return self.checkpoint.read_rank_slice(self.kernel_name, peer)
+
+    def _undo_rocm_dense_layout(self, value, raw_dtype):
+        from rtp_llm.models_py.quant_methods.block_fp8_ft import (
+            block_ft_source_is_rocm,
+            block_ft_weight,
+        )
+
+        if not block_ft_source_is_rocm(
+            self.checkpoint.index_metadata.get("ft_export_backend"), raw_dtype, False
+        ):
+            return value
+        if self.swizzled:
+            from rtp_llm.models_py.quant_methods.dense_layout import decode_dense_weight
+
+            return decode_dense_weight(value)
+        return block_ft_weight(
+            value.unsqueeze(0), (1, *value.shape), False, rocm_shuffle=True
+        )[0]
+
+    def _read_kernel(self, peer):
+        value = self._read(self.kernel_name, peer)
+        return self._undo_rocm_dense_layout(value, value.dtype)
 
     def _scale(self, peer, part=0):
         value = self._read(self.scale_name, peer).float().reshape(-1)
@@ -98,7 +123,7 @@ class PerTensorFP8FTProjection:
         cache = {}
         for peer, part, begin, end, width in pieces:
             if peer not in cache:
-                cache[peer] = self._read(self.kernel_name, peer)
+                cache[peer] = self._read_kernel(peer)
             source = cache[peer]
             if source.dtype != torch.float8_e4m3fn:
                 raise TypeError(
@@ -126,7 +151,7 @@ class PerTensorFP8FTProjection:
                     continue
                 source = cache.get(peer)
                 if source is None:
-                    source = self._read(self.kernel_name, peer)
+                    source = self._read_kernel(peer)
                 for part in range(len(results)):
                     offset = part * width + padding if axis == 0 else padding
                     if torch.count_nonzero(
@@ -188,6 +213,7 @@ class PerChannelFP8FTProjection(PerTensorFP8FTProjection):
     def _read(self, name, peer):
         value = super()._read(name, peer)
         if name == self.kernel_name:
+            source_dtype = value.dtype
             value = value.reshape(self._kernel_shape(peer))
             if not bool(torch.isfinite(value.float()).all()):
                 raise ValueError("Per-channel FP8 FT contains nonfinite weights")
@@ -195,6 +221,7 @@ class PerChannelFP8FTProjection(PerTensorFP8FTProjection):
                 value = value.view(torch.float8_e4m3fn)
             elif value.dtype != torch.float8_e4m3fn:
                 raise TypeError("Per-channel FP8 FT requires an FP8 source dtype")
+            value = self._undo_rocm_dense_layout(value, source_dtype)
         return value
 
     def _selected_scale(self, piece):
