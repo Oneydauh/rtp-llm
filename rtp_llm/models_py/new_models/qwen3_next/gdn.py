@@ -1,4 +1,5 @@
 """Direct checkpoint parameters bound to main's Qwen GDN execution path."""
+
 import torch
 
 from rtp_llm.models_py.model_desc.qwen3_next import (
@@ -8,7 +9,9 @@ from rtp_llm.models_py.model_desc.qwen3_next import (
     Qwen3NextGdnStateParameters,
     RmsNormGated,
 )
-from rtp_llm.models_py.new_models.qwen3_next.gdn_parameters import Qwen3NextGdnParameters
+from rtp_llm.models_py.new_models.qwen3_next.gdn_parameters import (
+    Qwen3NextGdnParameters,
+)
 
 
 class Qwen3NextGatedDeltaNet(Qwen3NextGdnExecution, Qwen3NextGdnParameters):
@@ -29,9 +32,13 @@ class Qwen3NextGatedDeltaNet(Qwen3NextGdnExecution, Qwen3NextGdnParameters):
             self.linear_attn_config, self.parallelism_config, state
         )
         self.norm = RmsNormGated(
-            self.norm_w.detach(), eps=self.rms_norm_eps,
-            group_size=self.head_v_dim, activation=self.norm_activation
+            self.norm_w.detach(),
+            eps=self.rms_norm_eps,
+            group_size=self.head_v_dim,
+            activation=self.norm_activation,
         )
 
     def _input_project(self, hidden_states):
-        return self.in_proj_qkvz(hidden_states), torch.mm(hidden_states, self.in_proj_ba_w)
+        return self.in_proj_qkvz(hidden_states), torch.mm(
+            hidden_states, self.in_proj_ba_w
+        )

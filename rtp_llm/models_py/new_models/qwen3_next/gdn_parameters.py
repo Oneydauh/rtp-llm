@@ -1,4 +1,5 @@
 """Rank-local Qwen3-Next/Qwen3.5 gated-delta checkpoint parameters."""
+
 from __future__ import annotations
 
 import math
@@ -154,7 +155,9 @@ class Qwen3NextGdnParameters(RtpModule):
         if not (0 <= attn_tp_rank < attn_tp_size):
             raise ValueError(f"Invalid attention TP rank {attn_tp_rank}/{attn_tp_size}")
         if min(num_k_heads, num_v_heads, self.head_k_dim, self.head_v_dim) <= 0:
-            raise ValueError("Linear attention head counts and dimensions must be positive")
+            raise ValueError(
+                "Linear attention head counts and dimensions must be positive"
+            )
         if num_k_heads % attn_tp_size or num_v_heads % attn_tp_size:
             raise ValueError(
                 "Linear attention head counts must be divisible by attention TP"
@@ -234,7 +237,9 @@ class Qwen3NextGdnParameters(RtpModule):
         if not isinstance(value, (list, tuple)) or len(value) != 2:
             raise ValueError(f"Invalid FP8 weight_block_size {value!r}")
         if any(type(size) is not int or size <= 0 for size in value):
-            raise ValueError(f"FP8 block dimensions must be positive integers: {value!r}")
+            raise ValueError(
+                f"FP8 block dimensions must be positive integers: {value!r}"
+            )
         return value[0], value[1]
 
     def _split_qkvz_rows(self, tensor: torch.Tensor, unit: int) -> torch.Tensor:

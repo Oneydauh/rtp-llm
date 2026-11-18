@@ -3,7 +3,7 @@
 import logging
 import math
 from numbers import Real
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -14,7 +14,7 @@ from rtp_llm.models_py.model_desc.qwen3_next_mtp import Qwen3NextMTPModel
 from rtp_llm.models_py.new_models.qwen3_next.gdn import Qwen3NextGatedDeltaNet
 from rtp_llm.models_py.new_models.qwen3_next.gdn_parameters import _finite_positive_real
 from rtp_llm.models_py.read_spec import unwrap_checkpoint_tensor
-from rtp_llm.models_py.distributed.collective_torch import Group, all_gather, all_reduce
+from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
 from rtp_llm.models_py.layers.embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -26,10 +26,6 @@ from rtp_llm.models_py.layers.linear import (
     RowParallelLinear,
 )
 from rtp_llm.models_py.layers.norm import RMSNorm, RMSResNorm
-from rtp_llm.models_py.model_desc.block_map import (
-    get_primary_attention_inputs,
-    select_attention_inputs_for_layer,
-)
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
 from rtp_llm.models_py.module_base import CheckpointLoadTarget, RtpModule
 from rtp_llm.models_py.modules import (
@@ -37,10 +33,7 @@ from rtp_llm.models_py.modules import (
     MultimodalEmbeddingInjector,
     SelectTopk,
 )
-from rtp_llm.models_py.new_models.model_base import (
-    required_config_value,
-    select_fmha_impl_for_layer,
-)
+from rtp_llm.models_py.new_models.model_base import required_config_value
 from rtp_llm.models_py.new_models.qwen3.language import (
     Qwen3Attention,
     _positive_int,
@@ -48,14 +41,13 @@ from rtp_llm.models_py.new_models.qwen3.language import (
 )
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 from rtp_llm.models_py.weight_mapper import WeightsMapper
-from rtp_llm.ops import HybridAttentionType, LinearAttentionConfig
+from rtp_llm.ops import HybridAttentionType
 from rtp_llm.ops.compute_ops import (
     LayerKVCache,
     PyAttentionInputs,
     PyModelInputs,
     PyModelOutputs,
 )
-from rtp_llm.utils.util import to_torch_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -703,6 +695,10 @@ class Qwen3NextDecoderLayer(RtpModule):
         if self.layer_type == HybridAttentionType.LINEAR:
             self.linear_attn = Qwen3NextGatedDeltaNet(
                 parallelism_config=cfg["parallelism_config"],
+                norm_activation=getattr(
+                    model_config, "linear_attn_norm_activation", None
+                )
+                or "silu",
                 linear_attn_config=model_config.linear_attention_config,
                 hidden_size=hidden_size,
                 rms_norm_eps=rms_eps,
@@ -794,6 +790,7 @@ class Qwen3NextDecoderLayer(RtpModule):
 
 class _StageLayers(nn.ModuleDict):
     """Dispatch by global checkpoint layer ID; execute in stage-local order."""
+
     def __iter__(self):
         return iter(self.values())
 
@@ -815,7 +812,9 @@ class Qwen3NextForCausalLM(Qwen3NextModel, RtpModule):
         return not (name.startswith("mtp.") or name.startswith("model.visual."))
 
     def checkpoint_weight_name_filter(self) -> Optional[Callable[[str], bool]]:
-        return lambda name: self._is_core_checkpoint_weight(name) and self._owns_checkpoint_name(name)
+        return lambda name: self._is_core_checkpoint_weight(
+            name
+        ) and self._owns_checkpoint_name(name)
 
     def _owns_checkpoint_name(self, name):
         if not self._pipeline_partitioned:
@@ -825,7 +824,9 @@ class Qwen3NextForCausalLM(Qwen3NextModel, RtpModule):
             index = mapped.split(".", 2)[1]
             return not index.isdigit() or int(index) in self._owned_layer_ids
         if mapped == "embed_tokens.weight":
-            return self.embed_tokens is not None or (self.lm_head is not None and self.tie_word_embeddings)
+            return self.embed_tokens is not None or (
+                self.lm_head is not None and self.tie_word_embeddings
+            )
         if mapped.startswith(("lm_head.", "norm.")):
             return self.lm_head is not None
         return True
@@ -897,7 +898,12 @@ class Qwen3NextForCausalLM(Qwen3NextModel, RtpModule):
 
         super().load_weights(_track_mapped_weights(mapped_iter))
 
-        if not has_lm_head and self.tie_word_embeddings and self.lm_head is not None and self.embed_tokens is not None:
+        if (
+            not has_lm_head
+            and self.tie_word_embeddings
+            and self.lm_head is not None
+            and self.embed_tokens is not None
+        ):
             logger.info(
                 "[Qwen3NextForCausalLM] lm_head not found; tying to embed_tokens"
             )
@@ -984,7 +990,6 @@ class Qwen3NextForCausalLM(Qwen3NextModel, RtpModule):
         )
         parallelism_config = cfg["parallelism_config"]
         fmha_config = getattr(load_config, "fmha_config", None)
-        device_resource_config = getattr(load_config, "device_resource_config", None)
 
         GptModelBase.__init__(
             self,
@@ -997,7 +1002,9 @@ class Qwen3NextForCausalLM(Qwen3NextModel, RtpModule):
         )
 
         self._owned_layer_ids = self.layer_ids()
-        self._pipeline_partitioned = int(getattr(parallelism_config, "pp_size", 1)) > 1 and not self._expects_mtp
+        self._pipeline_partitioned = (
+            int(getattr(parallelism_config, "pp_size", 1)) > 1 and not self._expects_mtp
+        )
         owns_embedding = 0 in self._owned_layer_ids
         owns_head = cfg["num_layers"] - 1 in self._owned_layer_ids
         self._cfg = cfg
@@ -1014,34 +1021,58 @@ class Qwen3NextForCausalLM(Qwen3NextModel, RtpModule):
         self._lm_head_postprocessed = False
         self.multimodal_embedding_injector = MultimodalEmbeddingInjector()
 
-        self.embed_tokens = VocabParallelEmbedding(
-            vocab_size=cfg["vocab_size"],
-            embedding_dim=cfg["hidden_size"],
-            tp_size=cfg["attn_tp_size"],
-            tp_rank=cfg["attn_tp_rank"],
-            params_dtype=cfg["params_dtype"],
-            allow_vocab_padding=True,
-        ) if owns_embedding else None
-        owned = {str(i): Qwen3NextDecoderLayer(cfg, i, model_config, prefix=f"layers.{i}")
-                 for i in self._owned_layer_ids}
-        self.layers = _StageLayers(owned) if self._pipeline_partitioned else nn.ModuleList(owned.values())
-        self.norm = RMSResNorm(
-            cfg["hidden_size"],
-            eps=cfg["rms_norm_eps"],
-            params_dtype=cfg["params_dtype"],
-        ) if owns_head else None
-        self.lm_head = ParallelLMHead(
-            vocab_size=cfg["vocab_size"],
-            hidden_size=cfg["hidden_size"],
-            tp_size=cfg["lm_head_tp_size"],
-            tp_rank=cfg["lm_head_tp_rank"],
-            params_dtype=cfg["lm_head_params_dtype"],
-            **output_vocab_head_kwargs(model_config),
-        ) if owns_head else None
-        if self.tie_word_embeddings and self.embed_tokens is not None and self.lm_head is not None:
+        self.embed_tokens = (
+            VocabParallelEmbedding(
+                vocab_size=cfg["vocab_size"],
+                embedding_dim=cfg["hidden_size"],
+                tp_size=cfg["attn_tp_size"],
+                tp_rank=cfg["attn_tp_rank"],
+                params_dtype=cfg["params_dtype"],
+                allow_vocab_padding=True,
+            )
+            if owns_embedding
+            else None
+        )
+        owned = {
+            str(i): Qwen3NextDecoderLayer(cfg, i, model_config, prefix=f"layers.{i}")
+            for i in self._owned_layer_ids
+        }
+        self.layers = (
+            _StageLayers(owned)
+            if self._pipeline_partitioned
+            else nn.ModuleList(owned.values())
+        )
+        self.norm = (
+            RMSResNorm(
+                cfg["hidden_size"],
+                eps=cfg["rms_norm_eps"],
+                params_dtype=cfg["params_dtype"],
+            )
+            if owns_head
+            else None
+        )
+        self.lm_head = (
+            ParallelLMHead(
+                vocab_size=cfg["vocab_size"],
+                hidden_size=cfg["hidden_size"],
+                tp_size=cfg["lm_head_tp_size"],
+                tp_rank=cfg["lm_head_tp_rank"],
+                params_dtype=cfg["lm_head_params_dtype"],
+                **output_vocab_head_kwargs(model_config),
+            )
+            if owns_head
+            else None
+        )
+        if (
+            self.tie_word_embeddings
+            and self.embed_tokens is not None
+            and self.lm_head is not None
+        ):
             self.embed_tokens.tie_output_head(self.lm_head)
 
-        self._init_capture_context(self._capture_canonical_layer, self._capture_canonical_final)
+        self._init_capture_context(
+            self._capture_canonical_layer, self._capture_canonical_final
+        )
 
     def runtime_weight_view(self) -> dict[str, torch.Tensor]:
         result = {}
