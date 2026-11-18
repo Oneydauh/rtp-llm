@@ -1,0 +1,152 @@
+"""Whole two-layer Kimi KDA/MLA + MoE checkpoint against main's typed config."""
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+import torch
+from safetensors.torch import save_file
+
+from rtp_llm.models.kimi_linear.kimi_linear import KimiLinear
+from rtp_llm.models_py.model_loader import NewLoaderConfig, NewLoaderLoadMethod, NewModelLoader
+from rtp_llm.models_py.model_desc.kimi_linear import KimiLinearModel
+from rtp_llm.models_py.new_models.kimi_linear.language import KimiLinearForCausalLM
+from rtp_llm.ops import DataType, ParallelismConfig
+
+
+def _raw_config():
+    return {
+        "model_type": "kimi_linear",
+        "hidden_size": 8,
+        "num_hidden_layers": 2,
+        "vocab_size": 16,
+        "intermediate_size": 12,
+        "rms_norm_eps": 1e-5,
+        "tie_word_embeddings": False,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "q_lora_rank": None,
+        "kv_lora_rank": 4,
+        "qk_nope_head_dim": 2,
+        "qk_rope_head_dim": 2,
+        "v_head_dim": 2,
+        "mla_use_nope": True,
+        "rope_scaling": None,
+        "linear_attn_config": {
+            "kda_layers": [1],
+            "full_attn_layers": [2],
+            "head_dim": 4,
+            "num_heads": 2,
+            "short_conv_kernel_size": 4,
+        },
+        "first_k_dense_replace": 1,
+        "moe_layer_freq": 1,
+        "num_experts": 4,
+        "num_experts_per_token": 2,
+        "moe_intermediate_size": 4,
+        "num_shared_experts": 1,
+        "moe_router_activation_func": "sigmoid",
+        "moe_renormalize": True,
+        "routed_scaling_factor": 2.446,
+        "num_expert_group": 1,
+        "topk_group": 1,
+    }
+
+
+def _tensor(shape, value):
+    return torch.full(shape, float(value), dtype=torch.float32)
+
+
+def _checkpoint_weights():
+    weights = {
+        "model.embed_tokens.weight": _tensor((16, 8), 1),
+        "model.norm.weight": _tensor((8,), 2),
+        "lm_head.weight": _tensor((16, 8), 3),
+    }
+    for layer in range(2):
+        prefix = f"model.layers.{layer}."
+        weights[prefix + "input_layernorm.weight"] = _tensor((8,), 4 + layer)
+        weights[prefix + "post_attention_layernorm.weight"] = _tensor((8,), 6 + layer)
+    kda = "model.layers.0.self_attn."
+    for index, projection in enumerate(("q_proj", "k_proj", "v_proj"), 10):
+        weights[kda + projection + ".weight"] = _tensor((8, 8), index)
+    weights[kda + "b_proj.weight"] = _tensor((2, 8), 13)
+    weights[kda + "f_a_proj.weight"] = _tensor((4, 8), 14)
+    weights[kda + "f_b_proj.weight"] = _tensor((8, 4), 15)
+    weights[kda + "g_a_proj.weight"] = _tensor((4, 8), 16)
+    weights[kda + "g_b_proj.weight"] = _tensor((8, 4), 17)
+    for index, projection in enumerate(("q_conv1d", "k_conv1d", "v_conv1d"), 18):
+        weights[kda + projection + ".weight"] = _tensor((8, 1, 4), index)
+    weights[kda + "dt_bias"] = _tensor((8,), 21)
+    weights[kda + "A_log"] = _tensor((1, 1, 2, 1), 22)
+    weights[kda + "o_norm.weight"] = _tensor((4,), 23)
+    weights[kda + "o_proj.weight"] = _tensor((8, 8), 24)
+    dense = "model.layers.0.mlp."
+    weights[dense + "gate_proj.weight"] = _tensor((12, 8), 25)
+    weights[dense + "up_proj.weight"] = _tensor((12, 8), 26)
+    weights[dense + "down_proj.weight"] = _tensor((8, 12), 27)
+
+    mla = "model.layers.1.self_attn."
+    weights[mla + "q_proj.weight"] = _tensor((8, 8), 30)
+    weights[mla + "kv_a_proj_with_mqa.weight"] = _tensor((6, 8), 31)
+    weights[mla + "kv_a_layernorm.weight"] = _tensor((4,), 32)
+    weights[mla + "kv_b_proj.weight"] = _tensor((8, 4), 33)
+    weights[mla + "o_proj.weight"] = _tensor((8, 4), 34)
+    moe = "model.layers.1.block_sparse_moe."
+    weights[moe + "gate.weight"] = _tensor((4, 8), 35)
+    weights[moe + "gate.e_score_correction_bias"] = _tensor((4,), 36)
+    weights[moe + "shared_experts.gate_proj.weight"] = _tensor((4, 8), 37)
+    weights[moe + "shared_experts.up_proj.weight"] = _tensor((4, 8), 38)
+    weights[moe + "shared_experts.down_proj.weight"] = _tensor((8, 4), 39)
+    for expert in range(4):
+        expert_prefix = moe + f"experts.{expert}."
+        weights[expert_prefix + "w1.weight"] = _tensor((4, 8), 40 + expert)
+        weights[expert_prefix + "w3.weight"] = _tensor((4, 8), 50 + expert)
+        weights[expert_prefix + "w2.weight"] = _tensor((8, 4), 60 + expert)
+    return weights
+
+
+class KimiOwnerLoader(NewModelLoader):
+    def _create_model(self):
+        return KimiLinearForCausalLM(self.model_config, self.load_config)
+
+
+class KimiModelCheckpointTest(unittest.TestCase):
+    def test_entire_typed_model(self):
+        with tempfile.TemporaryDirectory() as root:
+            raw = _raw_config()
+            (Path(root) / "config.json").write_text(json.dumps(raw))
+            data = _checkpoint_weights()
+            save_file(data, str(Path(root) / "model.safetensors"))
+            config = KimiLinear._create_config(root)
+            config.ckpt_path = root
+            config.model_type = "kimi_linear"
+            config.max_seq_len = 128
+            config.enable_fp32_lm_head = False
+            config.linear_attention_config.ssm_state_dtype = DataType.TYPE_FP32
+            config.linear_attention_config.conv_state_dtype = DataType.TYPE_FP32
+            for method in (NewLoaderLoadMethod.SCRATCH, NewLoaderLoadMethod.FASTSAFETENSORS):
+                with self.subTest(method=method):
+                    loader = KimiOwnerLoader(config, NewLoaderConfig(
+                        compute_dtype=torch.float32, device="cpu", load_method=method,
+                        parallelism_config=ParallelismConfig(),
+                    ), model_path=root)
+                    model = loader.load()
+                    self.assertIsInstance(model, KimiLinearModel)
+                    self.assertEqual(loader.loaded_method, method)
+                    kda, mla = model.layers
+                    self.assertTrue(kda.is_linear)
+                    self.assertFalse(mla.is_linear)
+                    self.assertIs(kda.self_attn.prefill_kda.conv_weights, kda.self_attn.conv1d.weight)
+                    self.assertIs(kda.self_attn.decode_kda.alog, kda.self_attn.A_log)
+                    self.assertIsNotNone(mla.block_sparse_moe)
+                    self.assertIs(model.runtime_weight_view()["lm_head"], model.lm_head.weight)
+                    torch.testing.assert_close(model.embed_tokens.weight, data["model.embed_tokens.weight"])
+                    torch.testing.assert_close(model.lm_head.weight, data["lm_head.weight"])
+                    model._ensure_mla_kernel_layout()
+                    self.assertEqual(model._mla_kernel_layout.weights[0], {})
+                    self.assertTrue(model._mla_kernel_layout.weights[1])
+
+
+if __name__ == "__main__":
+    unittest.main()
