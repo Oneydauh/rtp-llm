@@ -7,6 +7,17 @@ from rtp_llm.models_py.module_base import _mark_loaded
 from rtp_llm.models_py.read_spec import unwrap_checkpoint_tensor
 
 
+def handler_weight_mappings(names):
+    """Turn declared checkpoint names into the embedding engine's global export roles."""
+    if not isinstance(names, tuple) or not all(
+        isinstance(name, str) and name for name in names
+    ):
+        raise TypeError("Handler checkpoint names must be a tuple of nonempty strings")
+    if len(set(names)) != len(names):
+        raise ValueError("Duplicate handler checkpoint name")
+    return tuple(("__custom__." + name, name) for name in names)
+
+
 class ReplicatedHandlerHeads(nn.Module):
     """Handler projections consume full, unprocessed weights on each serving rank."""
 

@@ -36,30 +36,6 @@ class RuntimeWeightView:
         return self.global_weights.get(name)
 
 
-def custom_weight_mappings(custom):
-    if custom is None:
-        return ()
-    records = custom.get_custom_weight_info()
-    if not records:
-        return ()
-    from rtp_llm.model_loader.weight_module import CustomAtomicWeight
-    from rtp_llm.utils.model_weight import identity, sp_id
-
-    result = []
-    for info in records:
-        if (
-            not isinstance(info, CustomAtomicWeight)
-            or len(info.weights) != 1
-            or info.process_fun is not identity
-            or info.weights[0].merge_fun is not identity
-            or info.split_func is not sp_id
-            or info.data_type is not None
-        ):
-            raise ValueError(f"Unadapted custom checkpoint transform for {info.name!r}")
-        result.append((info.name, info.weights[0].tensor_name(None)))
-    return tuple(result)
-
-
 def _runtime_view(module, config, device):
     exports = module.runtime_weight_view()
     if not isinstance(exports, dict) or not all(
@@ -122,7 +98,11 @@ def load_owned_model(service, *, publish_runtime=True):
         py_hw_kernel_config=service.hw_kernel_config,
         max_generate_batch_size=service.max_generate_batch_size,
         force_cpu_load_weights=getattr(service, "force_cpu_load_weights", False),
-        custom_weight_mappings=custom_weight_mappings(service.custom_module),
+        custom_weight_mappings=(
+            service.custom_module.checkpoint_weight_mappings()
+            if service.custom_module is not None
+            else ()
+        ),
     )
     loader = NewModelLoader(
         config, load_config, model_path=config.ckpt_path, parameter_aliases=aliases

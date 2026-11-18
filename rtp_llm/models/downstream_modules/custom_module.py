@@ -8,8 +8,7 @@ from pydantic import BaseModel
 from rtp_llm.async_decoder_engine.embedding.interface import EngineInputs, EngineOutputs
 from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.frontend.tokenizer_factory.tokenizers import BaseTokenizer
-from rtp_llm.model_loader.model_weight_info import ModelWeights
-from rtp_llm.model_loader.weight_module import CustomAtomicWeight
+from rtp_llm.models_py.downstream_heads import handler_weight_mappings
 
 if TYPE_CHECKING:
     from rtp_llm.ops import EmbeddingCppOutput
@@ -36,18 +35,16 @@ class CustomModule(object):
     def get_handler(self) -> "CustomHandler":
         return self.handler
 
-    def get_custom_weight_info(self) -> List[CustomAtomicWeight]:
-        return self.handler.custom_weight_info()
+    def checkpoint_weight_mappings(self):
+        return handler_weight_mappings(self.handler.checkpoint_weight_names())
 
-    def init(self, weight: ModelWeights):
-        tensor_map: Dict[str, torch.Tensor] = {}
-        for weight_info in self.get_custom_weight_info():
-            if weight_info.name.startswith(CustomAtomicWeight.prefix):
-                name = weight_info.name.replace(CustomAtomicWeight.prefix, "", 1)
-            else:
-                name = weight_info.name
-            tensor_map[name] = weight.get_global_weight(weight_info.name)
-        self.handler.init(tensor_map)
+    def init(self, weight):
+        self.handler.init(
+            {
+                name: weight.get_global_weight(role)
+                for role, name in self.checkpoint_weight_mappings()
+            }
+        )
 
 
 class CustomHandler(object):
@@ -56,8 +53,8 @@ class CustomHandler(object):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.need_post_process = False
 
-    def custom_weight_info(self) -> List[CustomAtomicWeight]:
-        return []
+    def checkpoint_weight_names(self) -> tuple[str, ...]:
+        return ()
 
     # for cpp
     def init_cpp_handler(self) -> None:

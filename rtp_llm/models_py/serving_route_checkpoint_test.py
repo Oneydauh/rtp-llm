@@ -10,7 +10,10 @@ import torch
 from safetensors.torch import save_file
 
 from rtp_llm.models.direct_checkpoint import load_owned_model
-from rtp_llm.models_py.downstream_heads import ReplicatedHandlerHeads
+from rtp_llm.models_py.downstream_heads import (
+    ReplicatedHandlerHeads,
+    handler_weight_mappings,
+)
 from rtp_llm.models_py.fst_range_reader import iter_fst_range_tensors
 from rtp_llm.models_py.model_loader import (
     NewLoaderConfig,
@@ -178,7 +181,7 @@ class DirectServingBoundaryTest(unittest.TestCase):
             "classifier.weight": torch.arange(6).reshape(3, 2).float(),
             "classifier.bias": torch.tensor([3.0, 1.0, -1.0]),
         }
-        mappings = tuple(("__custom__." + key, key) for key in values)
+        mappings = handler_weight_mappings(tuple(values))
         for method in ("scratch", "fastsafetensors"):
             with self.subTest(method=method), tempfile.TemporaryDirectory() as root:
                 cfg = service(root, method, "_service_direct_handler").model_config
@@ -244,7 +247,7 @@ class DirectServingBoundaryTest(unittest.TestCase):
 
     def test_failed_handler_is_not_published(self):
         class FailingHandler:
-            def get_custom_weight_info(self):
+            def checkpoint_weight_mappings(self):
                 return ()
 
             def init(self, weights):
