@@ -4,6 +4,19 @@ load("//rtp_llm/models_py/test:defs.bzl", "models_py_test")
 load(":checkpoint_service_tests.bzl", "checkpoint_service_tests")
 
 py_test(
+    name = "v41_fst_file_pool_test",
+    srcs = ["v41_fst_file_pool_test.py"],
+    deps = [":new_loader_core", "//rtp_llm:fastsafetensors"],
+    env = {"FASTSAFETENSORS_NOGDS": "1"},
+    tags = ["SM100_ARM_CU13"],
+    exec_properties = {"gpu": "SM100_ARM_CU13", "gpu_count": "1"},
+    target_compatible_with = select({
+        "@//:using_cuda13_arm": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
+py_test(
     name = "fst_host_backend_test",
     srcs = ["fst_host_backend_test.py"],
     deps = [":new_loader_core"],
@@ -174,6 +187,7 @@ py_library(
         "registry.py",
         "runtime_weight_update.py",
         "v41_fst_memory.py",
+        "v41_fst_file_pool.py",
         "weight_mapper.py",
     ],
     deps = [

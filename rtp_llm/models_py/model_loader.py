@@ -2156,6 +2156,15 @@ class NewModelLoader:
         use_nogds, use_shm = NewModelLoader._fastsafetensors_backend_options(
             target_device, checkpoint_files
         )
+        from rtp_llm.models_py.v41_fst_file_pool import v41_file_staging_loader
+
+        ParallelLoader = v41_file_staging_loader(
+            ParallelLoader,
+            self._model_type(),
+            torch.device(loader_device),
+            cuda_backend=self._accelerator_backend_name(),
+            use_shm=use_shm,
+        )
         bbuf_size_kb = NewModelLoader._fastsafetensors_bbuf_size_kb(
             checkpoint_files, use_host_staging=use_nogds or use_shm
         )
