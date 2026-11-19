@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import time
+import weakref
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -62,6 +63,94 @@ def _namespace_pids():
 
 
 class V4FstTrace:
+    _wo_a_key = "layers.0.attn.wo_a.scale"
+
+    def bind_wo_a_route(self, model, catalog, selected_files):
+        """Fenced smoke only: independent CPU oracle for the one failing leaf."""
+        from safetensors import safe_open
+
+        selected = {os.path.realpath(p) for p in selected_files}
+        paths = [
+            p for k, p in catalog.entries
+            if k == self._wo_a_key and os.path.realpath(p) in selected
+        ]
+        modules = [
+            m for m in model.modules()
+            if type(m).__name__ == "AttentionFP8" and m._checkpoint_owned
+            and m.layer_id == 0
+        ]
+        if len(paths) != 1 or len(modules) != 1:
+            raise RuntimeError("V4FST ambiguous layer 0 wo_a scale route")
+        module = modules[0]
+        owner = module.wo_a_s
+        if (
+            owner.ndim != 2
+            or owner.dtype != torch.float8_e8m0fnu
+            or not 0 < owner.numel() * module.tp_size <= 1024**2
+            or not 0 <= module.tp_rank < module.tp_size
+        ):
+            raise RuntimeError("V4FST invalid layer 0 wo_a scale geometry")
+        with safe_open(paths[0], framework="pt", device="cpu") as f:
+            field = f.get_slice(self._wo_a_key)
+            rows, cols = owner.shape
+            if field.get_dtype() != "F8_E8M0" or tuple(field.get_shape()) != (
+                rows * module.tp_size, cols
+            ):
+                raise RuntimeError("V4FST invalid layer 0 wo_a source geometry")
+            self._wo_a_full = field[:].view(torch.uint8).clone()
+        start = module.tp_rank * rows
+        self._wo_a_local = self._wo_a_full[start : start + rows]
+        self._wo_a_module = weakref.ref(module)
+
+    def _wo_a_sample(self, stage, tensor, *, full=False):
+        reference = self._wo_a_full if full else self._wo_a_local
+        if tensor.dtype != torch.float8_e8m0fnu or tensor.shape != reference.shape:
+            log.error(
+                "V4FST wo_a rank=%s stage=%s geometry_mismatch dtype=%s shape=%s",
+                self.rank, stage, tensor.dtype, tuple(tensor.shape),
+            )
+            return
+        bits = tensor.detach().view(torch.uint8).cpu().reshape(-1)
+        different = (bits != reference.reshape(-1)).nonzero().flatten()
+        # Do not abort here: the file-owner rank inspects its source BEFORE
+        # broadcast, so a local raise would strand other ranks in NCCL.
+        log.info(
+            "V4FST wo_a rank=%s stage=%s dtype=%s bytes=%d mismatches=%d first_offset=%d",
+            self.rank, stage, tensor.dtype, bits.numel(), different.numel(),
+            int(different[0]) if different.numel() else -1,
+        )
+
+    def observe_wo_a_owner(self, stage):
+        self._wo_a_sample(stage, self._wo_a_module().wo_a_s)
+
+    def observe_wo_a_reader(self, file_buffer, key, spec, scatter):
+        # Same actual operations as the normal reader: never issue a second
+        # FST read (it may consume/release the file). Source only exists on
+        # the owner; non-owner ranks verify the actual collective result.
+        owner_rank, idx = file_buffer.key_to_rank_lidx[key]
+        if file_buffer.pg.rank() == owner_rank:
+            native = file_buffer.rank_loaders[owner_rank][idx].tensors[key]
+            self._wo_a_sample("native_file_buffer", native.get_raw(), full=True)
+        if scatter:
+            raw = file_buffer.get_sharded(key, spec.shard_dim)
+            self._wo_a_sample("get_sharded", raw)
+            return spec.wrap_sharded_tensor(raw)
+        raw = file_buffer.get_tensor(key)
+        self._wo_a_sample("get_tensor", raw, full=True)
+        return spec.materialize(raw)
+
+    def wo_a_dispatch(self, weights):
+        from rtp_llm.models_py.read_spec import unwrap_checkpoint_tensor
+
+        for key, value in weights:
+            if key == self._wo_a_key:
+                self._wo_a_sample("after_readspec", unwrap_checkpoint_tensor(value)[0])
+                yield key, value
+                # The model consumed this item before asking for the next one.
+                self.observe_wo_a_owner("after_dispatch")
+            else:
+                yield key, value
+
     def verify_wo_a_owners(self, model, catalog, selected_files):
         """Check the actual FST destinations before packing; never repair from CPU."""
         from safetensors import safe_open
@@ -106,6 +195,8 @@ class V4FstTrace:
                 raise RuntimeError(
                     f"V4FST wo_a reference unavailable layer={layer} reason={type(exc).__name__}"
                 ) from None
+            if layer == 0 and hasattr(self, "_wo_a_local"):
+                self.observe_wo_a_owner("before_pack")
             if not torch.equal(owner.view(torch.uint8).cpu(), source.view(torch.uint8)):
                 raise RuntimeError(
                     f"V4FST wo_a source/owner mismatch rank={self.rank} layer={layer}"

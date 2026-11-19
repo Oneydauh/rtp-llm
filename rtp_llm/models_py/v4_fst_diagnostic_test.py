@@ -36,6 +36,33 @@ class TraceTest(unittest.TestCase):
                 [AttentionFP8(source[2:].clone(), i) for i in (0, 1)]
             )
             catalog = SimpleNamespace(entries=[(k, path) for k in names])
+            trace.bind_wo_a_route(owners, catalog, [path])
+            # Source is correct, one byte changes at collective return, and
+            # the same byte reaches the sharded ReadSpec and physical owner.
+            spec = reader.ReadSpec(names[0], names[0], (4, 6),
+                                   slices=(slice(2, 4), slice(None)))
+            returned = source.clone()
+            returned.view(diag.torch.uint8)[3, 1] ^= 1
+            fb = SimpleNamespace(
+                key_to_rank_lidx={names[0]: (1, 0)},
+                pg=SimpleNamespace(rank=lambda: 1),
+                rank_loaders={1: [SimpleNamespace(tensors={
+                    names[0]: SimpleNamespace(get_raw=lambda: source)
+                })]},
+                get_tensor=mock.Mock(return_value=returned),
+            )
+            with self.assertLogs(diag.log) as route:
+                checkpoint = trace.observe_wo_a_reader(fb, names[0], spec, False)
+                for _, value in trace.wo_a_dispatch([(names[0], checkpoint)]):
+                    owners[0].wo_a_s.copy_(value.tensor)
+            fb.get_tensor.assert_called_once_with(names[0])
+            for line, stage, differences, offset in zip(route.output, (
+                "native_file_buffer", "get_tensor", "after_readspec", "after_dispatch",
+            ), (0, 1, 1, 1), (-1, 19, 7, 7), strict=True):
+                self.assertIn(f"stage={stage}", line)
+                self.assertIn(f"mismatches={differences} first_offset={offset}", line)
+                self.assertNotIn(path, line)
+            owners[0].wo_a_s.copy_(source[2:])
             with self.assertLogs(diag.log) as logs:
                 trace.verify_wo_a_owners(owners, catalog, [path])
             self.assertIn("layers=2", logs.output[-1])

@@ -354,6 +354,7 @@ def iter_read_spec_tensors(
     safetensor_slice_expander: Optional[Any] = None,
     segmented_tensor_reader=None,
     name_filter=None,
+    wo_a_trace=None,
 ) -> Iterator[Tuple[str, object]]:
     """Consume one FST file buffer using its routing/sharding primitives.
 
@@ -474,6 +475,11 @@ def iter_read_spec_tensors(
             and targets in (None, all_ranks)
             and hasattr(file_buffer, "get_sharded")
         )
+        if wo_a_trace is not None and key == wo_a_trace._wo_a_key:
+            yield read_spec.output_name, wo_a_trace.observe_wo_a_reader(
+                file_buffer, key, read_spec, can_scatter
+            )
+            continue
         if can_scatter:
             tensor = file_buffer.get_sharded(key, read_spec.shard_dim)
             yield read_spec.output_name, read_spec.wrap_sharded_tensor(tensor)
@@ -547,6 +553,7 @@ def build_read_spec_parallel_loader(
                         self.safetensor_slice_expander,
                         self.segmented_tensor_reader,
                         self.name_filter,
+                        diag if diag is not None and hasattr(diag, "_wo_a_local") else None,
                     )
                 get_tensor_time = timer.elapsed_ms
                 if diag is not None:

@@ -2589,12 +2589,20 @@ class NewModelLoader:
             model, "_rtp_checkpoint_load_plan", _CHECKPOINT_LOAD_PLAN_UNSET
         )
         model._rtp_checkpoint_load_plan = checkpoint_load_plan
+        wo_a_trace = (
+            self._v4_fst_trace if self._v4_fst_trace is not None
+            and self._v4_fst_trace.mode == "fenced" else None
+        )
+        if wo_a_trace is not None:
+            wo_a_trace.bind_wo_a_route(model, self._checkpoint_catalog(), selected_files)
         dispatch_context = (
             self._scratch_stage("checkpoint dispatch") if streamed_scratch else nullcontext()
         )
         with dispatch_context:
             try:
-                model.load_weights(weights)
+                model.load_weights(
+                    wo_a_trace.wo_a_dispatch(weights) if wo_a_trace is not None else weights
+                )
                 if staged_coordinator is not None:
                     staged_coordinator.finish()
             except ValueError as exc:
@@ -2640,6 +2648,8 @@ class NewModelLoader:
                         prepare(module)
             self._migrate_staged_modules(model, self.load_config.device)
         validate_borrowed_parameters(model, self.load_config.device)
+        if wo_a_trace is not None:
+            wo_a_trace.observe_wo_a_owner("reader_closed")
         model.to(self.load_config.device)
         self._validate_loaded_weights(model)
         if self._v4_fst_trace is None:
