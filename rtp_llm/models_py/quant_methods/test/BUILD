@@ -138,8 +138,11 @@ py_test(
         "//rtp_llm/models_py:new_weight_loader",
         "//rtp_llm/tools/convert:convert",
     ],
-    exec_properties = {"gpu": "H20"},
-    tags = ["H20"],
+    exec_properties = select({
+        "//:using_cuda13_x86": {"gpu": "H20_CU13"},
+        "//conditions:default": {"gpu": "H20"},
+    }),
+    tags = ["H20", "H20_CU13"],
 )
 
 py_test(

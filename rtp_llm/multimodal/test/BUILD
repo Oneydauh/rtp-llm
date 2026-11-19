@@ -166,8 +166,8 @@ py_test(
         ":mm_cache_test_store",
         ":process_engine_test_helpers",
     ],
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
 
 py_test(
@@ -192,8 +192,8 @@ py_test(
     name = "mm_cancellation_test",
     srcs = ["mm_cancellation_test.py"],
     deps = [":process_engine_test_helpers"],
-    exec_properties = {"gpu": "A10_CU13"},
-    tags = ["A10_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
 )
 
 py_test(

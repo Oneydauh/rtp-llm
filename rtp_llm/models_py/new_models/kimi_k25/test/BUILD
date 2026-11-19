@@ -1,8 +1,11 @@
 py_test(
     name = "test_kimi_gpu",
     srcs = ["test_kimi_gpu.py", "test_kimi_vision.py", "test_kimi_compressed.py"],
-    tags = ["H20"],
-    exec_properties = {"gpu": "H20"},
+    tags = ["H20", "H20_CU13"],
+    exec_properties = select({
+        "//:using_cuda13_x86": {"gpu": "H20_CU13"},
+        "//conditions:default": {"gpu": "H20"},
+    }),
     deps = [
         "//rtp_llm:safetensors",
         "//rtp_llm:torch",
