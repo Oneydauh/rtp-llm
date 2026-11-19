@@ -21,6 +21,7 @@ class Qwen3NextGatedDeltaNet(Qwen3NextGdnExecution, Qwen3NextGdnParameters):
         self.norm_activation = norm_activation
 
     def process_weights_after_loading(self):
+        self._prepare_input_projection()
         # Scratch may stage on CPU; take kernel views only after migration.
         state = Qwen3NextGdnStateParameters(
             self.conv1d_w.detach(), self.dt_bias.detach(), self.a_log.detach()
@@ -39,6 +40,4 @@ class Qwen3NextGatedDeltaNet(Qwen3NextGdnExecution, Qwen3NextGdnParameters):
         )
 
     def _input_project(self, hidden_states):
-        return self.in_proj_qkvz(hidden_states), torch.mm(
-            hidden_states, self.in_proj_ba_w
-        )
+        return Qwen3NextGdnParameters._input_project(self, hidden_states)

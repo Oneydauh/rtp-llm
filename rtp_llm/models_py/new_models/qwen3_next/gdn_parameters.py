@@ -224,6 +224,68 @@ class Qwen3NextGdnParameters(RtpModule):
         self._qkvz_split_parts: Dict[str, Set[str]] = {}
         self._ba_layout: Optional[str] = None
         self._ba_split_parts: Set[str] = set()
+        self._input_projection_packed = False
+
+    def _packed_input_weight(self):
+        """Return the live [QKVZ+BA,K] view, never a cached copy of a parameter."""
+        if not self._input_projection_packed:
+            return None
+        q, ba = self.in_proj_qkvz.weight, self.in_proj_ba_w
+        width = self.qkvz_size + self.ba_size
+        # Moving/replacing individual parameters can break a storage alias.
+        # Never read a stale BA suffix after such a move.
+        if not (
+            q.device == ba.device
+            and q.dtype == ba.dtype
+            and q.stride() == (1, width)
+            and ba.stride() == (width, 1)
+            and q.storage_offset() == 0
+            and ba.storage_offset() == self.qkvz_size
+            and q.untyped_storage().data_ptr() == ba.untyped_storage().data_ptr()
+        ):
+            return None
+        return q.as_strided((width, self.hidden_size), (1, width))
+
+    @torch.no_grad()
+    def _pack_dense_input_projection(self):
+        proj = self.in_proj_qkvz
+        if self._packed_input_weight() is not None:
+            return
+        # Finalize the child before handing it a view into its parent's GEMM.
+        # The normal model post-load walk may finalize the child again.
+        proj.process_weights_after_loading()
+        full_kn = torch.cat((proj.weight.T, self.in_proj_ba_w), dim=1)
+        # Keep the registered objects (and all writes through them) authoritative.
+        proj.weight.set_(full_kn[:, : self.qkvz_size].T)
+        self.in_proj_ba_w.set_(full_kn[:, self.qkvz_size :])
+        self._input_projection_packed = True
+
+    def _prepare_input_projection(self):
+        from rtp_llm.models_py.quant_methods.unquantized import UnquantizedLinearMethod
+
+        proj = self.in_proj_qkvz
+        if (
+            torch.version.cuda is not None
+            and torch.version.hip is None
+            and self.in_proj_ba_w.is_cuda
+            and self.in_proj_ba_w.dtype == torch.bfloat16
+            and isinstance(proj.quant_method, UnquantizedLinearMethod)
+            and proj.quant_config.quant_type == "modelopt_fp4"
+            and getattr(proj.quant_config.source_config, "mixed_attention", False)
+        ):
+            self._pack_dense_input_projection()
+
+    def _input_project(self, hidden_states):
+        proj = self.in_proj_qkvz
+        weight = self._packed_input_weight()
+        if (
+            weight is not None
+            and not proj._forward_hooks
+            and not proj._forward_pre_hooks
+        ):
+            fused = torch.nn.functional.linear(hidden_states, weight)
+            return fused.split((self.qkvz_size, self.ba_size), dim=-1)
+        return proj(hidden_states), torch.mm(hidden_states, self.in_proj_ba_w)
 
     def validate_runtime_device(self, device: torch.device) -> None:
         if device.type != "cuda":

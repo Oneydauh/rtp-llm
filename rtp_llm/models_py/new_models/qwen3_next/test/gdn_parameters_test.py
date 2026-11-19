@@ -16,6 +16,98 @@ from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 
 
 class GdnOwnershipTest(unittest.TestCase):
+    def test_rank_local_input_projection_matches_one_gemm_after_reload(self):
+        # Same rank-local K,N layout as the CUDA mixed-attention reference.
+        # Exercise checkpoint dispatch first, rather than constructing packed views
+        # by hand. Include both replicated (DP) and sharded (TP) attention.
+        devices = ["cpu"]
+        if torch.cuda.is_available() and torch.version.hip is None:
+            devices.append("cuda")
+        config = SimpleNamespace(
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_num_key_heads=2,
+            linear_num_value_heads=4,
+            linear_conv_kernel_dim=3,
+        )
+        quant = QuantizationConfig(
+            "modelopt_fp4", source_config=SimpleNamespace(mixed_attention=True)
+        )
+        gen = torch.Generator().manual_seed(43)
+
+        def rand(n):
+            return torch.randn(n, 256, generator=gen).bfloat16()
+
+        parts = [rand(n) for n in (16, 16, 32, 32, 4, 4)]
+        q, k, v, z, b, a = parts
+        state = {
+            "in_proj_qkv.weight": torch.cat((q, k, v)),
+            "in_proj_z.weight": z,
+            "in_proj_b.weight": b,
+            "in_proj_a.weight": a,
+        }
+        for tp, rank in ((1, 0), (2, 0), (2, 1)):
+            for device in devices:
+                with self.subTest(tp=tp, rank=rank, device=device):
+                    m = Qwen3NextGdnParameters(
+                        config,
+                        256,
+                        1e-6,
+                        tp,
+                        rank,
+                        torch.bfloat16,
+                        quant,
+                        "linear_attn",
+                    ).to(device)
+                    m.load_weights(state)
+                    q_param, ba_param = m.in_proj_qkvz.weight, m.in_proj_ba_w
+                    m._prepare_input_projection()
+                    if device == "cpu":
+                        self.assertIsNone(m._packed_input_weight())
+                        m._pack_dense_input_projection()  # storage protocol on CPU
+                    expected = (
+                        torch.cat([t.chunk(tp)[rank] for t in parts])
+                        .T.contiguous()
+                        .T.to(device)
+                    )
+                    self.assertEqual(
+                        expected.stride(), m._packed_input_weight().stride()
+                    )
+                    self.assertTrue(torch.equal(expected, m._packed_input_weight()))
+                    self.assertIs(m.in_proj_qkvz.weight, q_param)
+                    self.assertIs(m.in_proj_ba_w, ba_param)
+                    ptr = ba_param.untyped_storage().data_ptr()
+                    self.assertEqual(ptr, q_param.untyped_storage().data_ptr())
+                    m._pack_dense_input_projection()
+                    self.assertEqual(
+                        ptr, m._packed_input_weight().untyped_storage().data_ptr()
+                    )
+                    for rows in (1, 3, 31):
+                        x = rand(rows).to(device)
+                        actual = torch.cat(m._input_project(x), dim=-1)
+                        self.assertTrue(
+                            torch.equal(actual, torch.nn.functional.linear(x, expected))
+                        )
+                    if device == "cuda":
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            captured = torch.cat(m._input_project(x), dim=-1)
+                        x.copy_(rand(x.size(0)).to(device))
+                        graph.replay()
+                        self.assertTrue(
+                            torch.equal(
+                                captured, torch.nn.functional.linear(x, expected)
+                            )
+                        )
+                    # Existing registered views remain update destinations.
+                    with torch.no_grad():
+                        ba_param.zero_()
+                    self.assertEqual(m._input_project(x)[1].count_nonzero().item(), 0)
+                    m.in_proj_ba_w = torch.nn.Parameter(
+                        torch.ones_like(ba_param), requires_grad=False
+                    )
+                    self.assertIsNone(m._packed_input_weight())
+
     def model(self, rank):
         config = SimpleNamespace(
             linear_key_head_dim=2,
