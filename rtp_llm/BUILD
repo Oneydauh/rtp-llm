@@ -452,12 +452,18 @@ py_library(
 )
 
 py_library(
+    name = "server_config",
+    srcs = ["config/server_config.py"],
+)
+
+py_library(
     name = "config",
     srcs = glob([
         "config/*.py",
         "config/**/*.py",
-    ]),
+    ], exclude = ["config/server_config.py"]),
     deps = [
+        ":server_config",
         ":ops",
         ":pydantic",
         # server_config_setup resolves model types through ModelDict.

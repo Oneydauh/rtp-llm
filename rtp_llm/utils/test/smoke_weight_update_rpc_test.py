@@ -2,7 +2,7 @@ import unittest
 
 import grpc
 
-from rtp_llm.config.py_config_modules import ServerConfig
+from rtp_llm.config.server_config import ServerConfig
 from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2 as pb
 from rtp_llm.cpp.model_rpc.proto import model_rpc_service_pb2_grpc as rpc
 from rtp_llm.utils.test.smoke_weight_update_rpc import (

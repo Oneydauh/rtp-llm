@@ -109,7 +109,7 @@ py_test(
     deps = [
         ":grpcio",
         ":smoke_weight_update_rpc",
-        "//rtp_llm:config",
+        "//rtp_llm:server_config",
         "//rtp_llm/cpp/model_rpc/proto:model_rpc_service_py_proto",
     ],
 )
