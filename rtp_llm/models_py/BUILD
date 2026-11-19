@@ -785,6 +785,16 @@ py_test(
 )
 
 py_test(
+    name = "v4_wo_a_layout_test",
+    srcs = [
+        "modules/dsv4/fp8/_wo_a_layout.py",
+        "v4_wo_a_layout_test.py",
+    ],
+    main = "v4_wo_a_layout_test.py",
+    deps = ["//rtp_llm:torch"],
+)
+
+py_test(
     name = "owner_migration_checkpoint_test",
     srcs = ["owner_migration_checkpoint_test.py"],
     deps = [":new_weight_loader"],

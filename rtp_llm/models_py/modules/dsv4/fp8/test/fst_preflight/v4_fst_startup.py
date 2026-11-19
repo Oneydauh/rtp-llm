@@ -119,7 +119,37 @@ def exercise(device, directory, mode):
         )
         assert weight.data_ptr() == owner["wo_a.weight"].data_ptr()
         assert scale.dtype == torch.int32
+        words = width // 512
+        assert scale.shape == (groups, rank, words)
+        assert scale.stride() == (rank * words, 1, rank)
         assert torch.equal(scale.cpu().contiguous().view(torch.uint8), expected)
+    if mode == "fenced":
+        # Independent finite synthetic input, known to run the v2.6 SM100
+        # pack kernel on this isolated fixture. Compare the actual kernel's
+        # result and storage contract, not just our own byte oracle.
+        from deep_gemm.utils.layout import get_mn_major_tma_aligned_packed_ue8m0_tensor
+
+        with stage("native-ue8m0-layout-reference", device):
+            grid = (
+                owner["wo_a.scale"].float().reshape(groups, rank // 128, width // 128)
+            )
+            native = get_mn_major_tma_aligned_packed_ue8m0_tensor(
+                grid.repeat_interleave(128, dim=1)
+            )
+            assert native.dtype == scale.dtype and native.stride() == scale.stride()
+            assert torch.equal(native, scale)
+        with stage("native-ue8m0-exponent-edges", device):
+            # Compare all encodings against the pinned native implementation
+            # (not just our byte oracle), including E8M0(0) = 2**-127 and
+            # E8M0(255) = NaN. Keep padding out of the compared logical data.
+            probe = torch.arange(grid.numel(), device=device).to(torch.uint8)
+            probe = probe.reshape_as(owner["wo_a.scale"]).view(torch.float8_e8m0fnu)
+            _, direct = _prepare_wo_a_stacked(
+                owner["wo_a.weight"], probe, groups, rank, width
+            )
+            probe_fp32 = probe.float().reshape_as(grid).repeat_interleave(128, dim=1)
+            native = get_mn_major_tma_aligned_packed_ue8m0_tensor(probe_fp32)
+            assert native.stride() == direct.stride() and torch.equal(native, direct)
     # Isolate the original H2D site with the actual rotary implementation.
     # A short context is enough to exercise the copy, not to test HBM limits.
     with stage("rope-table-cpu-to-device", device):
