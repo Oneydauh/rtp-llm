@@ -14,6 +14,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -250,11 +251,19 @@ class JitCacheSmokeTest(unittest.TestCase):
             logging.warning("model probe failed; using %s", model_type, exc_info=True)
             return model_type
 
-    def _exercise(self, config: SmokeConfig, model_path: str, model: str) -> None:
+    def _exercise(
+        self,
+        config: SmokeConfig,
+        model_path: str,
+        model: str,
+        record_artifacts: Callable[[str], None] | None = None,
+    ) -> None:
         if config.cuda_ipc_weight_update:
             _send_cuda_ipc_weight_update(
                 self.server, model_path, self._budget(WEIGHT_UPDATE_TIMEOUT_S)
             )
+            if record_artifacts is not None:
+                record_artifacts("after_ipc")
         for words, max_tokens in REQUESTS:
             try:
                 _send_request(
@@ -269,6 +278,8 @@ class JitCacheSmokeTest(unittest.TestCase):
                 # so echo the engine tail into the always-captured stdout log.
                 self._dump_server_logs()
                 raise
+            if record_artifacts is not None:
+                record_artifacts(f"after_request_{words}w_{max_tokens}t")
 
     def _log_candidates(self) -> list[Path]:
         work_dir = Path(os.environ.get("MAGA_SERVER_WORK_DIR", ""))
@@ -425,6 +436,15 @@ class JitCacheSmokeTest(unittest.TestCase):
             raise unittest.SkipTest(f"shared ACL unavailable: {error}") from error
         self.scope = self._resolve_scope()
         local_scope_root = self.scope.root
+        # SM9x's grouped FP8 kernel can first appear or change at several
+        # distinct stages. Retain file metadata only; no cache mutation, no
+        # extra requests, and no change to the binary reuse assertion.
+        history: dict[str, State] = {}
+
+        def record_artifacts(stage: str) -> None:
+            history[stage] = self._artifacts(local_scope_root)
+
+        trace = record_artifacts if config is CUDA_CONFIG else None
         remote_scope = Path(remote) / jit.RTP_JIT_VERSION / self.scope.scope_id
         previous = set(remote_scope.glob(f"*{store.SNAPSHOT_SUFFIX}"))
 
@@ -440,6 +460,8 @@ class JitCacheSmokeTest(unittest.TestCase):
             )
             try:
                 self._exercise(config, model_path, model)
+                if trace is not None:
+                    trace("producer_after_requests")
                 probe_name, probe_payload = self._create_probe(config)
                 remote_state = self._wait_for_snapshot(
                     remote_scope, previous, probe_name, probe_payload
@@ -470,19 +492,29 @@ class JitCacheSmokeTest(unittest.TestCase):
                 any("JIT_CACHE_RESTORED" in line for line in self._server_log_lines()),
                 "second server did not restore from the remote snapshot",
             )
+            restored = self._artifacts(local_scope_root)
+            if trace is not None:
+                history.update(published=remote_artifacts, restored_at_ready=restored)
             self.assertLessEqual(
                 set(remote_artifacts.items()),
-                set(self._artifacts(local_scope_root).items()),
+                set(restored.items()),
                 "restore did not reproduce the published binaries",
             )
-            self._exercise(config, model_path, model)
-            recompiled = set(self._artifacts(local_scope_root).items()) - set(
-                remote_artifacts.items()
-            )
+            self._exercise(config, model_path, model, record_artifacts=trace)
+            final = self._artifacts(local_scope_root)
+            recompiled = set(final.items()) - set(remote_artifacts.items())
+            details = ""
+            if recompiled and trace is not None:
+                history["final"] = final
+                changed = {
+                    name: {stage: state.get(name) for stage, state in history.items()}
+                    for name, _ in sorted(recompiled)[:20]
+                }
+                details = f"; per-stage (size, mtime_ns), None=absent: {changed}"
             self.assertFalse(
                 recompiled,
                 f"restored tree recompiled instead of reusing cache: "
-                f"{sorted(recompiled)[:20]}",
+                f"{sorted(recompiled)[:20]}{details}",
             )
         finally:
             self._stop_server()
