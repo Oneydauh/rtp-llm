@@ -18,7 +18,7 @@ _FIXTURES = {
 def approve(kind, body):
     """Only a Bazel test can authorize an exact fixture; request fields cannot opt in."""
     root = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR", "")
-    target = os.environ.get("TEST_TARGET", "")
+    target = os.environ.get("TEST_TARGET", "").removesuffix("_sample_diag")
     if (os.environ.get("RTP_NEXT_SMOKE_PREFIX") != "1"
             or target not in _TARGETS or not os.path.isabs(root)):
         return None
@@ -42,6 +42,26 @@ def approve(kind, body):
     return Path(root) / ("next-prefix-v1-" + kind + ".json")
 
 
+def authorize(path, request_id, slots):
+    """Private worker rendezvous: only exact HTTP fixtures can enable native sampling."""
+    if (path is None or os.environ.get("RTP_NEXT_SAMPLER_DIAGNOSTIC") != "1"
+            or not os.environ.get("TEST_TARGET", "").endswith("_sample_diag")
+            or type(request_id) != int or not 0 <= request_id < 2**63):
+        return
+    root = os.environ.get("TEST_TMPDIR", "")
+    if not os.path.isabs(root):
+        return
+    for offset, slot in enumerate(slots):
+        # This private temporary worker directory is not an artifact. Marker
+        # names do not contain raw request IDs; their contents contain only a slot.
+        tag = ((request_id + offset) * 11400714819323198485) % (2**64)
+        try:
+            with (Path(root) / ("next-smoke-auth-" + str(tag))).open("x") as f:
+                f.write(str(slot))
+        except OSError:
+            return
+
+
 def _row(t):
     # The frontend has already decoded this terminal CPU tensor. No device
     # transfer, model-side flags, logits, re-tokenization or hooks into sampling.
@@ -63,7 +83,7 @@ def capture(path, responses):
     """Write terminal-prefix digests only, never fail or change the request."""
     if (not isinstance(path, Path)
             or os.environ.get("RTP_NEXT_SMOKE_PREFIX") != "1"
-            or os.environ.get("TEST_TARGET") not in _TARGETS):
+            or os.environ.get("TEST_TARGET", "").removesuffix("_sample_diag") not in _TARGETS):
         return
     try:
         rows = []
