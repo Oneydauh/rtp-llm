@@ -41,6 +41,13 @@ def fixture():
 def worker(world_rank, directory, mode):
     device = torch.device("cuda", world_rank)
     torch.cuda.set_device(device)
+    if mode == "fenced":
+        # Check the effective allocator in both workers, not just Bazel's
+        # parent environment. The actual production reader is constructed in
+        # exercise(); do not patch or call an alternative copier in this test.
+        settings = torch.cuda.memory._snapshot()["allocator_settings"]
+        if not settings["expandable_segments"]:
+            raise AssertionError("V4 fenced prefill requires expandable segments")
     torch.distributed.init_process_group(
         "nccl",
         rank=world_rank,
