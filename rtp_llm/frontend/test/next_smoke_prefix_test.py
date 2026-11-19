@@ -75,6 +75,19 @@ class NextPrefixTest(unittest.TestCase):
                   torch.arange(21).reshape(1, 21), torch.tensor([[-1]])):
             self.assertIsNone(audit._row(t))
 
+    def test_request_cannot_provide_internal_capture_file(self):
+        injected = str(self.path / "attacker-chosen.json")
+        bodies = ({**self.single, "_next_fixture_prefix_file": injected},
+                  {**self.single, "generate_config": {**self.single["generate_config"],
+                                                      "_next_fixture_prefix_file": injected}})
+        for body in bodies:
+            self.assertIsNone(audit.approve("single", body))
+        with patch.object(audit, "_row", side_effect=AssertionError("must not inspect tokens")):
+            audit.capture(injected, [self.response([1])])  # JSON cannot transmit a Path.
+            with patch.dict(os.environ, TEST_TARGET="//an/unrelated:target"):
+                audit.capture(Path(injected), [self.response([1])])
+            self.assertFalse(Path(injected).exists())
+
 
 if __name__ == "__main__":
     unittest.main()
