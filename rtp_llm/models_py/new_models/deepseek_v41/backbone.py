@@ -60,6 +60,7 @@ class OwnedV41Block(RtpModule):
     attention_type = OwnedV41Attention
     commit_attention_type = OwnedV41CommitAttention
     hc_type = OwnedDelayedHC
+    norm_type = RMSNorm
 
     def __init__(self, args, layer_id, shared_attention, *, checkpoint_path=None):
         RtpModule.__init__(self)
@@ -101,8 +102,8 @@ class OwnedV41Block(RtpModule):
             shared_fp8_block_size=32,
             has_vision_router_bias=layer_id in vision_layers,
         )
-        self.attn_norm = RMSNorm(args.dim, args.norm_eps, torch.bfloat16)
-        self.ffn_norm = RMSNorm(args.dim, args.norm_eps, torch.bfloat16)
+        self.attn_norm = self.norm_type(args.dim, args.norm_eps, torch.bfloat16)
+        self.ffn_norm = self.norm_type(args.dim, args.norm_eps, torch.bfloat16)
         self.attn_hc = self.hc_type(args, layer_id, "attn")
         self.ffn_hc = self.hc_type(args, layer_id, "ffn")
         # Engram is populated by the layer-local host source loader after
@@ -112,6 +113,7 @@ class OwnedV41Block(RtpModule):
 class OwnedV41Transformer(RtpModule):
     block_type = OwnedV41Block
     head_type = _HeadReference
+    norm_type = RMSNorm
 
     def __init__(
         self,
@@ -203,7 +205,7 @@ class OwnedV41Transformer(RtpModule):
             tp_rank=args.embedding_tp_rank,
             dtype=torch.bfloat16,
         )
-        self.norm = RMSNorm(args.dim, args.norm_eps, torch.bfloat16)
+        self.norm = self.norm_type(args.dim, args.norm_eps, torch.bfloat16)
         self.head = OwnedV41Matrix(
             args.vocab_size,
             args.dim,
@@ -243,6 +245,38 @@ class OwnedV41Transformer(RtpModule):
         RtpModule.load_weights(self, self.WEIGHTS_MAPPER.apply(items))
 
 
+def _checkpoint_native_hc(args, layer_id, name):
+    from rtp_llm.models_py.modules.dsv41.hc.delayed import DelayedHCUnit
+
+    # Use the exact executor: its type is part of the mega_mhc and decode
+    # transition contract. Register its final contiguous views as the direct
+    # checkpoint destinations. No second tensor set or post-load copy.
+    width = args.hc_mult * (args.hc_mult + 2)
+    unit = DelayedHCUnit(
+        torch.empty(width, args.hc_mult * args.dim, dtype=torch.float32),
+        torch.empty(width, dtype=torch.float32),
+        torch.empty(3, dtype=torch.float32),
+        dim=args.dim,
+        hc_mult=args.hc_mult,
+        hc_sinkhorn_iters=args.hc_sinkhorn_iters,
+        norm_eps=args.norm_eps,
+        hc_eps=args.hc_eps,
+        layer_id=layer_id,
+        name=name,
+    )
+    for key in ("fn", "base", "scale"):
+        setattr(unit, key, nn.Parameter(getattr(unit, key), requires_grad=False))
+    return unit
+
+
+def _checkpoint_cuda_norm(dim, eps, dtype):
+    from rtp_llm.models_py.modules.base.cuda.norm import RMSNorm as CudaRMSNorm
+
+    return CudaRMSNorm(
+        nn.Parameter(torch.empty(dim, dtype=dtype), requires_grad=False), eps
+    )
+
+
 def runtime_backbone_class():
     """Compose the real main runtime only for production construction.
 
@@ -254,7 +288,7 @@ def runtime_backbone_class():
     from rtp_llm.models_py.modules.dsv41.fp8.attention_v41_commit import (
         CommitOnlyAttentionV41FP8,
     )
-    from rtp_llm.models_py.modules.dsv41.hc.delayed import DelayedHCHead, DelayedHCUnit
+    from rtp_llm.models_py.modules.dsv41.hc.delayed import DelayedHCHead
     from rtp_llm.models_py.modules.dsv41.transformer import V4Transformer
 
     class RuntimeAttention(AttentionV41FP8, OwnedV41Attention):
@@ -265,18 +299,18 @@ def runtime_backbone_class():
         __init__ = OwnedV41CommitAttention.__init__
         load_weights = OwnedV41CommitAttention.load_weights
 
-    class RuntimeHC(DelayedHCUnit, OwnedDelayedHC):
-        __init__ = OwnedDelayedHC.__init__
-
     class RuntimeBlock(Block, OwnedV41Block):
         __init__ = OwnedV41Block.__init__
+        _dsv41_native_decode_block = Block
         attention_type = RuntimeAttention
         commit_attention_type = RuntimeCommitAttention
-        hc_type = RuntimeHC
+        hc_type = staticmethod(_checkpoint_native_hc)
+        norm_type = staticmethod(_checkpoint_cuda_norm)
 
     class RuntimeTransformer(V4Transformer, OwnedV41Transformer):
         __init__ = OwnedV41Transformer.__init__
         block_type = RuntimeBlock
         head_type = DelayedHCHead
+        norm_type = staticmethod(_checkpoint_cuda_norm)
 
     return RuntimeTransformer

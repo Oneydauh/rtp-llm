@@ -144,6 +144,53 @@ def checkpoint(commit=False, layer_prefix="layers"):
 
 
 class BackboneCheckpointTest(unittest.TestCase):
+    def test_native_hc_checkpoint_owners_preserve_fused_seam(self):
+        from safetensors import safe_open
+
+        from rtp_llm.models_py.module_base import RtpModule
+        from rtp_llm.models_py.modules.base.cuda.norm import RMSNorm
+        from rtp_llm.models_py.modules.dsv41.hc.delayed import DelayedHCUnit
+        from rtp_llm.models_py.modules.dsv41.hc.v41_jit_warmup import (
+            _collect_v41_hc_configs,
+        )
+        from rtp_llm.models_py.new_models.deepseek_v41.backbone import (
+            _checkpoint_cuda_norm,
+            _checkpoint_native_hc,
+        )
+
+        config = args()
+        config.dim, config.hc_mult = 5120, 4
+        block = RtpModule()
+        block.attn_hc = _checkpoint_native_hc(config, 0, "attn")
+        block.ffn_hc = _checkpoint_native_hc(config, 0, "ffn")
+        block.ffn_hc.set_previous(block.attn_hc)
+        block.ffn_norm = _checkpoint_cuda_norm(
+            config.dim, config.norm_eps, torch.bfloat16
+        )
+        self.assertIs(type(block.ffn_hc), DelayedHCUnit)
+        self.assertIs(type(block.ffn_norm), RMSNorm)
+        before = {k: id(p) for k, p in block.named_parameters()}
+        weights = {
+            k: torch.full_like(p, i + 1)
+            for i, (k, p) in enumerate(block.named_parameters())
+        }
+        self.assertEqual(len(weights), 7)
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "model.safetensors")
+            save_file(weights, path)
+            with safe_open(path, framework="pt", device="cpu") as checkpoint_file:
+                block.load_weights(
+                    (k, checkpoint_file.get_tensor(k)) for k in checkpoint_file.keys()
+                )
+        for k, p in block.named_parameters():
+            self.assertEqual(id(p), before[k])
+            self.assertTrue(torch.equal(p, weights[k]))
+        units, seams = _collect_v41_hc_configs(block)
+        self.assertEqual((len(units), len(seams)), (1, 1))
+        self.assertEqual(
+            next(iter(seams.values())), (block.attn_hc, block.ffn_hc, block.ffn_norm)
+        )
+
     def load(self, values, rank=0, commit=False, vision=False, native_fst=False):
         config = args(rank, commit)
         config.embedding_tp_size, config.embedding_tp_rank = 2, rank
