@@ -40,6 +40,7 @@ except Exception as e:
 
 
 class Qwen3_5MoeImageEmbedding(Qwen3_VLImageEmbedding):
+    _newloader_rotary_tower = Qwen3_5MoeVisionModel
     image_processor_class = Qwen2VLImageProcessor
 
     def __init__(self, mm_related_params: VitParameters):

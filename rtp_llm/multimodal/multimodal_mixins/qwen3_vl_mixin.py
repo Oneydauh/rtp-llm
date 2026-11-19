@@ -52,6 +52,8 @@ if not hasattr(tl, "wrap_triton"):
 
 
 class Qwen3_VLImageEmbedding(Qwen2_5_VLImageEmbedding):
+    _newloader_rotary_tower = Qwen3VLVisionModel
+
     def __init__(self, mm_related_params: VitParameters):
         self.mm_processor = AutoProcessor.from_pretrained(
             mm_related_params.config["ckpt_path"]
@@ -67,8 +69,8 @@ class Qwen3_VLImageEmbedding(Qwen2_5_VLImageEmbedding):
         self.spatial_merge_size = self.visual.spatial_merge_size
 
     def prepare_newloader_runtime_buffers(self, device):
-        # Derived embeddings (e.g. Qwen3.5) construct different vision classes.
-        if not isinstance(self.visual, Qwen3VLVisionModel):
+        # Only explicitly opted-in towers share this rotary constructor.
+        if not isinstance(self.visual, self._newloader_rotary_tower):
             return
         target = torch.device(device)
         if target.type == "cuda" and target.index is None:
