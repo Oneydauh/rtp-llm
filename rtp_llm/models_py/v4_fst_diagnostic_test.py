@@ -13,6 +13,41 @@ from rtp_llm.models_py import v4_fst_diagnostic as diag
 
 
 class TraceTest(unittest.TestCase):
+
+    def test_fenced_wo_a_audit_compares_selected_tp_rows_and_never_repairs(self):
+        from safetensors.torch import save_file
+
+        class AttentionFP8(diag.torch.nn.Module):
+            def __init__(self, value, layer):
+                super().__init__()
+                self._checkpoint_owned = True
+                self.layer_id, self.tp_size, self.tp_rank = layer, 2, 1
+                self.wo_a_s = value
+
+        trace = diag.V4FstTrace("fenced", 1, "cpu")
+        source = diag.torch.arange(24, dtype=diag.torch.uint8).reshape(4, 6)
+        module_type = diag.torch.float8_e8m0fnu
+        source = source.view(module_type)
+        with tempfile.TemporaryDirectory() as d:
+            path = str(Path(d) / "selected.safetensors")
+            names = [f"layers.{i}.attn.wo_a.scale" for i in (0, 1)]
+            save_file({k: source.clone() for k in names}, path)
+            owners = diag.torch.nn.ModuleList(
+                [AttentionFP8(source[2:].clone(), i) for i in (0, 1)]
+            )
+            catalog = SimpleNamespace(entries=[(k, path) for k in names])
+            with self.assertLogs(diag.log) as logs:
+                trace.verify_wo_a_owners(owners, catalog, [path])
+            self.assertIn("layers=2", logs.output[-1])
+            owners[1].wo_a_s.view(diag.torch.uint8)[0, 0] ^= 1
+            with self.assertRaisesRegex(RuntimeError, "mismatch rank=1 layer=1"):
+                trace.verify_wo_a_owners(owners, catalog, [path])
+            self.assertNotEqual(
+                owners[1].wo_a_s.view(diag.torch.uint8)[0, 0].item(), 12
+            )
+            with self.assertRaisesRegex(RuntimeError, "audit input"):
+                trace.verify_wo_a_owners(owners, catalog, [])
+
     def test_read_failure_logs_rank_batch_and_ordinal_without_payload(self):
         trace = diag.V4FstTrace("trace", 1, "cpu")
         failure = RuntimeError("private error")

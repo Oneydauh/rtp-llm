@@ -139,15 +139,25 @@ def exercise(device, directory, mode):
             assert native.dtype == scale.dtype and native.stride() == scale.stride()
             assert torch.equal(native, scale)
         with stage("native-ue8m0-exponent-edges", device):
-            # Compare all encodings against the pinned native implementation
-            # (not just our byte oracle), including E8M0(0) = 2**-127 and
-            # E8M0(255) = NaN. Keep padding out of the compared logical data.
+            # The pinned CUDA packer asserts FP32 scales have a zero sign
+            # and mantissa. Probe all 256 checkpoint bytes with our raw
+            # layout, but compare *only* normalized powers to the native
+            # packer; 0 decodes to a subnormal and 255 decodes to NaN.
             probe = torch.arange(grid.numel(), device=device).to(torch.uint8)
             probe = probe.reshape_as(owner["wo_a.scale"]).view(torch.float8_e8m0fnu)
             _, direct = _prepare_wo_a_stacked(
                 owner["wo_a.weight"], probe, groups, rank, width
             )
-            probe_fp32 = probe.float().reshape_as(grid).repeat_interleave(128, dim=1)
+            direct_bytes = direct.contiguous().view(torch.uint8)
+            probe_bytes = (
+                probe.view(torch.uint8).reshape_as(grid).repeat_interleave(128, dim=1)
+            )
+            assert torch.equal(direct_bytes, probe_bytes)
+            finite = probe.view(torch.uint8).clamp(1, 254).view(torch.float8_e8m0fnu)
+            _, direct = _prepare_wo_a_stacked(
+                owner["wo_a.weight"], finite, groups, rank, width
+            )
+            probe_fp32 = finite.float().reshape_as(grid).repeat_interleave(128, dim=1)
             native = get_mn_major_tma_aligned_packed_ue8m0_tensor(probe_fp32)
             assert native.stride() == direct.stride() and torch.equal(native, direct)
     # Isolate the original H2D site with the actual rotary implementation.

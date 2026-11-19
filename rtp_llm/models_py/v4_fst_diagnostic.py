@@ -62,6 +62,61 @@ def _namespace_pids():
 
 
 class V4FstTrace:
+    def verify_wo_a_owners(self, model, catalog, selected_files):
+        """Check the actual FST destinations before packing; never repair from CPU."""
+        from safetensors import safe_open
+
+        selected = {os.path.realpath(p) for p in selected_files}
+        sources = {}
+        for key, path in catalog.entries:
+            if re.fullmatch(r"layers\.\d+\.attn\.wo_a\.scale", key):
+                path = os.path.realpath(path)
+                if path in selected:
+                    sources.setdefault(key, []).append(path)
+        checked = 0
+        for module in model.modules():
+            if type(module).__name__ != "AttentionFP8" or not module._checkpoint_owned:
+                continue
+            layer = module.layer_id
+            paths = sources.get(f"layers.{layer}.attn.wo_a.scale", ())
+            owner = module.wo_a_s.detach()
+            if (
+                len(paths) != 1
+                or owner.ndim != 2
+                or owner.dtype != torch.float8_e8m0fnu
+                or not 0 < owner.numel() <= 1024**2
+            ):
+                raise RuntimeError(f"V4FST invalid wo_a audit input layer={layer}")
+            rows, cols = owner.shape
+            tp, rank = module.tp_size, module.tp_rank
+            if not 0 <= rank < tp:
+                raise RuntimeError(f"V4FST invalid wo_a owner rank layer={layer}")
+            # All checkpoint names here come from the same selected FST
+            # manifest. Read just this owner's rows, not an entire shard.
+            try:
+                with safe_open(paths[0], framework="pt", device="cpu") as f:
+                    field = f.get_slice(f"layers.{layer}.attn.wo_a.scale")
+                    if field.get_dtype() != "F8_E8M0" or tuple(field.get_shape()) != (
+                        tp * rows,
+                        cols,
+                    ):
+                        raise ValueError("incompatible source")
+                    source = field[rank * rows : (rank + 1) * rows]
+            except Exception as exc:
+                raise RuntimeError(
+                    f"V4FST wo_a reference unavailable layer={layer} reason={type(exc).__name__}"
+                ) from None
+            if not torch.equal(owner.view(torch.uint8).cpu(), source.view(torch.uint8)):
+                raise RuntimeError(
+                    f"V4FST wo_a source/owner mismatch rank={self.rank} layer={layer}"
+                )
+            checked += 1
+        if not checked:
+            raise RuntimeError("V4FST did not verify any wo_a scale owner")
+        log.info(
+            "V4FST wo_a owner/source bytes match rank=%s layers=%d", self.rank, checked
+        )
+
     def compare_bad_router(self, error, catalog_fn, selected_files):
         """Compare at most 8 MiB on the failed worker; never use it for loading."""
         if not isinstance(error, V4RouterRangeError):

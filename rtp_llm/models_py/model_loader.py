@@ -2646,6 +2646,10 @@ class NewModelLoader:
             self._run_post_load_hooks(model)
         else:
             self._v4_fst_trace.point("post_load_enter")
+            if self._v4_fst_trace.mode == "fenced":
+                self._v4_fst_trace.verify_wo_a_owners(
+                    model, self._checkpoint_catalog(), selected_files
+                )
             self._run_post_load_hooks(model, self._v4_fst_trace)
             self._v4_fst_trace.point("post_load_done")
         validate_borrowed_parameters(model)
