@@ -1,4 +1,5 @@
 import copy
+from contextlib import nullcontext
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple, Type
 
 import torch
@@ -532,12 +533,16 @@ def build_read_spec_parallel_loader(
                 self._log_message(
                     f"Batch {batch.batch_id}: tensor key len: {len(batch.keys)}"
                 )
+                key_context = (
+                    diag.watch_keys(batch.batch_id, batch.keys)
+                    if diag is not None else nullcontext(batch.keys)
+                )
                 with timing_context(
                     "get_tensor", self._log_message, batch.batch_id
-                ) as timer:
+                ) as timer, key_context as keys:
                     yield from iter_read_spec_tensors(
                         batch.fb,
-                        batch.keys,
+                        keys,
                         self.read_spec_resolver,
                         self.safetensor_slice_expander,
                         self.segmented_tensor_reader,

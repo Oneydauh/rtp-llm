@@ -5,7 +5,18 @@ def _v4_xgrammar_with_fst_probes(name, envs, **kwargs):
     # The existing blocking smoke logs asynchronous markers without adding a
     # CUDA fence. Only its label is returned to the normal suite.
     fenced = dict(envs)
-    fenced["prefill"] = envs["prefill"] + ["RTP_V4_XGRAMMAR_FST_DIAG=fenced"]
+    # With asynchronous launches both prefill ranks reached layer 0's host
+    # wo_a_packed marker before RoPE H2D reported an unspecified launch failure.
+    # Set this in the role's environment *before* its CUDA context is created,
+    # so native/ATen failures can be observed at their launch sites, including
+    # launches on the FST producer thread. Keep the ordinary smoke asynchronous:
+    # a timing-sensitive failure disappearing in this leg does not clear it.
+    fenced["prefill"] = envs["prefill"] + [
+        "RTP_V4_XGRAMMAR_FST_DIAG=fenced",
+        "CUDA_LAUNCH_BLOCKING=1",
+        "TORCH_SHOW_CPP_STACKTRACES=1",
+        "TORCH_DISABLE_ADDR2LINE=1",
+    ]
     smoke_test(
         name = "v4_0731_xgrammar_real_fst_fenced_sm100_arm",
         tags = ["v4_loader_diagnostic"],  # smoke_test already adds "manual".

@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -182,6 +183,35 @@ class V4FstTrace:
             if emit:
                 log.info(fmt + " marker=fence_ok", *fields)
 
+    @contextmanager
+    def watch_keys(self, batch, keys):
+        """Identify native-read/consumer progress without recording checkpoint keys."""
+        ordinal = None
+
+        def indexed():
+            nonlocal ordinal
+            report_after = 0.0
+            for ordinal, key in enumerate(keys):
+                now = time.monotonic()
+                if now >= report_after:
+                    log.info(
+                        "V4FST consumer_progress rank=%s batch=%s key_ordinal=%s",
+                        self.rank, batch, ordinal,
+                    )
+                    report_after = now + 0.5
+                yield key
+
+        try:
+            yield indexed()
+        except (Exception, GeneratorExit) as exc:
+            # GeneratorExit also occurs when external module dispatch fails (or
+            # stops intentionally). This ordinal is a location, not a verdict.
+            log.warning(
+                "V4FST consumer_stopped rank=%s batch=%s key_ordinal=%s reason=%s",
+                self.rank, batch, ordinal, type(exc).__name__,
+            )
+            raise
+
     def reader_class(self, base, files):
         index = {os.fspath(path): idx for idx, path in enumerate(sorted(files), 1)}
         trace = self
@@ -204,7 +234,11 @@ class V4FstTrace:
                 # Producer thread: no device sync, no touching its CUDA context
                 # or changing when the native producer may enqueue the batch.
                 trace.point("producer_start", batch_id, fence=False)
-                result = super()._load_single_batch(batch_id, file_list)
+                try:
+                    result = super()._load_single_batch(batch_id, file_list)
+                except Exception:
+                    trace.point("producer_raised", batch_id, fence=False)
+                    raise
                 trace.point("producer_returned", batch_id, fence=False)
                 return result
 

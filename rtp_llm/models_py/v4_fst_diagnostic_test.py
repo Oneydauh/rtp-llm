@@ -13,6 +13,34 @@ from rtp_llm.models_py import v4_fst_diagnostic as diag
 
 
 class TraceTest(unittest.TestCase):
+    def test_read_failure_logs_rank_batch_and_ordinal_without_payload(self):
+        trace = diag.V4FstTrace("trace", 1, "cpu")
+        failure = RuntimeError("private error")
+        with self.assertLogs(diag.log, level="INFO") as messages:
+            with self.assertRaises(RuntimeError) as caught:
+                with trace.watch_keys(16, ["private-a", "private-b"]) as keys:
+                    self.assertEqual(next(keys), "private-a")
+                    self.assertEqual(next(keys), "private-b")
+                    raise failure
+        self.assertIs(caught.exception, failure)
+        self.assertIn("rank=1 batch=16 key_ordinal=1 reason=RuntimeError", messages.output[-1])
+        self.assertNotIn("private", "\n".join(messages.output))
+
+    def test_producer_failure_preserves_exception_without_a_producer_fence(self):
+        failure = RuntimeError("private error")
+        class Reader:
+            def _load_single_batch(self, batch, files):
+                raise failure
+        trace = diag.V4FstTrace("fenced", 0, "cpu")
+        with self.assertLogs(diag.log, level="INFO") as messages, mock.patch.object(
+            diag.torch.cuda, "synchronize"
+        ) as sync, self.assertRaises(RuntimeError) as caught:
+            trace.reader_class(Reader, [])()._load_single_batch(18, [])
+        sync.assert_not_called()
+        self.assertIs(caught.exception, failure)
+        self.assertIn("stage=producer_raised batch=18", messages.output[-1])
+        self.assertNotIn("private", "\n".join(messages.output))
+
     def test_rejected_hash_router_compares_only_its_small_physical_tensor(self):
         from safetensors.torch import save_file
 
