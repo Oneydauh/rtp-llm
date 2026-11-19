@@ -467,7 +467,14 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
         return True
 
     def checkpoint_weight_name_filter(self):
-        if not self._pipeline_partitioned and self.lm_head is not None:
+        checkpoint_layers = getattr(
+            self.config, "_checkpoint_num_layers_before_override", self.layer_num
+        )
+        if (
+            not self._pipeline_partitioned
+            and self.lm_head is not None
+            and checkpoint_layers == self.layer_num
+        ):
             return None
 
         def owns(name):
@@ -475,8 +482,19 @@ class Qwen3ForCausalLM(GptModelBase, RtpModule):
             if mapped in self.handler_heads.sources:
                 return True
             if mapped.startswith("layers."):
-                index = mapped.split(".", 2)[1]
-                return not index.isdigit() or int(index) in self._owned_layer_ids
+                parts = mapped.split(".", 2)
+                index = parts[1]
+                if (
+                    len(parts) != 3
+                    or not parts[2]
+                    or not index.isascii()
+                    or not index.isdigit()
+                ):
+                    return True
+                layer_id = int(index)
+                if str(layer_id) != index or layer_id >= checkpoint_layers:
+                    return True  # Strict dispatch handles malformed/out-of-range keys.
+                return layer_id in self._owned_layer_ids
             if mapped == "embed_tokens.weight":
                 return self.embed_tokens is not None or (
                     self.lm_head is not None and self.tie_word_embeddings

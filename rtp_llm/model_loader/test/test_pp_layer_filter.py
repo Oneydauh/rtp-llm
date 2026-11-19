@@ -332,6 +332,49 @@ def qwen_loader(cfg, pc, method, d, aliases=None):
 
 
 class PPQwenStageTest(unittest.TestCase):
+    def test_explicit_layer_reduction_loads_full_qwen_checkpoint(self):
+        from rtp_llm.config.model_config import apply_layer_num_override
+
+        cfg = qwen_config(3)
+        cfg.hybrid_attention_config = NS(enable_hybrid_attention=False)
+        cfg.moe_layer_index = []
+        apply_layer_num_override(cfg, 2)
+        apply_layer_num_override(cfg, 1)
+        checkpoint = qwen_tensors(3)
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "model.safetensors")
+            for method in ("scratch", "fastsafetensors"):
+                with self.subTest(method=method):
+                    save_file(checkpoint, path)
+                    loader = qwen_loader(cfg, topology([1], 0), method, directory)
+                    model = loader.load()
+                    self.assertEqual(loader.loaded_method.value, method)
+                    self.assertEqual(tuple(model.layer_ids()), (0,))
+                    torch.testing.assert_close(
+                        model.layers[0].input_layernorm.weight,
+                        checkpoint["model.layers.0.input_layernorm.weight"],
+                    )
+                    torch.testing.assert_close(
+                        model.lm_head.weight,
+                        checkpoint["lm_head.weight"] * cfg.logit_scale,
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "could not dispatch"):
+                        qwen_loader(
+                            qwen_config(1), topology([1], 0), method, directory
+                        ).load()
+                    for key in (
+                        "model.layers.3.input_layernorm.weight",
+                        "model.layers.0.unknown.weight",
+                    ):
+                        with self.subTest(key=key):
+                            save_file({**checkpoint, key: torch.ones(4)}, path)
+                            with self.assertRaisesRegex(
+                                RuntimeError, "could not dispatch"
+                            ):
+                                qwen_loader(
+                                    cfg, topology([1], 0), method, directory
+                                ).load()
+
     def test_real_scratch_and_fst_stage_owners_alias_and_head_postprocess(self):
         from rtp_llm.models_py.borrowed_parameters import (
             BorrowedParameter,

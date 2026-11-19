@@ -1144,6 +1144,12 @@ def apply_layer_num_override(model_config: ModelConfig, num_layers: int) -> None
         layer_id for layer_id in model_config.moe_layer_index if layer_id < num_layers
     ]
     model_config.kv_cache_spec_descs = []
+    # Keep the original bound so a direct checkpoint owner can distinguish
+    # explicitly pruned decoder layers from invalid checkpoint layer indices.
+    if num_layers < old_num_layers and not hasattr(
+        model_config, "_checkpoint_num_layers_before_override"
+    ):
+        model_config._checkpoint_num_layers_before_override = old_num_layers
     model_config.num_layers = num_layers
 
 
