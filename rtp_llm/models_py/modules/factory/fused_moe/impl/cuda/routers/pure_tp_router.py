@@ -233,30 +233,38 @@ class PureTpRouterNoQuant(PureTpRouterBase):
 
 
 class PureTpRouterFp8PerTensor(PureTpRouterBase):
-    """Pure TP router with FP8 per-tensor quantization."""
+    """Per-token activation quantization for FP8 expert GEMMs."""
+
+    supported_methods = ("FP8_PER_TENSOR_COMPRESSED", "FP8_DYNAMIC_PER_TENSOR")
+    recompute_topk = True
 
     def __init__(
         self,
         config: MoEConfigAdapter,
         quant_config: FusedMoEQuantConfig,
     ):
-        super().__init__(config, quant_config, do_recompute_topk=True)
+        super().__init__(config, quant_config, do_recompute_topk=self.recompute_topk)
 
     @classmethod
     def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
-        """Check if PureTpRouterFp8PerTensor can handle the configuration"""
+        """Check both topology and the accepted weight scale contract."""
         super().check_conditions(checker, config)
         resolver = MoeConfigResolver()
         quant_method = resolver.get_quant_method(config)
-        checker.check(
-            quant_method in ["FP8_PER_TENSOR_COMPRESSED", "FP8_DYNAMIC_PER_TENSOR"]
-        )
+        checker.check(quant_method in cls.supported_methods)
 
     def _do_quant(
         self, a1: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """FP8 per-token quantization"""
         return scaled_fp8_per_token_quant(a1, None)
+
+
+class PureTpRouterFp8PerChannel(PureTpRouterFp8PerTensor):
+    # Single rank: IDs are already local and the number of assignments is
+    # known from their shape; no CPU copy of per-expert counts is needed.
+    recompute_topk = False
+    supported_methods = ("FP8_PER_CHANNEL_COMPRESSED",)
 
 
 class PureTpRouterFp8PerBlock(PureTpRouterBase):

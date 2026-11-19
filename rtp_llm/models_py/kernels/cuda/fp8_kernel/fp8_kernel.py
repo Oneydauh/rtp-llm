@@ -286,9 +286,20 @@ def cutlass_moe_mm_fp8_scaled(
         )
 
     assert per_act_token == True
-    assert per_out_ch == False
 
     E, N, _ = w.shape
+    if per_out_ch:
+        # OldLoader stores [E, N, 1]; NewLoader owns [E, N]. CUTLASS indexes
+        # the contiguous FP32 table by expert * N + output_channel.
+        if (
+            w_scale.shape not in ((E, N), (E, N, 1))
+            or w_scale.dtype != torch.float32
+            or not w_scale.is_contiguous()
+        ):
+            raise ValueError(
+                "CUTLASS FP8 requires one contiguous FP32 scale per expert/output channel"
+            )
+        w_scale = w_scale.view(E, N)
     M, K = aq.shape
     configs = get_cutlass_groupgemm_best_config(E, N, K)
     if configs:

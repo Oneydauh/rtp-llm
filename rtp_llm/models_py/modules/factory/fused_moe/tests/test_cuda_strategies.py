@@ -9,6 +9,7 @@ from rtp_llm.config.quant_config import (
     CompressedW8A8Int8PerChannelQuantConfig,
     Fp8BlockWiseQuantConfig,
     Fp8DynamicPerTensorQuantConfig,
+    Fp8PerChannelCompressedQuantConfig,
     MXFp4QuarkQuantConfig,
     W4a8Int4PerChannelQuantConfig,
 )
@@ -29,6 +30,7 @@ from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.strategy import (
     CudaFp8PerBlockNoDPStrategy,
     CudaFp8PerBlockPureCPStrategy,
     CudaFp8PerBlockPureDPStrategy,
+    CudaFp8PerChannelNoDPStrategy,
     CudaFp8PerTensorNoDPStrategy,
     CudaNoQuantCppStrategy,
     CudaNoQuantDpNormalStrategy,
@@ -154,6 +156,39 @@ def create_moe_config_adapter(
         moe_config=moe_config,
         enable_cuda_graph=enable_cuda_graph,
     )
+
+
+class TestCudaPerChannelFp8Strategy(unittest.TestCase):
+    def test_eager_single_rank_ptpc_only(self):
+        channel = CudaFp8PerChannelNoDPStrategy()
+        tensor = CudaFp8PerTensorNoDPStrategy()
+        model = create_model_config_with_fp8_per_tensor_quant()
+        model.data_type = "bf16"
+        model.activation_type = "SiGLU"
+        parallel = create_parallelism_config()
+        parallel.world_size = 1
+        config = create_moe_config_adapter(
+            model, parallel, create_moe_config(use_all_gather=True)
+        )
+        self.assertTrue(tensor.can_handle(config))
+        self.assertFalse(channel.can_handle(config))
+
+        model.quant_config = Fp8PerChannelCompressedQuantConfig(is_quanted=True)
+        self.assertTrue(channel.can_handle(config))
+        self.assertFalse(tensor.can_handle(config))
+        self.assertTrue(channel.get_attributes().quant_config.per_out_ch_quant)
+        self.assertFalse(tensor.get_attributes().quant_config.per_out_ch_quant)
+
+        with patch(
+            "rtp_llm.models_py.kernels.cuda.fp8_kernel.fp8_kernel.fp8_grouped_gemm_ptpc",
+            None,
+        ):
+            self.assertFalse(channel.can_handle(config))
+        config.enable_cuda_graph = True
+        self.assertFalse(channel.can_handle(config))
+        config.enable_cuda_graph = False
+        config.world_size = 2
+        self.assertFalse(channel.can_handle(config))
 
 
 class TestCudaNoQuantFallbackStrategies(unittest.TestCase):
