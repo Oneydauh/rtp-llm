@@ -239,7 +239,16 @@ class V4FstTrace:
                 except Exception:
                     trace.point("producer_raised", batch_id, fence=False)
                     raise
-                trace.point("producer_returned", batch_id, fence=False)
+                # Some FST versions hand off the exception through the batch
+                # queue instead of raising it on this thread. Do not confuse
+                # that normal Python return with successful native I/O.
+                error_event = getattr(self, "error_event", None)
+                stage = (
+                    "producer_returned_error_event"
+                    if error_event is not None and error_event.is_set()
+                    else "producer_returned"
+                )
+                trace.point(stage, batch_id, fence=False)
                 return result
 
         return TracedReader

@@ -41,6 +41,19 @@ class TraceTest(unittest.TestCase):
         self.assertIn("stage=producer_raised batch=18", messages.output[-1])
         self.assertNotIn("private", "\n".join(messages.output))
 
+    def test_producer_queued_failure_is_not_reported_as_normal_return(self):
+        class Reader:
+            def _load_single_batch(self, batch, files):
+                self.error_event = SimpleNamespace(is_set=lambda: True)
+
+        trace = diag.V4FstTrace("fenced", 1, "cpu")
+        with self.assertLogs(diag.log, level="INFO") as logs, mock.patch.object(
+            diag.torch.cuda, "synchronize"
+        ) as sync:
+            trace.reader_class(Reader, [])()._load_single_batch(18, [])
+        self.assertIn("stage=producer_returned_error_event batch=18", logs.output[-1])
+        sync.assert_not_called()
+
     def test_rejected_hash_router_compares_only_its_small_physical_tensor(self):
         from safetensors.torch import save_file
 
