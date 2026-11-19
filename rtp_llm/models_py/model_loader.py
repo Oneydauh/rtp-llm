@@ -1279,6 +1279,8 @@ class NewModelLoader:
         ):
             if not callable(symbol):
                 raise RuntimeError(f"fastsafetensors.{symbol_name} must be callable")
+        if not callable(getattr(ParallelLoader, "iterate_weights", None)):
+            raise RuntimeError("fastsafetensors.ParallelLoader lacks iterate_weights")
         try:
             parameters = inspect.signature(ParallelLoader.__init__).parameters
         except (TypeError, ValueError) as exc:
@@ -1681,6 +1683,13 @@ class NewModelLoader:
         force_nogds = os.environ.get("FASTSAFETENSORS_NOGDS", "0") == "1"
         if force_nogds:
             return True, False
+        if device.type == "cuda" and NewModelLoader._accelerator_backend_name() in (
+            "Ppu",
+            "ROCm",
+        ):
+            # These readers transfer from shared host memory through their
+            # own native extension. Never probe an NVIDIA driver on PPU.
+            return False, True
         force_shm = (
             device.type == "cuda"
             and torch.version.hip is None
@@ -1689,10 +1698,7 @@ class NewModelLoader:
         if force_shm:
             return False, True
         use_nogds = NewModelLoader._fastsafetensors_use_nogds(device, checkpoint_files)
-        use_shm = (
-            device.type == "cuda" and torch.version.hip is not None and not use_nogds
-        )
-        return use_nogds, use_shm
+        return use_nogds, False
 
     @staticmethod
     def _model_storage_bytes(model: nn.Module) -> int:
@@ -1782,28 +1788,21 @@ class NewModelLoader:
         if target_device.type == "cuda":
             if not torch.cuda.is_available():
                 return f"runtime device {target_device} is unavailable"
+            # CUDA, ROCm and PPU expose their accelerator through torch.cuda.
+            # Let the installed reader, checkpoint, participating ranks and
+            # available memory decide eligibility, not the host ISA or card label.
             backend = self._accelerator_backend_name()
-            if automatic and backend != "Cuda":
-                return (
-                    "automatic fastsafetensors selection is disabled on the "
-                    f"unvalidated {backend} backend; request "
-                    "fastsafetensors explicitly to override"
+            if backend in ("Ppu", "ROCm"):
+                from rtp_llm.models_py.fst_host_backend import fst_host_backend_reason
+
+                use_nogds, use_shm = self._fastsafetensors_backend_options(
+                    target_device, checkpoint_files
                 )
-            machine = platform.machine().lower()
-            if automatic and machine not in ("amd64", "x86_64"):
-                return (
-                    "automatic fastsafetensors selection is disabled on the "
-                    f"unvalidated {machine or 'unknown'} architecture; request "
-                    "fastsafetensors explicitly to override"
+                reason = fst_host_backend_reason(
+                    backend, use_shm=use_shm, use_nogds=use_nogds
                 )
-            if (
-                torch.version.hip is not None
-                and os.environ.get("FASTSAFETENSORS_NOGDS", "0") == "1"
-            ):
-                return (
-                    "FASTSAFETENSORS_NOGDS=1 is unsupported on ROCm by the "
-                    "installed fastsafetensors backend"
-                )
+                if reason is not None:
+                    return reason
             device_index = (
                 torch.cuda.current_device()
                 if target_device.index is None

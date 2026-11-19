@@ -4,6 +4,13 @@ load("//rtp_llm/models_py/test:defs.bzl", "models_py_test")
 load(":checkpoint_service_tests.bzl", "checkpoint_service_tests")
 
 py_test(
+    name = "fst_host_backend_test",
+    srcs = ["fst_host_backend_test.py"],
+    deps = [":new_loader_core"],
+    env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "ROCR_VISIBLE_DEVICES": ""},
+)
+
+py_test(
     name = "v41_fst_memory_test",
     srcs = ["v41_fst_memory_test.py"],
     env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "ROCR_VISIBLE_DEVICES": ""},
@@ -155,6 +162,7 @@ py_library(
         "fastsafetensors_read_spec.py",
         "finetune_overlay.py",
         "fp4_read_spec.py",
+        "fst_host_backend.py",
         "fst_range_reader.py",
         "fst_file_plan.py",
         "ft_checkpoint.py",
@@ -215,6 +223,39 @@ py_test(
         "//rtp_llm/tools/convert:ft_export_metadata",
         "//rtp_llm/tools/convert:ft_export_writer",
     ],
+)
+
+py_test(
+    name = "auto_fst_route_test",
+    srcs = ["auto_fst_route_test.py"],
+    args = ["DefaultFstRouteTest"],
+    env = {
+        "CUDA_VISIBLE_DEVICES": "",
+        "HIP_VISIBLE_DEVICES": "",
+        "ROCR_VISIBLE_DEVICES": "",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+    },
+    deps = [":new_loader_core"],
+)
+
+# Native reader contract on build profiles that actually package the wheel.
+# PPU's current wheel-less CI still runs every portable policy test above.
+py_test(
+    name = "auto_fst_native_reader_test",
+    srcs = ["auto_fst_route_test.py"],
+    main = "auto_fst_route_test.py",
+    args = ["DefaultFstNativeReaderTest"],
+    env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "ROCR_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+    target_compatible_with = select({
+        "@//:using_cuda13_x86": [],
+        "@//:using_cuda13_arm": [],
+        "@//:using_cuda12_9_x86": [],
+        "@//:using_cuda12_arm": [],
+        "@//:using_rocm": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [":new_loader_core", "//rtp_llm:fastsafetensors"],
 )
 
 py_test(
