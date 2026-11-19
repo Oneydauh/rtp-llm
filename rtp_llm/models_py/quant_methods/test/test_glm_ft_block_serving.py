@@ -152,7 +152,6 @@ class LegacyWriterToServingTest(unittest.TestCase):
                 cfg.model_type = "glm4_moe"
                 cfg.ckpt_path = str(path)
                 cfg.data_type = "bf16"
-                cfg.enable_fp32_lm_head = False
                 if mode == "channel":
                     source = Fp8PerChannelCompressedQuantConfig(is_quanted=True)
                     key = "fp8_per_channel"
