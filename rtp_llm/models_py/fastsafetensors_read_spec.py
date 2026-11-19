@@ -526,6 +526,9 @@ def build_read_spec_parallel_loader(
                 )
 
             try:
+                diag = getattr(self, "_rtp_v4_fst_trace", None)
+                if diag is not None:
+                    diag.point("consumer_received", batch.batch_id)
                 self._log_message(
                     f"Batch {batch.batch_id}: tensor key len: {len(batch.keys)}"
                 )
@@ -541,12 +544,16 @@ def build_read_spec_parallel_loader(
                         self.name_filter,
                     )
                 get_tensor_time = timer.elapsed_ms
+                if diag is not None:
+                    diag.point("consumer_before_release", batch.batch_id)
             finally:
                 with timing_context(
                     "fb.close", self._log_message, batch.batch_id
                 ) as timer:
                     batch.fb.close()
                 close_time = timer.elapsed_ms
+            if diag is not None:
+                diag.point("consumer_released", batch.batch_id)
 
             self._log_message(
                 f"Batch {batch.batch_id} summary: "

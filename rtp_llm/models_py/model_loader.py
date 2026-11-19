@@ -1140,14 +1140,21 @@ class NewModelLoader:
                     raise
 
     @staticmethod
-    def _run_post_load_hooks(model: nn.Module) -> None:
+    def _run_post_load_hooks(model: nn.Module, v4_trace=None) -> None:
         for module in model.modules():
             if getattr(module, "_rtp_borrowed_parameter_names", ()):
                 # The owning model already postprocessed this storage.
                 continue
             hook = getattr(module, "process_weights_after_loading", None)
             if callable(hook):
-                hook()
+                if v4_trace is not None and type(module).__name__ == "AttentionFP8":
+                    module._rtp_v4_fst_trace = v4_trace
+                    try:
+                        hook()
+                    finally:
+                        del module._rtp_v4_fst_trace
+                else:
+                    hook()
 
     @staticmethod
     def _prepare_model_for_fastsafetensors(
@@ -2220,6 +2227,9 @@ class NewModelLoader:
             else:
                 # Construction errors propagate: never retry allocation/I/O
                 # failures by silently switching to a full-tensor loader.
+                v4_trace = getattr(self, "_v4_fst_trace", None)
+                if v4_trace is not None:
+                    read_spec_loader = v4_trace.reader_class(read_spec_loader, checkpoint_files)
                 loader = read_spec_loader(
                     read_spec_resolver=read_spec_resolver,
                     safetensor_slice_expander=safetensor_slice_expander,
@@ -2486,6 +2496,12 @@ class NewModelLoader:
             method == NewLoaderLoadMethod.FASTSAFETENSORS
             and not self.load_config.force_cpu_load_weights
         )
+        self._v4_fst_trace = None
+        if accelerator_fst and os.environ.get("RTP_V4_XGRAMMAR_FST_DIAG"):
+            if self._model_type() == "deepseek_v4":
+                from rtp_llm.models_py.v4_fst_diagnostic import V4FstTrace
+
+                self._v4_fst_trace = V4FstTrace.from_env(self.load_config.device)
         streamed_scratch = self._arm_streamed_scratch(
             model, method
         ) or self._ppu_streamed_scratch(model, method)
@@ -2618,7 +2634,12 @@ class NewModelLoader:
         validate_borrowed_parameters(model, self.load_config.device)
         model.to(self.load_config.device)
         self._validate_loaded_weights(model)
-        self._run_post_load_hooks(model)
+        if self._v4_fst_trace is None:
+            self._run_post_load_hooks(model)
+        else:
+            self._v4_fst_trace.point("post_load_enter")
+            self._run_post_load_hooks(model, self._v4_fst_trace)
+            self._v4_fst_trace.point("post_load_done")
         validate_borrowed_parameters(model)
         model.eval()
         if memory_trace is not None:
