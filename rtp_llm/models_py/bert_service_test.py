@@ -56,11 +56,13 @@ def make_checkpoint(root, *, classifier=False):
     return ref
 
 
-def public_load(root, method, task, *, tp=1, rank=0):
+def public_load(root, method, task, *, tp=1, rank=0, quant=None):
     config = Bert._create_config(str(root))
     config.model_type = "bert"
     config.tokenizer_path = str(root)
     config.data_type = "fp32"
+    if quant is not None:
+        config.quant_config = quant
     config.task_type = task
     config.generate_env_config = GenerateEnvConfig()
     config.render_config = RenderConfig()
@@ -157,7 +159,173 @@ def check_tp_rank(rank, checkpoint, rendezvous):
         dist.destroy_process_group()
 
 
+def check_static_tp_rank(rank, checkpoint, rendezvous):
+    from rtp_llm.config.quant_config import Int8PerTensorQuantConfig
+
+    dist = torch.distributed
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
+    try:
+        root = Path(checkpoint)
+        values = load_file(str(root / "model.safetensors"))
+        for method in ("scratch", "fastsafetensors"):
+            rank_model = public_load(
+                root,
+                method,
+                TaskType.DENSE_EMBEDDING,
+                tp=2,
+                rank=rank,
+                quant=Int8PerTensorQuantConfig(),
+            )
+            assert rank_model.model_weights_loader.loaded_method == NewLoaderLoadMethod(
+                method
+            )
+            layer = rank_model.py_model.encoder.layer["0"]
+            prefix = "encoder.layer.0.attention."
+            expected_weights, expected_scales = [], []
+            rows = slice(rank * 8, (rank + 1) * 8)
+            for part in ("query", "key", "value"):
+                src = prefix + "self." + part
+                expected_weights.append(values[src + ".qweight"][rows])
+                expected_scales.append(values[src + ".scales"].expand(16)[rows])
+            torch.testing.assert_close(layer.qkv.weight, torch.cat(expected_weights))
+            torch.testing.assert_close(
+                layer.qkv.weight_scale, torch.cat(expected_scales)
+            )
+            torch.testing.assert_close(
+                layer.attn_output.weight,
+                values[prefix + "output.dense.qweight"][:, rows],
+            )
+            torch.testing.assert_close(
+                layer.attn_output.weight_scale, values[prefix + "output.dense.scales"]
+            )
+    finally:
+        dist.destroy_process_group()
+
+
 class BertServiceTest(unittest.TestCase):
+    @torch.inference_mode()
+    def test_static_int8_checkpoint(self):
+        from rtp_llm.config.quant_config import Int8PerTensorQuantConfig
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            reference = make_checkpoint(root)
+            path = str(root / "model.safetensors")
+            values = load_file(path)
+            quant = Int8PerTensorQuantConfig()
+            for i in range(2):
+                base = f"encoder.layer.{i}."
+                for j, suffix in enumerate(
+                    (
+                        "attention.self.query",
+                        "attention.self.key",
+                        "attention.self.value",
+                        "attention.output.dense",
+                        "intermediate.dense",
+                        "output.dense",
+                    )
+                ):
+                    p = base + suffix
+                    w = values.pop(p + ".weight")
+                    scales = (
+                        torch.arange(1, w.shape[0] + 1).float()
+                        if j % 2
+                        else torch.tensor([1.0])
+                    ) / 1024
+                    values[p + ".qweight"] = (
+                        (w / scales[:, None]).round().clamp(-128, 127).to(torch.int8)
+                    )
+                    values[p + ".scales"] = scales
+                    if j == 0:
+                        values[base + "attention.self.qkv_input_scale"] = torch.tensor(
+                            0.02 + i * 0.01
+                        )
+                    elif j >= 3:
+                        values[p + "_input_scale"] = torch.tensor([0.01 * j])
+                    # Independent HF forward: floating dequantized weights
+                    # and fake-quantized activations at each linear boundary.
+                    linear = reference.get_submodule(p)
+                    linear.weight.copy_(
+                        values[p + ".qweight"].float() * scales[:, None]
+                    )
+                    step = values[
+                        (
+                            base + "attention.self.qkv_input_scale"
+                            if j < 3
+                            else p + "_input_scale"
+                        )
+                    ]
+                    linear.register_forward_pre_hook(
+                        lambda _, args, s=step: (
+                            (args[0] / s).round().clamp(-128, 127) * s,
+                        )
+                    )
+            save_file(values, path)
+            inputs, lengths = packed_inputs()
+            expected_hidden = torch.cat(
+                [
+                    reference(
+                        input_ids=ids[None], token_type_ids=types[None]
+                    ).last_hidden_state[0]
+                    for ids, types in zip(
+                        inputs.input_ids.split(lengths.tolist()),
+                        inputs.bert_embedding_inputs.combo_tokens_type_ids.split(
+                            lengths.tolist()
+                        ),
+                    )
+                ]
+            )
+            for method in ("scratch", "fastsafetensors"):
+                with self.subTest(method=method):
+                    service_model = public_load(
+                        root, method, TaskType.DENSE_EMBEDDING, quant=quant
+                    )
+                    self.assertEqual(
+                        service_model.model_weights_loader.loaded_method,
+                        NewLoaderLoadMethod(method),
+                    )
+                    layers = service_model.py_model.encoder.layer
+                    torch.testing.assert_close(
+                        service_model.py_model.forward_hidden(inputs),
+                        expected_hidden,
+                        rtol=1e-4,
+                        atol=1e-5,
+                    )
+                    self.assertIs(
+                        layers["0"].output_norm.input_scale, layers["1"].qkv.input_scale
+                    )
+                    self.assertIsNone(layers["1"].output_norm.input_scale)
+                    x = torch.arange(32).reshape(2, 16).float() / 9 - 1.0
+                    for i in range(2):
+                        b = f"encoder.layer.{i}.attention.self."
+                        projection = layers[str(i)].qkv
+                        self.assertEqual(projection.weight.dtype, torch.int8)
+                        step = values[b + "qkv_input_scale"]
+                        expected = []
+                        for part in ("query", "key", "value"):
+                            k = b + part
+                            weights = values[k + ".qweight"].to(torch.int32)
+                            dots = (x / step).round().clamp(-128, 127).to(
+                                torch.int32
+                            ) @ weights.T
+                            expected.append(
+                                dots.float() * step * values[k + ".scales"]
+                                + values[k + ".bias"]
+                            )
+                        torch.testing.assert_close(
+                            projection(x), torch.cat(expected, -1)
+                        )
+            torch.multiprocessing.start_processes(
+                check_static_tp_rank,
+                args=(d, (root / "gloo").as_uri()),
+                nprocs=2,
+                start_method="fork",
+            )
+            del values["encoder.layer.1.attention.self.value.scales"]
+            save_file(values, path)
+            with self.assertRaisesRegex(RuntimeError, "weight_scale"):
+                public_load(root, "scratch", TaskType.DENSE_EMBEDDING, quant=quant)
+
     def test_tp2_real_checkpoint_ownership(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

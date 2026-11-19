@@ -54,6 +54,13 @@ class BertNorm(RtpModule):
     def beta(self):
         return self.bias
 
+    @property
+    def input_scale(self):
+        # Static BERT quantizes the post-norm activation at the consuming
+        # projection. Expose that exact scale without a second Parameter.
+        consumer = getattr(self, "_scale_consumer", None)
+        return consumer().input_scale if consumer is not None else None
+
     def forward(self, value, residual=None):
         if value.is_cuda:
             from rtp_llm.models_py.modules import AddBiasResLayerNorm, LayerNorm
@@ -131,9 +138,12 @@ class BertLayer(RtpModule):
         if heads * dim != h:
             raise ValueError("BERT attention heads must span hidden_size")
         self.index = index
-        common = dict(
-            quant_config=load.quant_config, params_dtype=load.compute_dtype, bias=True
-        )
+        quant = load.quant_config
+        if getattr(quant, "quant_type", None) == "pertensor_quant":
+            from .static_int8 import BertStaticInt8Config
+
+            quant = BertStaticInt8Config("pertensor_quant")
+        common = dict(quant_config=quant, params_dtype=load.compute_dtype, bias=True)
         attn = dict(tp_size=load.attn_tp_size, tp_rank=load.attn_tp_rank, **common)
         mlp = dict(tp_size=load.ffn_tp_size, tp_rank=load.ffn_tp_rank, **common)
         p = f"encoder.layer.{index}"

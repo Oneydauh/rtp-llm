@@ -2,6 +2,7 @@
 
 import json
 import re
+import weakref
 from pathlib import Path
 
 import torch
@@ -30,18 +31,31 @@ class _BertMapper(WeightsMapper):
         "output.LayerNorm": "output_norm",
     }
 
-    def __init__(self, prefix):
+    def __init__(self, prefix, static_int8=False):
         super().__init__()
         self.prefix = prefix + "."
+        self.static_int8 = static_int8
 
     def map_name(self, name):
         name = name.removeprefix(self.prefix)
+        if self.static_int8:
+            # HF static W8A8 names the four calibrated activations with an
+            # underscore. Q, K and V share one activation, not three scales.
+            if name.endswith(".attention.self.qkv_input_scale"):
+                return (
+                    name.removesuffix(".attention.self.qkv_input_scale")
+                    + ".qkv.input_scale"
+                )
+            if name.endswith("_input_scale"):
+                name = name.removesuffix("_input_scale") + ".input_scale"
         stem, _, leaf = name.rpartition(".")
         if stem.endswith(".LayerNorm") and leaf in ("beta", "gamma"):
             leaf = {"beta": "bias", "gamma": "weight"}[leaf]
             name = stem + "." + leaf
         match = self._layer.match(stem)
         if match and match[2] in self._children:
+            if self.static_int8:
+                leaf = {"qweight": "weight", "scales": "weight_scale"}.get(leaf, leaf)
             return ".".join((match[1], self._children[match[2]], leaf))
         return name
 
@@ -91,7 +105,10 @@ class BertEncoderOwner(GptModelBase, RtpModule):
             fmha_config=load.fmha_config,
             py_hw_kernel_config=load.py_hw_kernel_config,
         )
-        self.WEIGHTS_MAPPER = _BertMapper(self.checkpoint_prefix)
+        static_int8 = (
+            getattr(load.quant_config, "quant_type", None) == "pertensor_quant"
+        )
+        self.WEIGHTS_MAPPER = _BertMapper(self.checkpoint_prefix, static_int8)
         hf = json.loads((Path(config.ckpt_path) / "config.json").read_text())
         if hf.get("position_embedding_type", "absolute") != "absolute":
             raise ValueError("The BERT serving encoder expects absolute positions")
@@ -121,6 +138,16 @@ class BertEncoderOwner(GptModelBase, RtpModule):
         self.encoder.layer = nn.ModuleDict(
             {str(i): BertLayer(config, load, i) for i in owned}
         )
+        if static_int8:
+            for i in owned:
+                current = self.encoder.layer[str(i)]
+                current.attn_norm._scale_consumer = weakref.ref(current.intermediate)
+                if i == 0:
+                    self.embeddings.LayerNorm._scale_consumer = weakref.ref(current.qkv)
+                elif str(i - 1) in self.encoder.layer:
+                    self.encoder.layer[str(i - 1)].output_norm._scale_consumer = (
+                        weakref.ref(current.qkv)
+                    )
         self.pooler = (
             _OptionalPooler(config.hidden_size, load.compute_dtype)
             if self.last
