@@ -112,6 +112,55 @@ def load(root, name, method):
 
 
 class Qwen2ServiceVariantsTest(unittest.TestCase):
+    def test_qwen2_vl_real_vision_and_biased_language_checkpoint(self):
+        from rtp_llm.multimodal.multimodal_mixin_factory import MultimodalMixinFactory
+        from rtp_llm.multimodal.multimodal_mixins.qwen2_vl.image_processing_qwen2_vl import (
+            Qwen2VLImageProcessor,
+        )
+        from rtp_llm.multimodal.multimodal_mixins.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VisionTransformerPretrainedModel,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tensors = fixture(root, head=True)
+            config_path = root / "config.json"
+            config = json.loads(config_path.read_text())
+            vision = dict(depth=1, embed_dim=8, hidden_size=4, num_heads=2,
+                          patch_size=2, spatial_merge_size=1, temporal_patch_size=1)
+            config.update(architectures=["Qwen2VLForConditionalGeneration"],
+                          model_type="qwen2_vl", vision_config=vision, rope_theta=10000,
+                          vision_start_token_id=5, vision_end_token_id=6)
+            config_path.write_text(json.dumps(config))
+            Qwen2VLImageProcessor().save_pretrained(root)
+            reference = Qwen2VisionTransformerPretrainedModel(vision)
+            visual = {"visual." + n: p.detach().half()
+                      for n, p in reference.named_parameters()}
+            save_file(visual, str(root / "vision.safetensors"))
+            index_path = root / "model.safetensors.index.json"
+            index = json.loads(index_path.read_text())
+            index["weight_map"].update(dict.fromkeys(visual, "vision.safetensors"))
+            index_path.write_text(json.dumps(index))
+            for method in ("scratch", "fastsafetensors"):
+                with self.subTest(method=method):
+                    model = load(root, "qwen2_vl", method)
+                    owner = model.py_model
+                    torch.testing.assert_close(owner.lm_head.weight, tensors["lm_head.weight"])
+                    self.assertIsNotNone(owner.layers[0].self_attn.qkv_proj.bias)
+                    mm = MultimodalMixinFactory._create_multimodal_mixin(
+                        model.model_config, SimpleNamespace(load_config=SimpleNamespace(
+                            load_method=method)), None, "cpu")
+                    for name, param in mm.mm_part.visual.named_parameters():
+                        torch.testing.assert_close(param.float(), visual["visual." + name].float())
+                    features = torch.tensor([[2., 4., 6., 8.]])
+                    inputs = SimpleNamespace(input_ids=torch.tensor([1, 80]),
+                        embedding_inputs=SimpleNamespace(text_tokens_mask=torch.tensor([1, 0])),
+                        multimodal_inputs=SimpleNamespace(multimodal_features=[features],
+                            mm_features_locs=torch.tensor([1]), mm_extra_input=[]))
+                    hidden, _, _ = owner._embed_multimodal_inputs(inputs)
+                    torch.testing.assert_close(hidden[0], tensors["model.embed_tokens.weight"][1])
+                    torch.testing.assert_close(hidden[1], features[0])
+
     def test_tool_selected_logits_survive_terminal_frame(self):
         for method in ("scratch", "fastsafetensors"):
             with self.subTest(

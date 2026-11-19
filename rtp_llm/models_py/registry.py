@@ -165,6 +165,7 @@ register_lazy_model(
 
 # Distinct service types share main's vision tower, not a text-only runtime.
 for _vl_type, _vl_owner in (
+    ("qwen2_vl", "Qwen2VLForCausalLM"),
     ("qwen3_vl", "Qwen3VLForCausalLM"),
     ("qwen3_vl_moe", "Qwen3VLMoeForCausalLM"),
 ):
