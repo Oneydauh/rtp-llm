@@ -45,3 +45,4 @@ class Qwen1ForCausalLM(Qwen2ForCausalLM):
     """
 
     WEIGHTS_MAPPER = Qwen1CheckpointMapper()
+    ppu_dense_streamed_scratch = True

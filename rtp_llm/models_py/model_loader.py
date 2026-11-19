@@ -2008,6 +2008,9 @@ class NewModelLoader:
             and platform.machine().lower() in ("aarch64", "arm64")
         ):
             return False
+        return self._full_world_scratch_owner(model)
+
+    def _full_world_scratch_owner(self, model):
         # The allocation/dispatch acknowledgements use WORLD. Unlike the
         # two-rank P/D services, auxiliary owners and PP drafts can be built
         # by a single rank or stage. Do not introduce a new collective there.
@@ -2021,6 +2024,28 @@ class NewModelLoader:
             if world > 1 and getattr(pc, "world_size", None) != world:
                 return False
         return True
+
+    def _ppu_streamed_scratch(self, model, method):
+        # Qwen-7B P/D otherwise materializes a complete CPU destination on
+        # every rank, then transfers it in a second, whole-model _apply.
+        # Its dense checkpoint leaves can copy directly from each CPU shard
+        # into final parameter storage. Do not enable for other formats or
+        # for operators that own a host/online-quantization staging step.
+        return (
+            getattr(model, "ppu_dense_streamed_scratch", False)
+            and method == NewLoaderLoadMethod.SCRATCH
+            and not self.load_config.force_cpu_load_weights
+            and (
+                self.load_config.quant_config is None
+                or getattr(self.load_config.quant_config, "quant_type", None) == "none"
+            )
+            and not self.load_config.custom_weight_mappings
+            and not self.load_config.custom_projection_layers
+            and self.load_config.compute_dtype in (torch.float16, torch.bfloat16)
+            and torch.device(self.load_config.device).type == "cuda"
+            and self._accelerator_backend_name() == "Ppu"
+            and self._full_world_scratch_owner(model)
+        )
 
     @contextmanager
     def _scratch_stage(self, phase):
@@ -2452,7 +2477,9 @@ class NewModelLoader:
             method == NewLoaderLoadMethod.FASTSAFETENSORS
             and not self.load_config.force_cpu_load_weights
         )
-        streamed_scratch = self._arm_streamed_scratch(model, method)
+        streamed_scratch = self._arm_streamed_scratch(
+            model, method
+        ) or self._ppu_streamed_scratch(model, method)
         if streamed_scratch:
             with self._scratch_stage("destination allocation"):
                 self._prepare_streamed_scratch(model)

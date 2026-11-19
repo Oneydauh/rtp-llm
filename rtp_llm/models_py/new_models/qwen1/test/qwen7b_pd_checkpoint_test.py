@@ -1,6 +1,7 @@
 """Release-layout Qwen1: real FP16 files/transport; not a PPU PD golden."""
 
 import json
+import os
 import tempfile
 import unittest
 from datetime import timedelta
@@ -15,7 +16,13 @@ from safetensors.torch import save_file
 
 from rtp_llm.model_factory import ModelFactory
 from rtp_llm.models.base_model import BaseModel
-from rtp_llm.models_py.model_loader import NewLoaderLoadMethod
+from rtp_llm.models_py.model_loader import (
+    NewLoaderConfig,
+    NewLoaderLoadMethod,
+    NewModelLoader,
+)
+from rtp_llm.models_py.new_models.qwen1.language import Qwen1ForCausalLM
+from rtp_llm.models_py.read_spec import unwrap_checkpoint_tensor
 from rtp_llm.ops import RoleType, TaskType
 
 
@@ -68,7 +75,7 @@ def write(root, missing=None):
     )
 
 
-def load(root, method, role, tp, rank):
+def load(root, method, role, tp, rank, device="cpu"):
     cfg = ModelFactory.get_model_cls("qwen_7b").create_config(str(root))
     cfg.model_type, cfg.data_type, cfg.task_type = (
         "qwen_7b",
@@ -110,9 +117,9 @@ def load(root, method, role, tp, rank):
             moe_pure_tp_preshard=False,
         ),
     )
-    # Tokenizer assets and a PPU are not needed to verify the checkpoint ABI.
+    # Tokenizer assets are not needed to verify the checkpoint ABI.
     with patch.object(BaseModel, "load_tokenizer"), patch.object(
-        BaseModel, "_get_device_str", return_value="cpu"
+        BaseModel, "_get_device_str", return_value=device
     ):
         svc = ModelFactory._create_model(cfg, engine)
     assert svc.model_weights_loader.loaded_method == NewLoaderLoadMethod(method)
@@ -179,6 +186,87 @@ def worker(rank, root):
 
 
 class Qwen1CheckpointTest(unittest.TestCase):
+    def test_ppu_streamed_scratch_policy(self):
+        owner = SimpleNamespace(ppu_dense_streamed_scratch=True)
+        method = NewLoaderLoadMethod.SCRATCH
+
+        def selected(config, candidate=owner, reader=method):
+            return NewModelLoader({}, config)._ppu_streamed_scratch(candidate, reader)
+
+        with patch.object(
+            NewModelLoader, "_accelerator_backend_name", return_value="Ppu"
+        ):
+            for dtype in (torch.float16, torch.bfloat16):
+                config = NewLoaderConfig(
+                    compute_dtype=dtype, quant_config=SimpleNamespace(quant_type="none")
+                )
+                self.assertTrue(selected(config))
+            for config in (
+                NewLoaderConfig(device="cpu"),
+                NewLoaderConfig(compute_dtype=torch.float32),
+                NewLoaderConfig(quant_config=SimpleNamespace(quant_type="FP8")),
+                NewLoaderConfig(force_cpu_load_weights=True),
+            ):
+                self.assertFalse(selected(config))
+            self.assertFalse(selected(NewLoaderConfig(), SimpleNamespace()))
+            self.assertFalse(
+                selected(NewLoaderConfig(), reader=NewLoaderLoadMethod.FASTSAFETENSORS)
+            )
+            isolated = SimpleNamespace(
+                ppu_dense_streamed_scratch=True, fastsafetensors_load_isolated=True
+            )
+            self.assertFalse(selected(NewLoaderConfig(), isolated))
+            with patch.object(dist, "is_initialized", return_value=True), patch.object(
+                dist, "get_world_size", return_value=2
+            ):
+                self.assertFalse(selected(NewLoaderConfig()))
+        with patch.object(
+            NewModelLoader, "_accelerator_backend_name", return_value="Cuda"
+        ):
+            self.assertFalse(selected(NewLoaderConfig()))
+
+    @unittest.skipUnless(os.getenv("PPU_QWEN_SCRATCH_TEST") == "1", "requires a PPU")
+    def test_ppu_scratch_populates_final_parameter_storage(self):
+        self.assertTrue(torch.cuda.is_available())
+        self.assertEqual(NewModelLoader._accelerator_backend_name(), "Ppu")
+        device = torch.device("cuda", torch.cuda.current_device())
+        original = Qwen1ForCausalLM.load_weights
+        seen = {}
+
+        def observe(owner, weights):
+            for name, value in owner.named_parameters():
+                self.assertEqual(value.device, device)
+                seen[name] = value.data_ptr()
+
+            def checked_weights():
+                for name, value in weights:
+                    source, _ = unwrap_checkpoint_tensor(value)
+                    self.assertEqual(source.device.type, "cpu")
+                    yield name, value
+
+            return original(owner, checked_weights())
+
+        with tempfile.TemporaryDirectory() as path, patch.object(
+            Qwen1ForCausalLM, "load_weights", observe
+        ):
+            write(Path(path))
+            model = load(Path(path), "scratch", RoleType.PREFILL, 1, 0, str(device))
+        self.assertTrue(seen)
+        self.assertEqual({n: p.data_ptr() for n, p in model.named_parameters()}, seen)
+        expected = release()
+        torch.testing.assert_close(
+            model.embed_tokens.weight.cpu(), expected["transformer.wte.weight"]
+        )
+        torch.testing.assert_close(
+            model.layers[0].mlp.gate_up_proj.weight.cpu(),
+            torch.cat(
+                [
+                    expected["transformer.h.0.mlp.w2.weight"],
+                    expected["transformer.h.0.mlp.w1.weight"],
+                ]
+            ),
+        )
+
     def test_fp16_prefill_and_decode(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
