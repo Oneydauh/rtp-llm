@@ -15,10 +15,12 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from transformers import PreTrainedTokenizerFast
 
+from rtp_llm.config.py_config_modules import DeepEPConfig
 from rtp_llm.config.quant_config import (
     Fp8BlockWiseQuantConfig,
     Fp8PerChannelCompressedQuantConfig,
 )
+from rtp_llm.config.server_config_setup import auto_configure_deepep
 from rtp_llm.models.glm4_moe import Glm4Moe
 from rtp_llm.models_py.model_loader import NewLoaderConfig, NewModelLoader
 from rtp_llm.models_py.quant_methods.base import QuantizationConfig
@@ -26,7 +28,7 @@ from rtp_llm.models_py.quant_methods.test.test_glm_ft_block_tree import (
     inputs,
     channel_inputs,
 )
-from rtp_llm.ops import FMHAConfig, HWKernelConfig, MoeConfig
+from rtp_llm.ops import FMHAConfig, HWKernelConfig, MoeConfig, RoleType
 from rtp_llm.tools.convert.weights_convert import WeightConverter
 
 
@@ -142,6 +144,9 @@ class LegacyWriterToServingTest(unittest.TestCase):
                 True,
             )
 
+            pc = converter._build_parallelism_config()
+            self.assertEqual((pc.world_size, pc.tp_size, pc.ep_size), (1, 1, 1))
+
             def load_and_evaluate(path, backend):
                 cfg = Glm4Moe._create_config(str(path))
                 cfg.model_type = "glm4_moe"
@@ -157,14 +162,21 @@ class LegacyWriterToServingTest(unittest.TestCase):
                     )
                     key = "fp8_block_online" if mode == "online_block" else "fp8_block"
                 cfg.quant_config = source
+                # Direct construction skips the server CLI's all-gather default
+                # and the topology pass. Use the same policy as single-rank serving.
+                moe = MoeConfig()
+                moe.use_all_gather = True
+                auto_configure_deepep(moe, DeepEPConfig(), pc, RoleType.PDFUSION)
+                self.assertTrue(moe.use_all_gather)
+                self.assertFalse(moe.use_deepep_low_latency)
                 config = NewLoaderConfig(
                     device="cuda:0",
                     compute_dtype=torch.bfloat16,
                     load_method=backend,
                     quant_config=QuantizationConfig(key, source),
-                    parallelism_config=converter._build_parallelism_config(),
+                    parallelism_config=pc,
                     fmha_config=FMHAConfig(),
-                    moe_config=MoeConfig(),
+                    moe_config=moe,
                     py_hw_kernel_config=HWKernelConfig(),
                 )
                 loader = NewModelLoader(cfg, config, model_path=str(path))
