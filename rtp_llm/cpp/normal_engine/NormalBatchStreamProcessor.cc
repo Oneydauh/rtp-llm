@@ -132,8 +132,10 @@ absl::StatusOr<SamplerInputs> NormalBatchStreamProcessor::gatherSamplerInput(
     const StreamGroups& stream_groups, const GptModelInputs& model_inputs, const GptModelOutputs& model_output) const {
     auto              result          = sampler_input_gatherer_->gather(stream_groups, model_inputs, model_output);
     static const bool fixture_enabled = [] {
-        const auto* value = std::getenv("RTP_V41_LONG_PREFILL_PROBE");
-        return value && std::strcmp(value, "1") == 0;
+        const auto* value  = std::getenv("RTP_V41_LONG_PREFILL_PROBE");
+        const auto* target = std::getenv("TEST_TARGET");
+        return value && std::strcmp(value, "1") == 0 && target
+               && std::strcmp(target, "//rtp_llm/test/smoke:deepseek_v41_long_prefill_logits_sm100_arm") == 0;
     }();
     if (fixture_enabled && model_input_gatherer_config_.role_type == RoleType::PREFILL && result.ok()) {
         captureV41Fixture(stream_groups, result->logits);

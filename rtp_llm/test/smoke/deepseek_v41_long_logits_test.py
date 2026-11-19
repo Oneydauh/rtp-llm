@@ -42,10 +42,18 @@ class DeepSeekV41LongLogitsTest(
             "oldfst": "finally choose load method: fastsafetensors",
             "newfst": "NewLoader load method: requested=fastsafetensors, selected=fastsafetensors",
         }
-        self.assertIn(markers[loader], startup)
-        self.assertNotIn(markers["newfst" if loader == "oldfst" else "oldfst"], startup)
-        self.assertNotIn("finally choose load method: scratch", startup)
-        self.assertNotIn("selected=scratch", startup)
+        # unittest membership assertions print the entire container on
+        # failure. Never include the service startup log in an assertion.
+        self.assertTrue(
+            markers[loader] in startup, "missing expected FST loader marker"
+        )
+        other = "newfst" if loader == "oldfst" else "oldfst"
+        self.assertFalse(markers[other] in startup, "ambiguous FST loader path")
+        self.assertFalse(
+            "finally choose load method: scratch" in startup
+            or "selected=scratch" in startup,
+            "unexpected scratch loader path",
+        )
         offset = log.stat().st_size
         result = self.session.post(
             f"http://127.0.0.1:{self.server.port}/", json=query, timeout=600
