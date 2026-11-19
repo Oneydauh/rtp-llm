@@ -199,6 +199,8 @@ class FrontendWorker:
 
     def inference(self, **kwargs: Any) -> CompleteResponseAsyncGenerator:
         prefix_file = next_smoke_prefix.approve("single", kwargs)
+        if prefix_file is not None:
+            next_smoke_prefix.authorize(prefix_file, kwargs.get("__request_id__"), (0,))
         # Never permit the transport to supply the internal test-only observer.
         kwargs.pop("_next_fixture_prefix_file", None)
         default_generate_config = GenerateConfig()

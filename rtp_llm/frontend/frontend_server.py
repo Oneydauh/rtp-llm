@@ -600,6 +600,8 @@ class FrontendServer(object):
             prompts = req.get("prompt_batch", [])
             generate_config = req.get("generate_config", {})
             prefix_file = next_smoke_prefix.approve("batch", req)
+            if prefix_file is not None:
+                next_smoke_prefix.authorize(prefix_file, request_id, (1, 2, 3))
             result = await self._frontend_worker.batch_infer(
                 prompts=prompts,
                 request_id=request_id,
