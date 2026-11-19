@@ -11,6 +11,30 @@ namespace rtp_llm {
 
 namespace {
 
+// Collect runtime evidence only after a failed enqueue; a preceding asynchronous
+// failure may also be surfaced by these best-effort queries. Never retry here:
+// copyBlocks must report the original error and drain the stream on unwind.
+void logFailedCopyContext(const void* src, const void* dst, cudaStream_t stream) {
+    int                   current_device = -1;
+    unsigned int          stream_flags = 0;
+    cudaPointerAttributes src_attrs{};
+    cudaPointerAttributes dst_attrs{};
+    const auto            device_rc = cudaGetDevice(&current_device);
+    const auto            stream_rc = cudaStreamGetFlags(stream, &stream_flags);
+    const auto            src_rc = cudaPointerGetAttributes(&src_attrs, src);
+    const auto            dst_rc = cudaPointerGetAttributes(&dst_attrs, dst);
+    RTP_LLM_LOG_ERROR("PPU copy runtime diagnostics: device_rc=%d current_device=%d "
+                      "stream_flags_rc=%d stream_flags=%u "
+                      "src_attr_rc=%d src_type=%d src_device=%d "
+                      "dst_attr_rc=%d dst_type=%d dst_device=%d",
+                      static_cast<int>(device_rc), device_rc == cudaSuccess ? current_device : -1,
+                      static_cast<int>(stream_rc), stream_flags,
+                      static_cast<int>(src_rc), src_rc == cudaSuccess ? static_cast<int>(src_attrs.type) : -1,
+                      src_rc == cudaSuccess ? src_attrs.device : -1,
+                      static_cast<int>(dst_rc), dst_rc == cudaSuccess ? static_cast<int>(dst_attrs.type) : -1,
+                      dst_rc == cudaSuccess ? dst_attrs.device : -1);
+}
+
 at::cuda::CUDAStream getNoBlockCopyStream(int device) {
     // A worker can serve more than one device over its lifetime.
     static thread_local std::unordered_map<int, at::cuda::CUDAStream> streams;
@@ -115,6 +139,7 @@ void copyBlocks(const MultiCopyParams& params, const DeviceHostCopyExecutionCont
                                   dst.nbytes(),
                                   stream,
                                   cudaGetErrorString(error));
+                logFailedCopyContext(src.data_ptr(), dst.data_ptr(), stream);
             }
             check_cuda_value(error);
         }

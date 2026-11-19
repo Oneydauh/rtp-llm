@@ -93,6 +93,42 @@ TEST(PpuNoBlockCopyTest, ConcurrentLayerStagingKeepsBytesAndOwnerLifetimes) {
     }
 }
 
+TEST(PpuNoBlockCopyTest, PrefillReloadsInteriorHostSlotIntoDeviceBlockOnWorker) {
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    // Match pd_reuse_prefill_memory: host slot 1 is 24 x 4 KiB into the
+    // host backing; layer 0, device block 3 is 12 KiB into the KV pool.
+    constexpr int64_t bytes = 4096, host_slot = 24 * bytes, device_block = 3 * bytes;
+    auto host_opts = bytesOn(torch::kCPU);
+    auto gpu_opts  = bytesOn(torch::Device(torch::kCUDA, 0));
+    auto host      = torch::empty({host_slot * 2}, host_opts.pinned_memory(true)).fill_(19);
+    auto gpu       = torch::full({device_block + 2 * bytes}, 37, gpu_opts);
+    auto owner     = acquireDeviceHostCopyStreams(0);
+    auto host_view = torch::from_blob(host.data_ptr<uint8_t>() + host_slot, {bytes}, host_opts);
+    auto gpu_view  = torch::from_blob(gpu.data_ptr<uint8_t>() + device_block, {bytes}, gpu_opts);
+    auto expected  = torch::arange(bytes, torch::kInt32).to(torch::kUInt8);
+    host_view.copy_(expected);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    // Negative case: a short second destination must reject the entire H2D
+    // batch rather than partially restoring the first (valid) KV block.
+    EXPECT_THROW(execNoBlockCopy({{gpu_view, gpu_view.narrow(0, 0, bytes - 1)}, {host_view, host_view}},
+                                 {owner, DeviceHostCopyDirection::H2D}),
+                 c10::Error);
+    ASSERT_TRUE(torch::equal(gpu.cpu(), torch::full({gpu.numel()}, 37, host_opts)));
+    std::exception_ptr error;
+    std::thread worker([&] {
+        try {
+            execNoBlockCopy({{gpu_view}, {host_view}}, {owner, DeviceHostCopyDirection::H2D});
+        } catch (...) { error = std::current_exception(); }
+    });
+    worker.join();
+    if (error) {
+        std::rethrow_exception(error);
+    }
+    auto expected_gpu = torch::full({gpu.numel()}, 37, host_opts);
+    expected_gpu.narrow(0, device_block, bytes).copy_(expected);
+    EXPECT_TRUE(torch::equal(gpu.cpu(), expected_gpu));
+}
+
 TEST(PpuNoBlockCopyTest, CopiesBeyondFourGiBAllocationOffset) {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
     // The smoke pool is 91 GiB; layer bases pass 32-bit offsets. Reserve only
