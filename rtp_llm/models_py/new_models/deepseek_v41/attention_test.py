@@ -98,6 +98,38 @@ def load(owner, values):
 
 
 class AttentionCheckpointTest(unittest.TestCase):
+    def test_qkv_runtime_reuses_loaded_parameters_and_raw_scale_views(self):
+        owner = load(OwnedV41Attention(config(), 0, {}), weights())
+        initial = dict(owner.named_parameters())
+        q, kv = owner.wq_a, owner.wkv
+        original = [p.view(torch.uint8).clone() for p in (q.weight, kv.weight)]
+
+        # CPU storage-only stand-in for the native SM100 GEMM. The source
+        # values and direct-dispatch parameter tree come from the real loader.
+        def merge(qw, qs, kw, ks):
+            weight = torch.cat([x.view(torch.uint8) for x in (qw, kw)]).view(qw.dtype)
+            scale = torch.cat([x.view(torch.uint8) for x in (qs, ks)]).view(qs.dtype)
+            return (
+                torch.nn.Identity(),
+                weight.split([qw.size(0), kw.size(0)]),
+                scale.split([qs.size(0), ks.size(0)]),
+            )
+
+        owner._prepare_qkv(merge)
+        self.assertIsNotNone(owner.wq_a_wkv)
+        self.assertNotIn("wq_a_wkv", dict(owner.named_modules()))
+        for name, p in owner.named_parameters():
+            self.assertIs(initial[name], p)
+        for a, b in ((q.weight, kv.weight), (q.scale, kv.scale)):
+            self.assertEqual(
+                a.untyped_storage().data_ptr(), b.untyped_storage().data_ptr()
+            )
+            self.assertEqual(b.storage_offset(), a.numel())
+        for idx, p in enumerate((q.weight, kv.weight)):
+            self.assertTrue(torch.equal(p.view(torch.uint8), original[idx]))
+        owner.to("cpu")
+        self.assertIsNone(owner.wq_a_wkv)
+
     def test_grouped_wo_a_keeps_sources_without_a_standalone_executor(self):
         for rank in (0, 1):
             with self.subTest(rank=rank):

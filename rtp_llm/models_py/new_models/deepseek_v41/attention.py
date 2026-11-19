@@ -257,11 +257,38 @@ class OwnedV41Attention(RtpModule):
     def validate_runtime_device(self, device):
         self.wkv.validate_runtime_device(device)
 
+    @torch.no_grad()
+    def _prepare_qkv(self, merge):
+        # Keep the four checkpoint Parameters (and their identity). A native
+        # prefill projection reads their shared allocation, not another copy.
+        q, kv = self.wq_a, self.wkv
+        merged = merge(q.weight, q.scale, kv.weight, kv.scale)
+        if merged is None:
+            object.__setattr__(self, "wq_a_wkv", None)
+            return
+        linear, weights, scales = merged
+        for projection, weight, scale in zip((q, kv), weights, scales):
+            projection.weight.set_(weight)
+            projection.scale.set_(scale)
+            object.__setattr__(projection, "_executor", None)
+        # Derived executor; never register a second checkpoint owner or let
+        # Module._apply convert its packed scales independently of the owners.
+        object.__setattr__(self, "wq_a_wkv", linear)
+
+    def _apply(self, fn, recurse=True):
+        object.__setattr__(self, "wq_a_wkv", None)
+        return super()._apply(fn, recurse=recurse)
+
     def process_weights_after_loading(self):
         self.validate_weights_loaded()
         self.validate_runtime_device(self.wkv.weight.device)
         from rtp_llm.models_py.modules.dsv41.fp8.attention import _prepare_wo_a_stacked
+        from rtp_llm.models_py.modules.dsv41.utils import (
+            _v4_fp8_linear,
+            merge_v41_qkv_tensors,
+        )
 
+        self._prepare_qkv(merge_v41_qkv_tensors)
         self._wo_a_stk_w, self._wo_a_stk_s = _prepare_wo_a_stacked(
             self.wo_a.weight,
             self.wo_a.scale,
@@ -269,8 +296,6 @@ class OwnedV41Attention(RtpModule):
             self.o_lora_rank,
             self.n_heads * self.head_dim // self.n_groups,
         )
-        from rtp_llm.models_py.modules.dsv41.utils import _v4_fp8_linear
-
         self._wo_a_groups_v41 = [
             _v4_fp8_linear(
                 self.wo_a.weight[g * self.o_lora_rank : (g + 1) * self.o_lora_rank],
