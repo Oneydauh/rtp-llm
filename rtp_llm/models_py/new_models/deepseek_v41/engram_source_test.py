@@ -66,6 +66,7 @@ class EngramSourceTest(unittest.TestCase):
     def test_ready_is_reported_only_after_local_engram_tables_bind(self):
         from tokenizers import Tokenizer, models
         from transformers import PreTrainedTokenizerFast
+
         from rtp_llm.models_py.new_models.deepseek_v41.language import (
             DeepSeekV41ForCausalLM,
         )
@@ -212,6 +213,7 @@ class EngramSourceTest(unittest.TestCase):
                 scratch = self.load(folder, layer, "scratch")
                 native_layer = self.load(folder, layer, "fastsafetensors")
                 NewModelLoader._validate_loaded_weights(native_layer)
+                self.assertIsNone(native_layer.wkv.v41_runtime_linear)
                 self.assertEqual(len(list(native_layer.parameters())), 6)
                 self.assertEqual(
                     native_layer.embed.weight.data_ptr(),

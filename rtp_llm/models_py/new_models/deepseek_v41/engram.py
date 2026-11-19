@@ -106,6 +106,13 @@ class OwnedEngramProjection(RtpModule):
         )
         object.__setattr__(self, "_executor", None)
 
+    @property
+    def v41_runtime_linear(self):
+        # The native WKV is deliberately not a registered child. Expose its
+        # warmup contract without registering a second owner or advertising
+        # the CPU reference as a group32 CUDA executor.
+        return getattr(self._executor, "v41_runtime_linear", None)
+
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse)
         object.__setattr__(self, "_executor", None)

@@ -1,8 +1,10 @@
 """Run on an explicitly reserved GPU; covers pinned host reads in graph replay."""
 
 import os
+import tempfile
 import unittest
 import uuid
+from pathlib import Path
 from unittest.mock import patch
 
 import torch
@@ -16,6 +18,47 @@ from rtp_llm.models_py.modules.dsv41.engram import (
     gated_engram_residual,
 )
 from rtp_llm.models_py.modules.dsv41.utils import V41MXFP8Linear
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires a CUDA GPU")
+class EngramProjectionWarmupTest(unittest.TestCase):
+    @torch.inference_mode()
+    def test_loaded_wkv_is_discovered_without_registering_another_weight(self):
+        if torch.cuda.get_device_capability()[0] != 10:
+            self.skipTest("requires SM100 group32 GEMM")
+        from safetensors.torch import save_file
+
+        from rtp_llm.models_py.modules.dsv41.dsv41_kernel_jit_warmup import (
+            collect_v41_dense_shapes,
+        )
+        from rtp_llm.models_py.new_models.deepseek_v41.engram import (
+            OwnedEngramProjection,
+        )
+        from rtp_llm.models_py.weight_mapper import get_all_weights
+
+        n, k = 640, 512
+        w = torch.randn(n, k).to(torch.float8_e4m3fn)
+        s = torch.ones(n // 32, k // 32).to(torch.float8_e8m0fnu)
+        model = torch.nn.Module()
+        model.wkv = OwnedEngramProjection(k, n).cuda()
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "model.safetensors")
+            save_file({"weight": w, "scale": s}, path)
+            model.wkv.load_weights(get_all_weights([path]))
+        self.assertEqual(collect_v41_dense_shapes(model)[0], {})
+        model.wkv.process_weights_after_loading()
+        native = model.wkv.v41_runtime_linear
+        self.assertIs(type(native), V41MXFP8Linear)
+        linears, _ = collect_v41_dense_shapes(model)
+        self.assertEqual(linears, {(n, k): ("wkv", native)})
+        self.assertEqual(
+            set(dict(model.named_parameters())), {"wkv.weight", "wkv.scale"}
+        )
+        self.assertIs(native.weight, model.wkv.weight)
+        x = torch.randn(392, k, device="cuda", dtype=torch.bfloat16)
+        self.assertTrue(
+            torch.equal(model.wkv(x), V41MXFP8Linear(w.cuda(), s.cuda())(x))
+        )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires a CUDA GPU")
