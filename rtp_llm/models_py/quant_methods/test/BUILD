@@ -135,6 +135,7 @@ py_test(
     main = "test_glm_ft_block_serving.py",
     data = ["//:rtp_compute_ops", "//:th_transformer_config"],
     deps = [
+        "//rtp_llm:transformers",
         "//rtp_llm/models_py:new_weight_loader",
         "//rtp_llm/tools/convert:convert",
     ],

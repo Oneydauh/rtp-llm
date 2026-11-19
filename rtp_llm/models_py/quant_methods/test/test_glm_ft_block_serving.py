@@ -11,6 +11,9 @@ from pathlib import Path
 
 import torch
 from safetensors.torch import save_file
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import PreTrainedTokenizerFast
 
 from rtp_llm.config.quant_config import (
     Fp8BlockWiseQuantConfig,
@@ -46,6 +49,18 @@ class LegacyWriterToServingTest(unittest.TestCase):
             hf, ft = root / "hf", root / "ft"
             hf.mkdir()
             ft.mkdir()
+            # The real export descriptor initializes the production tokenizer.
+            # Keep a complete, offline checkpoint with the same vocabulary as the head.
+            tokenizer = PreTrainedTokenizerFast(
+                tokenizer_object=Tokenizer(
+                    WordLevel(
+                        {"[UNK]": 0, **{str(i): i for i in range(1, 8)}},
+                        unk_token="[UNK]",
+                    )
+                ),
+                unk_token="[UNK]",
+            )
+            tokenizer.save_pretrained(hf)
             (hf / "config.json").write_text(
                 json.dumps(
                     dict(

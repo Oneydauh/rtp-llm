@@ -25,6 +25,7 @@ py_library(
     ]),
     deps = [
         "//rtp_llm:config",
+        "//rtp_llm:model_factory",
         "//rtp_llm:models",
         "//rtp_llm:openai_api",
         "//rtp_llm:structure",
