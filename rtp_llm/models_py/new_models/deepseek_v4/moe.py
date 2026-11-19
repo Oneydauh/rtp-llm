@@ -253,8 +253,13 @@ class OwnedFp8Fp4MoE(RtpModule):
                 if tensor.shape != target.shape:
                     raise ValueError(f"Shape mismatch for {name}: {tensor.shape}")
                 lo, hi = torch.aminmax(tensor)
-                if lo.item() < 0 or hi.item() >= self.num_experts:
-                    raise ValueError(f"{name} contains an out-of-range expert index")
+                lo, hi = lo.item(), hi.item()
+                if lo < 0 or hi >= self.num_experts:
+                    from rtp_llm.models_py.v4_fst_diagnostic import V4RouterRangeError
+
+                    raise V4RouterRangeError(
+                        self.layer_id, self.num_experts, tensor, lo, hi
+                    )
                 with torch.no_grad():
                     target.copy_(tensor)
             else:

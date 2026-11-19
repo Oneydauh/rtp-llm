@@ -1,8 +1,10 @@
 """CPU contract tests: do not exercise CUDA kernels or real FST I/O."""
 
 import queue
+import tempfile
 import unittest
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -11,6 +13,50 @@ from rtp_llm.models_py import v4_fst_diagnostic as diag
 
 
 class TraceTest(unittest.TestCase):
+    def test_rejected_hash_router_compares_only_its_small_physical_tensor(self):
+        from safetensors.torch import save_file
+
+        torch = diag.torch
+        key = "layers.2.ffn.gate.tid2eid"
+        source = torch.tensor([[0, 1], [1, 0]])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "private_checkpoint_name.safetensors")
+            save_file(
+                {key: source, "private_other_tensor": torch.tensor([98765])}, path
+            )
+            catalog = lambda: SimpleNamespace(entries=((key, path),))
+            observed = source.clone()
+            observed[1, 1] = 3
+            error = diag.V4RouterRangeError(2, 2, observed, 0, 3)
+            t = diag.V4FstTrace("trace", 1, "cpu")
+            with self.assertLogs(diag.log, level="ERROR") as logs:
+                t.compare_bad_router(error, catalog, [path])
+            msg = logs.output[0]
+            self.assertIn("layer=2", msg)
+            self.assertIn("source_range=[0,1] equal=False", msg)
+            self.assertIn("observed_sha256=", msg)
+            for private in (tmp, "private", "98765", key):
+                self.assertNotIn(private, msg)
+            with self.assertLogs(diag.log, level="ERROR") as logs:
+                t.compare_bad_router(error, catalog, [])
+            self.assertIn("unavailable", logs.output[0])
+            self.assertNotIn(tmp, logs.output[0])
+            save_file({key: observed}, path)
+            with self.assertLogs(diag.log, level="ERROR") as logs:
+                t.compare_bad_router(error, catalog, [path])
+            self.assertIn("source_range=[0,3] equal=True", logs.output[0])
+
+    def test_other_failure_or_oversize_router_never_reads_the_checkpoint(self):
+        catalog = mock.Mock()
+        trace = diag.V4FstTrace("trace", 1, "cpu")
+        trace.compare_bad_router(ValueError("private path"), catalog, [])
+        value = diag.torch.empty((1025, 1024), device="meta", dtype=diag.torch.int64)
+        with self.assertLogs(diag.log, level="ERROR"):
+            trace.compare_bad_router(
+                diag.V4RouterRangeError(2, 2, value, 0, 8), catalog, []
+            )
+        catalog.assert_not_called()
+
     def test_metadata_no_paths_or_tensor_payload(self):
         files = [
             "/private/credentials/model-00005-of-00048.safetensors",

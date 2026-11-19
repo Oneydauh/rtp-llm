@@ -6,6 +6,7 @@ proof of the identity of a failing kernel.
 """
 
 import ctypes
+import hashlib
 import logging
 import os
 import re
@@ -15,6 +16,19 @@ from pathlib import Path
 import torch
 
 log = logging.getLogger(__name__)
+
+
+class V4RouterRangeError(ValueError):
+    """This table failed the existing model gate ABI validation, not a retry."""
+
+    def __init__(self, layer, num_experts, observed, lo, hi):
+        self.layer, self.num_experts = layer, num_experts
+        self.observed, self.lo, self.hi = observed, lo, hi
+        super().__init__(
+            f"gate.tid2eid contains an out-of-range expert index: layer={layer} "
+            f"dtype={observed.dtype} shape={tuple(observed.shape)} "
+            f"observed=[{lo},{hi}] valid=[0,{num_experts})"
+        )
 
 
 def _pci(ordinal):
@@ -47,6 +61,76 @@ def _namespace_pids():
 
 
 class V4FstTrace:
+    def compare_bad_router(self, error, catalog_fn, selected_files):
+        """Compare at most 8 MiB on the failed worker; never use it for loading."""
+        if not isinstance(error, V4RouterRangeError):
+            return
+        try:
+            observed = error.observed
+            if (
+                type(error.layer) is not int
+                or not 0 <= error.layer < 128
+                or observed.dim() != 2
+                or observed.numel() == 0
+                or observed.numel() * observed.element_size() > 8 * 1024**2
+                or observed.dtype not in (torch.int32, torch.int64)
+            ):
+                raise ValueError("unsupported table")
+            # A validated weight index from this loader, not a path fabricated
+            # from a tensor name, message, environment variable or exception.
+            name = f"layers.{error.layer}.ffn.gate.tid2eid"
+            files = {os.path.realpath(p) for p in selected_files}
+            sources = [
+                p
+                for k, p in catalog_fn().entries
+                if k == name and os.path.realpath(p) in files
+            ]
+            if len(sources) != 1:
+                raise ValueError("ambiguous source")
+            from safetensors import safe_open
+
+            with safe_open(sources[0], framework="pt", device="cpu") as reader:
+                metadata = reader.get_slice(name)
+                expected = "I32" if observed.dtype == torch.int32 else "I64"
+                if (
+                    tuple(metadata.get_shape()) != tuple(observed.shape)
+                    or metadata.get_dtype() != expected
+                ):
+                    raise ValueError("source metadata mismatch")
+                reference = reader.get_tensor(name)
+                actual = observed.detach().to("cpu").contiguous()
+
+                def digest(value):
+                    return hashlib.sha256(
+                        memoryview(value.view(torch.uint8).numpy())
+                    ).hexdigest()
+
+                log.error(
+                    "V4FST failed_router rank=%s layer=%d dtype=%s shape=%s "
+                    "observed_range=[%d,%d] source_range=[%d,%d] "
+                    "equal=%s observed_sha256=%s source_sha256=%s",
+                    self.rank,
+                    error.layer,
+                    observed.dtype,
+                    tuple(observed.shape),
+                    error.lo,
+                    error.hi,
+                    reference.min().item(),
+                    reference.max().item(),
+                    torch.equal(actual, reference),
+                    digest(actual),
+                    digest(reference),
+                )
+        except Exception as diagnostic_error:
+            # Even a poisoned CUDA context or inaccessible file must preserve
+            # the *original* validation rejection. Exception strings can leak paths.
+            log.error(
+                "V4FST failed_router unavailable rank=%s layer=%s reason=%s",
+                self.rank,
+                error.layer,
+                type(diagnostic_error).__name__,
+            )
+
     def __init__(self, mode, rank, device):
         self.mode, self.rank, self.device = mode, rank, device
         self._batches = {}

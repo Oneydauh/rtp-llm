@@ -2597,6 +2597,14 @@ class NewModelLoader:
                 model.load_weights(weights)
                 if staged_coordinator is not None:
                     staged_coordinator.finish()
+            except ValueError as exc:
+                # Read diagnostic evidence only on the already-failed V4 smoke,
+                # while the yielded FST tensor is still owned by the reader.
+                if self._v4_fst_trace is not None:
+                    self._v4_fst_trace.compare_bad_router(
+                        exc, self._checkpoint_catalog, selected_files
+                    )
+                raise
             finally:
                 if previous_load_plan is _CHECKPOINT_LOAD_PLAN_UNSET:
                     delattr(model, "_rtp_checkpoint_load_plan")
