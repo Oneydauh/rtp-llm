@@ -29,6 +29,16 @@ from rtp_llm.models_py.read_spec import (
 from rtp_llm.models_py.weight_mapper import WeightsMapper
 
 
+class _GroupedOutputWeights(Dsv41MXFP8Linear):
+    """Checkpoint owner; the attention module prepares both grouped WO-A kernels."""
+
+    def process_weights_after_loading(self):
+        self.validate_weights_loaded()
+        self.validate_runtime_device(self.weight.device)
+        # No standalone linear is invoked for this projection. Constructing one
+        # would retain a third packed scale alongside the stacked/group kernels.
+
+
 class OwnedV41Attention(RtpModule):
     """Main runtime methods, checkpoint-native Parameters, no ModelWeights."""
 
@@ -75,7 +85,7 @@ class OwnedV41Attention(RtpModule):
             partition="column",
         )
         self.wkv = Dsv41MXFP8Linear(args.dim, args.head_dim)
-        self.wo_a = Dsv41MXFP8Linear(
+        self.wo_a = _GroupedOutputWeights(
             args.n_heads * args.head_dim // args.o_groups,
             args.o_groups * args.o_lora_rank,
             tp_size=args.tp_size,

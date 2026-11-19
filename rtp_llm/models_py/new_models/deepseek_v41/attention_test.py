@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
@@ -97,6 +98,20 @@ def load(owner, values):
 
 
 class AttentionCheckpointTest(unittest.TestCase):
+    def test_grouped_wo_a_keeps_sources_without_a_standalone_executor(self):
+        for rank in (0, 1):
+            with self.subTest(rank=rank):
+                owner = load(OwnedV41Attention(config(rank), 0, {}), weights())
+                leaf = owner.wo_a
+                with patch.object(leaf, "validate_runtime_device") as preflight:
+                    NewModelLoader._run_post_load_hooks(leaf)
+                preflight.assert_called_once_with(leaf.weight.device)
+                self.assertIsNone(leaf._executor)
+                self.assertIs(owner.wo_a_w, leaf.weight)
+                self.assertIs(owner.wo_a_s, leaf.scale)
+                with self.assertRaisesRegex(RuntimeError, "requires CUDA"):
+                    leaf.process_weights_after_loading()
+
     def test_source_consumer_shards_are_owned_and_runtime_views_alias(self):
         for rank in (0, 1):
             shared = {}
