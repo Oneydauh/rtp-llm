@@ -61,7 +61,9 @@ def _row(t):
 
 def capture(path, responses):
     """Write terminal-prefix digests only, never fail or change the request."""
-    if path is None:
+    if (not isinstance(path, Path)
+            or os.environ.get("RTP_NEXT_SMOKE_PREFIX") != "1"
+            or os.environ.get("TEST_TARGET") not in _TARGETS):
         return
     try:
         rows = []
