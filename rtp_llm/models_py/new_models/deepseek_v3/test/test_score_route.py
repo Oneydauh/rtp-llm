@@ -3,6 +3,7 @@ import json
 import math
 import tempfile
 import unittest
+import weakref
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -124,6 +125,7 @@ class ScoreRouteTest(unittest.TestCase):
 
     def test_main_config_load_and_sparse_runtime_ownership(self):
         for tag, hf, sparse, interleave in (
+            ("deepseek2", "deepseek_v2", False, False),
             ("deepseek3", "deepseek_v3", False, False),
             ("deepseek_v32", "deepseek_v32", True, False),
             ("glm_5", "glm_moe_dsa", True, True),
@@ -139,6 +141,13 @@ class ScoreRouteTest(unittest.TestCase):
                 qk_rope_head_dim=4, v_head_dim=4, vocab_size=32, routed_scaling_factor=2.5,
                 rms_norm_eps=1e-6, rope_theta=10000, torch_dtype="bfloat16",
             )
+            if tag == "deepseek2":
+                # V2-Lite: the checkpoint has a direct Q projection, not Q-LoRA.
+                cfg["q_lora_rank"] = None
+                for layer in range(2):
+                    prefix = f"model.layers.{layer}.self_attn."
+                    data[prefix + "q_proj.weight"] = data.pop(prefix + "q_a_proj.weight")
+                    del data[prefix + "q_b_proj.weight"], data[prefix + "q_a_layernorm.weight"]
             if sparse:
                 cfg.update(index_n_heads=2, index_head_dim=128, index_topk=4, indexer_rope_interleave=interleave)
                 for layer in range(2):
@@ -172,6 +181,7 @@ class ScoreRouteTest(unittest.TestCase):
                         model = service.py_model
                         self.assertIsInstance(model, DeepSeekV32ForCausalLM)
                         self.assertEqual(service.model_weights_loader.loaded_method, NewLoaderLoadMethod(method))
+                        q_source = weakref.ref(model.layers[0].self_attn.q_a_proj.weight)
                         self.assertTrue(model.initialize(SimpleNamespace(kv_cache=None)))
                         self.assertIs(model.weight.weights[1][W.mla_kc], model.layers[1].self_attn._kc_w)
                         self.assertEqual(model._get_fmha_group_tags(), ["default", "indexer_kv"] if sparse else None)
@@ -191,6 +201,30 @@ class ScoreRouteTest(unittest.TestCase):
                             torch.testing.assert_close(idx._get_logits_head_gate(x, scales), expected)
                         else:
                             self.assertIsNone(model.layers[1].indexer)
+                        if tag == "deepseek2":
+                            manager = service.weight_manager
+                            norm = model.layers[0].input_layernorm
+                            name = "model.layers.0.input_layernorm.weight"
+                            updated = torch.full_like(norm.weight, 2.5)
+                            before_ptr = norm.weight.data_ptr()
+                            manager.update_tensors({name: updated})
+                            self.assertEqual(manager.version, 1)
+                            self.assertEqual(norm.weight.data_ptr(), before_ptr)
+                            torch.testing.assert_close(norm.weight, updated, rtol=0, atol=0)
+                            self.assertIsNone(q_source())
+                            # Writing an expired projection would not update the
+                            # fused tensor that inference actually consumes.
+                            for source in ("q_proj", "kv_a_proj_with_mqa", "kv_b_proj"):
+                                key = f"model.layers.0.self_attn.{source}.weight"
+                                with self.assertRaises(NotImplementedError):
+                                    manager.update_tensors({key: data[key]})
+                            # The global check still catches changes to a live
+                            # parameter even when the RPC targets another one.
+                            other = model.layers[0].post_attention_layernorm
+                            other.weight = torch.nn.Parameter(other.weight.clone(), requires_grad=False)
+                            with self.assertRaisesRegex(RuntimeError, "parameter/storage changed.*post_attention_layernorm"):
+                                manager.update_tensors({name: updated})
+                            self.assertEqual(manager.version, 1)
 
 
 if __name__ == "__main__":

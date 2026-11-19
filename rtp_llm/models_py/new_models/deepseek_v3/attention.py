@@ -378,6 +378,13 @@ class DeepSeekV32MlaAttention(RtpModule):
             bias=False,
             params_dtype=params_dtype,
         )
+        # These three linears are sources for attention-owned fused QKV-A and
+        # KV-B/KC/VC. Replacing one source alone cannot update all consumers;
+        # initialize() may discard its storage after building kernel views.
+        # Do not publish them as independently mutable linears (or retain them
+        # in the update manager). Q-B, O and the norms remain live owners.
+        for source in (self.q_a_proj, self.kv_a_proj_with_mqa, self.kv_b_proj):
+            source.supports_independent_weight_updates = False
         # o_proj: num_heads * v_head_dim → hidden
         self.o_proj = RowParallelLinear(
             input_size=num_heads * v_head_dim,
