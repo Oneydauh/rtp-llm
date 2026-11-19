@@ -729,8 +729,13 @@ py_test(
     ],
     tags = ["H20_CU13"],
     exec_properties = {"gpu": "H20_CU13", "gpu_count": "1"},
+    target_compatible_with = select({
+        "@//:using_cuda13_x86": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
     deps = [
         ":new_weight_loader",
+        "//rtp_llm:fastsafetensors",
         "//rtp_llm:models",
         "//rtp_llm:multimodal",
         "//rtp_llm/cpp/model_rpc/proto:model_rpc_service_py_proto",
