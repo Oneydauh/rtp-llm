@@ -1,4 +1,8 @@
 #include "rtp_llm/cpp/normal_engine/speculative/MtpCompute.h"
+#include "rtp_llm/cpp/normal_engine/speculative/V4SmokeWitness.h"
+#include <fstream>
+#include <iomanip>
+#include <openssl/sha.h>
 #include "rtp_llm/cpp/observability/ExecutionRecorder.h"
 #include "rtp_llm/cpp/normal_engine/speculative/MtpExecutor.h"
 #include "rtp_llm/cpp/normal_engine/NormalExecutor.h"
@@ -74,6 +78,113 @@ GptModelOutputs MtpExecutor::forwardModel(ModelBase* model, const GptModelInputs
 }
 
 namespace {
+
+struct V4AuditScores {
+    double  a, b;
+    int64_t argmax;
+};
+struct V4AuditRow {
+    int           slot, batch, col, width;
+    int64_t       row, a, b;
+    V4AuditScores raw, masked;
+    std::string   digest;
+};
+
+// Only the actual target sampler reaches these two sites. The verify histories
+// include proposals preceding each individual row, not just committed tokens.
+std::vector<V4AuditRow> collectV4SmokeRows(
+    const StreamGroups& streams, const SamplerInputs& in, const torch::Tensor& raw_logits, int width, bool verify) {
+    using namespace v4_smoke_witness;
+    std::vector<V4AuditRow> found;
+    if (!enabled() || width <= 0)
+        return found;
+    const auto all = streams.allStreams();
+    if (raw_logits.dim() != 2 || in.logits.dim() != 2 || static_cast<int64_t>(all.size()) * width != in.logits.size(0)
+        || in.logits.size(0) != raw_logits.size(0) || raw_logits.size(1) < in.logits.size(1) || !in.token_ids.defined()
+        || !in.input_lengths.device().is_cpu() || !in.sequence_lengths.device().is_cpu())
+        return found;
+    for (const auto& stream : all)
+        if (stream->maxBatchSize() != 1)
+            return found;
+    int batch = -1;
+    for (const auto& stream : all) {
+        ++batch;
+        if (stream->isMiddleChunk())
+            continue;
+        for (int col = 0; col < width; ++col) {
+            const int64_t row    = batch * width + col;
+            const int     prompt = in.input_lengths.data_ptr<int32_t>()[row];
+            const int     length = in.sequence_lengths.data_ptr<int32_t>()[row];
+            if (!((prompt == 21 && length == 21) || (verify && prompt == 18 && length == 55))
+                || length > in.token_ids.size(1))
+                continue;
+            const auto&            config  = *stream->generateConfig();
+            const std::string_view grammar = config.json_schema    ? std::string_view(*config.json_schema) :
+                                             config.structural_tag ? std::string_view(*config.structural_tag) :
+                                                                     "";
+            const auto             has     = [&](const char* s) { return grammar.find(s) != std::string_view::npos; };
+            const auto             kind    = has("advice") && has("weather") && has("city") ? Grammar::Weather :
+                                             has("anyOf") && has("array")                   ? Grammar::Object :
+                                                                                              Grammar::Other;
+            if (kind == Grammar::Other)
+                continue;
+            const auto history = in.token_ids[row].narrow(0, 0, length).cpu().contiguous();
+            const int  index   = slot(prompt, length, history.data_ptr<int32_t>(), kind, verify);
+            if (index < 0)
+                continue;
+            const int a = index == 17 ? 3315 : 24313;
+            const int b = index == 17 ? 2642 : 2054;
+            // The two model columns and one argmax are the ONLY data copied.
+            auto scores = [&](const torch::Tensor& matrix) -> V4AuditScores {
+                const auto t = matrix[row];
+                return {t[a].item<double>(), t[b].item<double>(), t.argmax().item<int64_t>()};
+            };
+            auto raw = scores(raw_logits.narrow(1, 0, in.logits.size(1)));
+            // Serialize int32 explicitly, independent of the host endianness.
+            unsigned char bytes[55 * 4], digest[SHA256_DIGEST_LENGTH];
+            for (int i = 0; i < length; ++i)
+                for (int j = 0; j < 4; ++j)
+                    bytes[i * 4 + j] = static_cast<uint32_t>(history.data_ptr<int32_t>()[i]) >> (j * 8);
+            SHA256(bytes, length * 4, digest);
+            std::ostringstream hex;
+            for (auto v : digest)
+                hex << std::hex << std::setfill('0') << std::setw(2) << static_cast<unsigned>(v);
+            found.push_back({index, batch, col, width, row, a, b, raw, verify ? scores(in.logits) : raw, hex.str()});
+        }
+    }
+    return found;
+}
+
+void emitV4SmokeRows(const std::vector<V4AuditRow>& rows,
+                     const torch::Tensor&           sampled,
+                     const torch::Tensor&           accept_len    = {},
+                     const torch::Tensor&           accept_tokens = {}) {
+    for (const auto& w : rows) {
+        const bool verify   = accept_len.defined();
+        const int  accepted = verify ? accept_len.reshape({-1})[w.batch].item<int>() : 1;
+        if (!v4_smoke_witness::emitted(w.col, accepted, w.width))
+            continue;
+        const int          target  = sampled[w.row][sampled.size(1) - 1].item<int>();
+        const int          emitted = verify ? accept_tokens[w.batch][w.col].item<int>() : target;
+        std::ostringstream out;
+        out << std::setprecision(10) << "v4_target_witness_v1 case=" << w.slot
+            << " phase=" << (verify ? "verify" : "prefill")
+            << " stage=raw_target_logits prefix_sha256_le_i32=" << w.digest
+            << " canonical_prefix=" << (w.digest == v4_smoke_witness::sha(w.slot))
+            << " output_token_1based=" << (w.slot == 17 ? 38 : 1) << " batch=" << w.batch << " row=" << w.row
+            << " col=" << w.col << " width=" << w.width << " a_id=" << w.a << " b_id=" << w.b << " raw_a=" << w.raw.a
+            << " raw_b=" << w.raw.b << " raw_argmax=" << w.raw.argmax;
+        if (verify)
+            out << " masked_a=" << w.masked.a << " masked_b=" << w.masked.b << " masked_argmax=" << w.masked.argmax
+                << " accept_len=" << accepted;
+        out << " sampled_target=" << target << " emitted=" << emitted;
+        RTP_LLM_LOG_INFO("%s", out.str().c_str());
+        std::ofstream(std::string(std::getenv("TEST_UNDECLARED_OUTPUTS_DIR")) + "/v4-target-witness-"
+                          + std::to_string(w.slot) + "-" + (verify ? "verify" : "prefill") + ".txt",
+                      std::ios::app)
+            << out.str() << '\n';
+    }
+}
 
 bool readEnvFlag(const char* env_name, const char* log_tag, const char* label, bool default_enabled = false) {
     const char* env = std::getenv(env_name);
@@ -1125,7 +1236,9 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
                     sampler_input,
                     batch_stream_processor_->gatherSamplerInput(stream_groups, model_input, model_output));
                 holdSamplerInputHostBuffers(buffer_holder_, sampler_input);
+                const auto witness = collectV4SmokeRows(stream_groups,sampler_input,sampler_input.logits,1,false);
                 sampler_output     = std::move(sampler_->forward(sampler_input));
+                emitV4SmokeRows(witness,sampler_output.token_ids);
                 update_draft_input = !is_dspark_;
             }
         }
@@ -1739,6 +1852,8 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                 }
                 auto& sampler_input = sampler_input_status.value();
                 holdSamplerInputHostBuffers(buffer_holder_, sampler_input);
+                const auto witness = collectV4SmokeRows(stream_groups,sampler_input,model_output.logits,
+                                                        propose_step_+1,true);
                 sampler_output           = std::move(sampler_->forward(sampler_input));
                 sampler_output.all_probs = sampler_output.all_probs.reshape(
                     {(int64_t)batch_size, (int64_t)(propose_step_ + 1), (int64_t)vocab_size_});
@@ -1751,6 +1866,8 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                                           sampler_output,
                                           *spec_logits_result,
                                           speculative_sampler_output);
+                emitV4SmokeRows(witness,sampler_output.token_ids,speculative_sampler_output.accept_len,
+                                speculative_sampler_output.accept_tokens);
             }
         }
         return absl::OkStatus();
