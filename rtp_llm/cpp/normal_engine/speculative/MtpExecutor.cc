@@ -88,6 +88,8 @@ struct V4AuditRow {
     int64_t       row, a, b;
     V4AuditScores raw, masked;
     std::string   digest;
+    int64_t       num_rows;
+    bool          verify;
 };
 
 // Only the actual target sampler reaches these two sites. The verify histories
@@ -98,10 +100,17 @@ std::vector<V4AuditRow> collectV4SmokeRows(
     std::vector<V4AuditRow> found;
     if (!enabled() || width <= 0)
         return found;
-    const auto all = streams.allStreams();
-    if (raw_logits.dim() != 2 || in.logits.dim() != 2 || static_cast<int64_t>(all.size()) * width != in.logits.size(0)
-        || in.logits.size(0) != raw_logits.size(0) || raw_logits.size(1) < in.logits.size(1) || !in.token_ids.defined()
-        || !in.input_lengths.device().is_cpu() || !in.sequence_lengths.device().is_cpu())
+    const auto    all     = streams.allStreams();
+    const int64_t nrows   = static_cast<int64_t>(all.size()) * width;
+    const auto    per_row = [nrows](const torch::Tensor& t) {
+        return t.defined() && t.dim() == 1 && t.numel() == nrows && t.scalar_type() == at::kInt && t.device().is_cpu()
+               && t.is_contiguous();
+    };
+    if (!raw_logits.defined() || !in.logits.defined() || raw_logits.dim() != 2 || in.logits.dim() != 2
+        || nrows != in.logits.size(0) || nrows != raw_logits.size(0) || raw_logits.size(1) < in.logits.size(1)
+        || !in.token_ids.defined() || in.token_ids.dim() != 2 || in.token_ids.size(0) != nrows
+        || in.token_ids.scalar_type() != at::kInt || !per_row(in.input_lengths) || !per_row(in.sequence_lengths)
+        || (verify && raw_logits.is_alias_of(in.logits)))
         return found;
     for (const auto& stream : all)
         if (stream->maxBatchSize() != 1)
@@ -134,6 +143,8 @@ std::vector<V4AuditRow> collectV4SmokeRows(
                 continue;
             const int a = index == 17 ? 3315 : 24313;
             const int b = index == 17 ? 2642 : 2054;
+            if (std::max(a, b) >= in.logits.size(1))
+                continue;
             // The two model columns and one argmax are the ONLY data copied.
             auto scores = [&](const torch::Tensor& matrix) -> V4AuditScores {
                 const auto t = matrix[row];
@@ -149,7 +160,8 @@ std::vector<V4AuditRow> collectV4SmokeRows(
             std::ostringstream hex;
             for (auto v : digest)
                 hex << std::hex << std::setfill('0') << std::setw(2) << static_cast<unsigned>(v);
-            found.push_back({index, batch, col, width, row, a, b, raw, verify ? scores(in.logits) : raw, hex.str()});
+            found.push_back(
+                {index, batch, col, width, row, a, b, raw, verify ? scores(in.logits) : raw, hex.str(), nrows, verify});
         }
     }
     return found;
@@ -159,9 +171,22 @@ void emitV4SmokeRows(const std::vector<V4AuditRow>& rows,
                      const torch::Tensor&           sampled,
                      const torch::Tensor&           accept_len    = {},
                      const torch::Tensor&           accept_tokens = {}) {
+    const auto integers = [](const torch::Tensor& t) {
+        return t.defined() && (t.scalar_type() == at::kInt || t.scalar_type() == at::kLong);
+    };
+    if (rows.empty() || !integers(sampled) || sampled.dim() != 2 || sampled.size(1) == 0)
+        return;
     for (const auto& w : rows) {
-        const bool verify   = accept_len.defined();
-        const int  accepted = verify ? accept_len.reshape({-1})[w.batch].item<int>() : 1;
+        const bool verify = w.verify;
+        if (sampled.size(0) != w.num_rows || w.row < 0 || w.row >= w.num_rows || w.width <= 0 || w.col < 0
+            || w.col >= w.width || w.batch < 0 || w.num_rows % w.width != 0 || w.batch >= w.num_rows / w.width)
+            continue;
+        if (verify
+            && (!integers(accept_len) || accept_len.dim() != 1 || accept_len.numel() != w.num_rows / w.width
+                || !integers(accept_tokens) || accept_tokens.dim() != 2 || accept_tokens.size(0) != accept_len.numel()
+                || accept_tokens.size(1) != w.width))
+            continue;
+        const int accepted = verify ? accept_len[w.batch].item<int>() : 1;
         if (!v4_smoke_witness::emitted(w.col, accepted, w.width))
             continue;
         const int          target  = sampled[w.row][sampled.size(1) - 1].item<int>();
