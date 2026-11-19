@@ -98,6 +98,11 @@ class DeepSeekV41LongLogitsTest(
         # rows, truncated per-layer traces, or an unobserved runtime head.
         trace = {}
         root = Path(os.environ["TEST_UNDECLARED_OUTPUTS_DIR"])
+        from rtp_llm.models_py.modules.v41_fixture_boundaries import (
+            validate_fixture_boundaries,
+        )
+
+        validate_fixture_boundaries(root)
         for rank in range(2):
             rank_trace = root / f"v41_fixed_trace_rank{rank}.jsonl"
             entries = [json.loads(line) for line in rank_trace.read_text().splitlines()]
@@ -158,6 +163,86 @@ class DeepSeekV41LongLogitsTest(
             self.assertEqual(
                 sampled, 1606, "OldFST must reproduce the golden first token"
             )
+
+
+class LayerBoundaryProtocolTest(unittest.TestCase):
+    """CPU protocol: exercise real PyTorch hooks, CP mapping and in-place inputs."""
+
+    def test_both_ranks_and_full_or_compacted_wkv(self):
+        import tempfile
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import torch
+
+        from rtp_llm.models_py.modules.v41_fixture_boundaries import (
+            observe_fixture_layer,
+            validate_fixture_boundaries,
+        )
+
+        class Engram(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.wkv = torch.nn.Linear(4, 6, bias=False).to(torch.bfloat16)
+
+            def forward(self, x, active, compact):
+                rows = x.flatten(1)
+                self.wkv(rows[active] if compact else rows)
+                return x.add_(1)
+
+        for compact in (False, True):
+            with self.subTest(compact=compact), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                layer = SimpleNamespace(
+                    engram=Engram(),
+                    attn_norm=torch.nn.Identity(),
+                    attn=torch.nn.Identity(),
+                    ffn=torch.nn.Identity(),
+                )
+                with patch.dict(os.environ, TEST_UNDECLARED_OUTPUTS_DIR=temp):
+                    for rank in range(2):
+                        pos = list(range(rank, 783, 2))
+                        valid = torch.arange(392) < len(pos)
+                        cp = SimpleNamespace(
+                            cp_rank=rank,
+                            local_is_real=valid,
+                            global_positions=torch.tensor(
+                                pos + [782] * (392 - len(pos))
+                            ),
+                        )
+                        h = torch.zeros(392, 2, 2, dtype=torch.bfloat16)
+                        layer.engram_token_mask = valid
+                        layer.engram_hashes = torch.zeros(392, 1, dtype=torch.int64)
+                        hc = SimpleNamespace(pre_mix_out=torch.zeros(392, 2))
+                        layer.attn_hc = SimpleNamespace(_previous_ref=lambda: hc)
+                        layer.ffn_hc = hc
+
+                        def call(x):
+                            x = layer.engram(x, valid, compact)
+                            layer.ffn(layer.attn(layer.attn_norm(x[:, 0, :])))
+                            return x
+
+                        self.assertIs(observe_fixture_layer(call, layer, cp, h), h)
+                        self.assertFalse(layer.engram._forward_hooks)
+                layout = (2, 2, 1, 4)
+                validate_fixture_boundaries(root, layout=layout)
+                path = root / "v41_layer1_boundaries_rank1.json"
+                row = json.loads(path.read_text())
+                self.assertNotEqual(
+                    row["stages"]["engram_in"], row["stages"]["engram_out"]
+                )
+                self.assertEqual(row["stages"]["engram_in"], row["stages"]["incoming"])
+                # Still two complete rank-local records, but one missing real
+                # position and a duplicate across ranks (the old test passed).
+                row["positions"][-1] = 782
+                path.write_text(json.dumps(row))
+                with self.assertRaisesRegex(ValueError, "exactly once"):
+                    validate_fixture_boundaries(root, layout=layout)
+                row["positions"][-1] = 781
+                row["metadata"]["previous_mix"] = ["torch.bfloat16", [2]]
+                path.write_text(json.dumps(row))
+                with self.assertRaisesRegex(ValueError, "metadata"):
+                    validate_fixture_boundaries(root, layout=layout)
 
 
 if __name__ == "__main__":

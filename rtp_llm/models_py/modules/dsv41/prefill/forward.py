@@ -676,6 +676,16 @@ def forward_layers(
                 else v4.layers
             )
             for layer_idx, layer_call in enumerate(layer_calls):
+                if tracing and layer_idx == 1:
+                    from functools import partial
+
+                    from rtp_llm.models_py.modules.v41_fixture_boundaries import (
+                        observe_fixture_layer,
+                    )
+
+                    layer_call = partial(
+                        observe_fixture_layer, layer_call, v4.layers[1], cp_ctx
+                    )
                 if layer_idx == 21 and ced_tail is not None:
                     with _profiler.record_function_range("dsv41.ced.compact"):
                         if not ced_in_l20:
