@@ -99,7 +99,6 @@ class Dsv41MXFP8Linear(RtpModule):
                 get_mn_major_tma_aligned_packed_ue8m0_tensor,
             )
 
-            from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import fp8_fp4_gemm_nt
             from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
                 sgl_per_token_group_quant_fp8,
             )
@@ -110,7 +109,6 @@ class Dsv41MXFP8Linear(RtpModule):
             for fn in (
                 getattr(deep_gemm, "fp8_fp4_gemm_nt", None),
                 get_mn_major_tma_aligned_packed_ue8m0_tensor,
-                fp8_fp4_gemm_nt,
                 sgl_per_token_group_quant_fp8,
             )
         ):
@@ -123,11 +121,16 @@ class Dsv41MXFP8Linear(RtpModule):
             return
         self.validate_weights_loaded()
         self.validate_runtime_device(self.weight.device)
-        from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.quantized_linear import (
-            Mxfp8Linear,
-        )
+        # Preserve the original V4.1 group32 rounding, quantized-input ABI
+        # and grouped projection dispatch. The owner still owns the two
+        # checkpoint Parameters and invalidates the executor when they move.
+        from rtp_llm.models_py.modules.dsv41.utils import V41MXFP8Linear
 
-        object.__setattr__(self, "_executor", Mxfp8Linear(self.weight, self.scale))
+        object.__setattr__(self, "_executor", V41MXFP8Linear(self.weight, self.scale))
+
+    @property
+    def v41_runtime_linear(self):
+        return self._executor
 
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)

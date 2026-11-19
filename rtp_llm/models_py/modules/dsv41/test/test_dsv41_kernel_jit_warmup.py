@@ -39,6 +39,10 @@ def fake_module(name, **attrs):
 
 def shaped_module(name, **attrs):
     result = type(name, (nn.Module,), {})()
+    if name == "AttentionV41FP8":
+        result.v41_group32_attention = True
+    elif name == "V41MXFP8Linear":
+        object.__setattr__(result, "v41_runtime_linear", result)
     for key, value in attrs.items():
         setattr(result, key, value)
     return result
@@ -105,6 +109,26 @@ class V41KernelJitWarmupTest(unittest.TestCase):
         self.assertEqual(linears[(32, 128)], ("q", model.q))
         self.assertEqual(set(outputs), {(8, 32, 128)})
         self.assertEqual(outputs[(8, 32, 128)], ("a", model.a))
+
+    def test_loader_owned_attention_warms_its_unregistered_quantized_views(self):
+        # The direct owner and runtime subclass do not share the old class
+        # names. Derived executors must not be registered a second time.
+        model = nn.Module()
+        model.attn = shaped_module(
+            "RuntimeAttention",
+            v41_group32_attention=True,
+            _wo_a_stk_w=torch.empty(8, 32, 128),
+        )
+        group = shaped_module("V41MXFP8Linear", N=32, K=128)
+        fused = shaped_module("V41MXFP8Linear", N=64, K=256)
+        output = shaped_module("V41MXFP8Linear", N=96, K=128)
+        model.attn.wo_b = shaped_module("Dsv41MXFP8Linear")
+        object.__setattr__(model.attn.wo_b, "v41_runtime_linear", output)
+        object.__setattr__(model.attn, "wq_a_wkv", fused)
+        model.attn._wo_a_groups_v41 = [group]
+        linears, outputs = warmup.collect_v41_dense_shapes(model)
+        self.assertEqual({v[1] for v in linears.values()}, {group, fused, output})
+        self.assertEqual(outputs[(8, 32, 128)], ("attn", model.attn))
 
     def test_m_grid_includes_both_quantizer_threshold_sides(self):
         with mock.patch.object(

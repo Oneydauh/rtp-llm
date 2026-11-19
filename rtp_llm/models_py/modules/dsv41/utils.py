@@ -24,6 +24,10 @@ class V41Embedding(Embedding):
 class V41MXFP8Linear(torch.nn.Module):
     """Native 32x32 checkpoint blocks, expanded to per-row MXFP8 scales."""
 
+    @property
+    def v41_runtime_linear(self):
+        return self
+
     def __init__(self, weight: torch.Tensor, scales: torch.Tensor):
         super().__init__()
         self.weight = weight
