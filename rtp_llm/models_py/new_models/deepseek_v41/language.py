@@ -1,5 +1,7 @@
 """V4.1 target ownership on the unmodified main target forward/cache runtime."""
 
+import logging
+
 import torch
 
 from rtp_llm.models_py.model_desc.deepseek_v41_model import (
@@ -59,3 +61,8 @@ class DeepSeekV41ForCausalLM(OwnedV41Mixin, DeepSeekV41Model, RtpModule):
         self._engram_layers = tuple(
             (layer_id, layout.layer_ids.index(layer_id)) for layer_id in loadable
         )
+        if self._engram_layers:
+            logging.getLogger(__name__).info(
+                "DeepSeek V4.1 Engram initialized on layers %s",
+                [layer_id for layer_id, _ in self._engram_layers],
+            )

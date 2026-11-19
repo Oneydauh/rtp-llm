@@ -6,6 +6,7 @@ import mmap
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -61,6 +62,59 @@ class EngramSourceTest(unittest.TestCase):
         (directory / "model.safetensors.index.json").write_text(
             json.dumps({"weight_map": index})
         )
+
+    def test_ready_is_reported_only_after_local_engram_tables_bind(self):
+        from tokenizers import Tokenizer, models
+        from transformers import PreTrainedTokenizerFast
+        from rtp_llm.models_py.new_models.deepseek_v41.language import (
+            DeepSeekV41ForCausalLM,
+        )
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.fixture(root)
+            vocab = {f"t{i}": i for i in range(8)}
+            PreTrainedTokenizerFast(
+                tokenizer_object=Tokenizer(models.WordLevel(vocab, unk_token="t0"))
+            ).save_pretrained(folder)
+
+            def owner():
+                model = DeepSeekV41ForCausalLM.__new__(DeepSeekV41ForCausalLM)
+                torch.nn.Module.__init__(model)
+                model.v4 = torch.nn.Module()
+                model.v4.embed = torch.nn.Embedding(8, 32)
+                model.v4.layers = torch.nn.ModuleList(
+                    torch.nn.Module() for _ in range(15)
+                )
+                model._v4_args = SimpleNamespace(v41_config=self.cfg)
+                model._owned_source_method = "fastsafetensors"
+                model._owned_checkpoint_path = folder
+                return model
+
+            name = "rtp_llm.models_py.new_models.deepseek_v41.language"
+            model = owner()
+            with self.assertLogs(name, level="INFO") as logs:
+                model._load_owned_extra_weights()
+            self.assertTrue(
+                any(
+                    line.endswith("DeepSeek V4.1 Engram initialized on layers [1, 14]")
+                    for line in logs.output
+                )
+            )
+            self.assertEqual(model._engram_layers, ((1, 0), (14, 1)))
+            model._prepare_engram(
+                SimpleNamespace(engram_token_windows=torch.tensor([[2, 1]]))
+            )
+            for layer in (model.v4.layers[1], model.v4.layers[14]):
+                self.assertIsInstance(layer.engram, OwnedEngram)
+                self.assertIsNotNone(layer.engram.embed_tokens)
+                self.assertEqual(layer.engram_hashes.shape, (1, 1))
+                self.assertTrue(layer.engram_token_mask.item())
+            (root / "layer-14.safetensors").unlink()
+            with self.assertNoLogs(name, level="INFO"), self.assertRaises(
+                FileNotFoundError
+            ):
+                owner()._load_owned_extra_weights()
 
     def load(self, folder, layer, method):
         return OwnedEngram.from_checkpoint(
