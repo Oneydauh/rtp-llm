@@ -85,6 +85,9 @@ class OwnedV4ModelMixin:
             py_hw_kernel_config=load_config.py_hw_kernel_config,
         )
         args = OwnedV4Args(**asdict(self._v4_args))
+        args.cuda_norm = (
+            torch.device(load_config.device).type == "cuda" and torch.version.hip is None
+        )
         validate_load_groups(args, load_config)
         validate_v4_static_placement(args, model_config, load_config)
         args.lm_head_tp_size = load_config.lm_head_tp_size

@@ -30,6 +30,18 @@ from rtp_llm.models_py.weight_mapper import WeightsMapper
 class OwnedV4Args(V4Args):
     lm_head_tp_size: int = 1
     lm_head_tp_rank: int = 0
+    cuda_norm: bool = False
+
+
+def _checkpoint_norm(args, dtype):
+    if not args.cuda_norm:
+        return RMSNorm(args.dim, args.norm_eps, dtype)
+    from rtp_llm.models_py.modules.base.cuda.norm import RMSNorm as CudaRMSNorm
+
+    # The CUDA V4 prefill runner recognizes this runtime class and writes
+    # the result back into its workspace. Only change who owns the weight.
+    weight = nn.Parameter(torch.empty(args.dim, dtype=dtype), requires_grad=False)
+    return CudaRMSNorm(weight, args.norm_eps)
 
 
 def _attention_kwargs(args, layer_id):
@@ -80,8 +92,8 @@ class OwnedV4Block(Block, RtpModule):
             self._prefill_fast_hc_impls_cached = None
             return
         self.ffn = self.create_ffn(args, layer_id)
-        self.attn_norm = RMSNorm(args.dim, args.norm_eps, params_dtype)
-        self.ffn_norm = RMSNorm(args.dim, args.norm_eps, params_dtype)
+        self.attn_norm = _checkpoint_norm(args, params_dtype)
+        self.ffn_norm = _checkpoint_norm(args, params_dtype)
         for kind in ("attn", "ffn"):
             setattr(
                 self,
@@ -208,7 +220,7 @@ class OwnedV4Transformer(V4Transformer, RtpModule):
         self.embed = VocabParallelEmbedding(
             args.vocab_size, args.dim, params_dtype=params_dtype
         )
-        self.norm = RMSNorm(args.dim, args.norm_eps, params_dtype)
+        self.norm = _checkpoint_norm(args, params_dtype)
         self.head = ParallelLMHead(
             args.vocab_size,
             args.dim,

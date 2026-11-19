@@ -252,10 +252,12 @@ class Dsv4FullBackboneCheckpointTest(unittest.TestCase):
                 weights[prefix + "ffn.gate.bias"] = torch.tensor([0.1, 0.2, 0.3, 0.4])
         return weights
 
-    def load(self, weights, rank=0):
+    def load(self, weights, rank=0, *, cuda_norm=False):
         from safetensors.torch import save_file
 
-        model = OwnedV4Transformer(self.args(rank))
+        args = self.args(rank)
+        args.cuda_norm = cuda_norm
+        model = OwnedV4Transformer(args)
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "model.safetensors")
             save_file(weights, path)
@@ -280,6 +282,30 @@ class Dsv4FullBackboneCheckpointTest(unittest.TestCase):
             )
         NewModelLoader._validate_loaded_weights(model)
         return model
+
+    def test_cuda_norm_uses_original_prefill_output_workspace_and_loaded_parameter(self):
+        from unittest.mock import patch
+
+        from rtp_llm.models_py.modules.base.cuda.norm import RMSNorm as CudaRMSNorm
+        from rtp_llm.models_py.modules.dsv4 import block
+
+        weights = self.weights()
+        model = self.load(weights, cuda_norm=True)
+        for module, key in (
+            (model.layers[0].attn_norm, "layers.0.attn_norm.weight"),
+            (model.layers[0].ffn_norm, "layers.0.ffn_norm.weight"),
+            (model.norm, "norm.weight"),
+        ):
+            self.assertIs(type(module), CudaRMSNorm)
+            self.assertIs(module.weight, dict(module.named_parameters())["weight"])
+            self.assertTrue(torch.equal(module.weight, weights[key]))
+        # Test the runtime decision without loading a CUDA extension on CPU.
+        x = torch.empty_like(model.layers[0].attn_norm.weight).unsqueeze(0)
+        with patch.object(block, "RMSNorm", CudaRMSNorm), patch.object(
+            CudaRMSNorm, "forward", autospec=True, return_value=x
+        ) as forward:
+            self.assertIs(block._prefill_fast_norm(model.layers[0].attn_norm, x), x)
+        self.assertIs(forward.call_args.kwargs["output"], x)
 
     def test_real_native_checkpoint_full_swa_csa_hca_moe_hc_tree(self):
         weights = self.weights()
