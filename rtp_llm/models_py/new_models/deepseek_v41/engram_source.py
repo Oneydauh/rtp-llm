@@ -2,12 +2,15 @@
 
 The production checkpoint places both large host tensors *and* the small
 projection/gates in one shard. A collective whole-file FST load would put a
-~94 GiB host table on every GPU. Use actual native FST range I/O into owned
-CPU tensors, and let the shared cache request the big pair only on a miss.
+~94 GiB host table on every GPU. Native FST reads small ranges into owned CPU
+tensors and streams the big pair directly into the shared cache on a miss.
 """
 
+import ctypes
 import json
+import mmap
 import os
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -80,36 +83,58 @@ class EngramSource:
             parts.extend((str(path.resolve()), str(size), str(ns)))
         return "|".join(parts)
 
-    def load(self, name):
+    @contextmanager
+    def _open(self, name):
         path = self.paths[name]
         with path.open("rb", buffering=0) as stream:
             fd = stream.fileno()
             st = os.fstat(fd)
             if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != self.stamps[path]:
                 raise RuntimeError(f"Engram shard changed during loading: {path}")
+            yield fd
+
+    def _read_native(self, name, fd, address):
+        from fastsafetensors import cpp
+
+        start, size = self.frames[name]
+        if size:
+            reader = cpp.nogds_file_reader(False, 1024, 1, False)
+            dest = cpp.gds_device_buffer(address, size, False)
+            chunk = 64 * 1024 * 1024
+            for off in range(0, size, chunk):
+                req = reader.submit_read(
+                    fd, dest, start + off, min(size - off, chunk), off
+                )
+                if req < 0 or reader.wait_read(req) <= 0:
+                    raise OSError(f"Engram native FST read failed: {self.prefix}{name}")
+
+    def fill_shared_table(self, mapping: mmap.mmap):
+        """Fill the two validated native byte ranges in the final tmpfs mapping."""
+        if self.method != "fastsafetensors":
+            raise ValueError("Engram direct shared staging requires native FST")
+        names = ("embed.weight", "embed.scale")
+        if len(mapping) != sum(self.frames[name][1] for name in names):
+            raise ValueError("Incorrect shared Engram staging size")
+        # Keep the caller-owned mapping alive for all synchronous wait_read calls.
+        # The temporary ctypes view must not outlive this address lookup: failed
+        # staging must also be able to close and unlink the unpublished mapping.
+        address = ctypes.addressof(ctypes.c_char.from_buffer(mapping))
+        for name in names:
+            with self._open(name) as fd:
+                self._read_native(name, fd, address)
+            address += self.frames[name][1]
+
+    def load(self, name):
+        with self._open(name) as fd:
             if self.method == "scratch":
                 with safe_open(
                     f"/proc/self/fd/{fd}", framework="pt", device="cpu"
                 ) as source:
                     return source.get_tensor(self.prefix + name)
 
-            from fastsafetensors import cpp
-
             shape, _, dtype = self.specs[name]
-            start, size = self.frames[name]
             output = torch.empty(shape, dtype=dtype, device="cpu")
-            if output.nbytes != size:
+            if output.nbytes != self.frames[name][1]:
                 raise ValueError(f"Invalid byte count for {self.prefix}{name}")
-            if size:
-                reader = cpp.nogds_file_reader(False, 1024, 1, False)
-                dest = cpp.gds_device_buffer(output.data_ptr(), size, False)
-                chunk = 64 * 1024 * 1024
-                for off in range(0, size, chunk):
-                    req = reader.submit_read(
-                        fd, dest, start + off, min(size - off, chunk), off
-                    )
-                    if req < 0 or reader.wait_read(req) <= 0:
-                        raise OSError(
-                            f"Engram native FST read failed: {self.prefix}{name}"
-                        )
+            self._read_native(name, fd, output.data_ptr())
             return output

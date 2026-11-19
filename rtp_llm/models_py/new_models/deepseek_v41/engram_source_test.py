@@ -2,16 +2,20 @@
 
 import gc
 import json
+import mmap
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
 
 from rtp_llm.models_py.model_loader import NewModelLoader
+from rtp_llm.models_py.modules.dsv41 import engram as runtime_engram
 from rtp_llm.models_py.modules.dsv41.engram import Engram
 from rtp_llm.models_py.new_models.deepseek_v41.engram import OwnedEngram
+from rtp_llm.models_py.new_models.deepseek_v41.engram_source import EngramSource
 
 
 class EngramSourceTest(unittest.TestCase):
@@ -62,6 +66,84 @@ class EngramSourceTest(unittest.TestCase):
         return OwnedEngram.from_checkpoint(
             self.cfg, layer, folder, "cpu", load_method=method
         )
+
+    def test_native_fills_final_shared_mapping_without_an_owned_table(self):
+        specs = {
+            "embed.weight": ((8, 32), "F8_E4M3", torch.float8_e4m3fn),
+            "embed.scale": ((8, 1), "F8_E8M0", torch.float8_e8m0fnu),
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.fixture(root)
+            scratch = EngramSource(root, 1, specs, "scratch")
+            native = EngramSource(root, 1, specs, "fastsafetensors")
+            expected = b"".join(
+                scratch.load(key).view(torch.uint8).numpy().tobytes() for key in specs
+            )
+            with (root / "final_shared_pages").open("w+b") as file:
+                file.truncate(len(expected))
+                with mmap.mmap(file.fileno(), len(expected)) as mapping:
+                    with patch.object(
+                        torch,
+                        "empty",
+                        side_effect=AssertionError("extra owned staging buffer"),
+                    ):
+                        native.fill_shared_table(mapping)
+                    self.assertEqual(mapping[:], expected)
+                    with self.assertRaisesRegex(ValueError, "requires native FST"):
+                        scratch.fill_shared_table(mapping)
+                with mmap.mmap(file.fileno(), len(expected) - 1) as short:
+                    with self.assertRaisesRegex(ValueError, "staging size"):
+                        native.fill_shared_table(short)
+                with (root / "layer-1.safetensors").open("ab") as shard:
+                    shard.write(b"!")
+                with mmap.mmap(file.fileno(), len(expected)) as mapping:
+                    with self.assertRaisesRegex(RuntimeError, "changed during loading"):
+                        native.fill_shared_table(mapping)
+
+    def test_shared_cache_publishes_only_complete_data_and_skips_warm_writer(self):
+        # CPU cache protocol test: stop at attachment (before CUDA registration).
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def local(path):
+                return root if str(path) in ("/dev/shm", "/tmp") else Path(path)
+
+            def fail(mapping):
+                mapping[0] = 17
+                raise OSError("incomplete native read")
+
+            def write(mapping):
+                mapping[:] = bytes(range(len(mapping)))
+
+            def attach(writer):
+                runtime_engram._PinnedSharedTable(
+                    None,
+                    None,
+                    "tiny-cache",
+                    "cuda:0",
+                    table_shape=(2, 32),
+                    load_into=writer,
+                )
+
+            class ReachedAttach(Exception):
+                pass
+
+            with patch.object(
+                runtime_engram, "_prune_expired_engram_tables"
+            ), patch.object(runtime_engram, "Path", side_effect=local), patch.object(
+                torch, "frombuffer", side_effect=ReachedAttach
+            ):
+                with self.assertRaisesRegex(OSError, "incomplete native read"):
+                    attach(fail)
+                self.assertFalse(list(root.glob("*.partial.*")))
+                self.assertFalse([p for p in root.iterdir() if "." not in p.name])
+                with self.assertRaises(ReachedAttach):
+                    attach(write)
+                with self.assertRaises(ReachedAttach):
+                    attach(lambda mapping: self.fail("warm cache re-read"))
+                (data,) = [p for p in root.iterdir() if "." not in p.name]
+                self.assertEqual(data.read_bytes(), bytes(range(66)))
 
     def test_native_owned_values_equal_main_after_close_and_allocator_churn(self):
         import fastsafetensors.cpp as native

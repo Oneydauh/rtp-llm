@@ -338,17 +338,13 @@ def _load_engram_tables(
 
     pair = []
     for name in (weight_name, scale_name):
-        with safe_open(
-            root / weight_map[name], framework="pt", device="cpu"
-        ) as file:
+        with safe_open(root / weight_map[name], framework="pt", device="cpu") as file:
             pair.append(file.get_tensor(name))
     weight, scales = pair
     reader = "per-tensor"
     rows, width = expected
     if tuple(weight.shape) != expected:
-        raise ValueError(
-            f"Engram table shape {weight.shape} does not match {expected}"
-        )
+        raise ValueError(f"Engram table shape {weight.shape} does not match {expected}")
     if tuple(scales.shape) != (rows, width // 32):
         raise ValueError(
             f"Engram scale shape {scales.shape} does not match {(rows, width // 32)}"
@@ -458,6 +454,7 @@ class _PinnedSharedTable:
 
     The copy source may be a lazy ``loader`` callable invoked only by the lock
     winner on a cache miss, so attaching readers never read the checkpoint.
+    Alternatively ``load_into`` fills the unpublished mapping in place.
     """
 
     def __init__(
@@ -469,12 +466,15 @@ class _PinnedSharedTable:
         *,
         loader: Optional[Callable[[], tuple]] = None,
         table_shape: Optional[tuple] = None,
+        load_into: Optional[Callable[[mmap.mmap], None]] = None,
     ):
         digest = hashlib.sha256(source_identity.encode()).hexdigest()[:24]
         data_path = Path("/dev/shm") / f"rtp_llm_engram_{os.getuid()}_{digest}"
         lock_path = Path("/tmp") / (data_path.name + ".lock")
         lease_path = Path(str(data_path) + f".lease.{os.getpid()}.{uuid.uuid4().hex}")
-        if loader is None:
+        if loader is not None and load_into is not None:
+            raise ValueError("Choose one shared Engram table source")
+        if loader is None and load_into is None:
             weight_bytes = weight.numel()
             scale_bytes = scales.numel()
             if weight.element_size() != 1 or scales.element_size() != 1:
@@ -514,7 +514,6 @@ class _PinnedSharedTable:
                 # At most one invocation, by the flock winner, only on a miss;
                 # attaching processes (lock waiters that find the file present)
                 # never materialize the ~94 GiB pair from the checkpoint.
-                sources = (weight, scales) if loader is None else loader()
                 partial = Path(str(data_path) + f".partial.{os.getpid()}")
                 try:
                     with open(partial, "w+b") as file:
@@ -522,17 +521,32 @@ class _PinnedSharedTable:
                         file.truncate(total_bytes)
                         mapping = mmap.mmap(file.fileno(), total_bytes)
                         try:
-                            destination = np.frombuffer(mapping, dtype=np.uint8)
-                            offset = 0
-                            for tensor in sources:
-                                source = tensor.view(torch.uint8).reshape(-1).numpy()
-                                for begin in range(0, source.size, 64 * 1024**2):
-                                    end = min(begin + 64 * 1024**2, source.size)
-                                    destination[offset + begin : offset + end] = source[
-                                        begin:end
-                                    ]
-                                offset += source.size
-                            del destination, source, sources
+                            if load_into is not None:
+                                # Native FST fills the final unpublished pages.
+                                # Never allocate a second, table-sized CPU buffer.
+                                logger.info(
+                                    "Staging cold host Engram table %s (%.2f GiB) directly into shared RAM",
+                                    data_path,
+                                    total_bytes / 1024**3,
+                                )
+                                load_into(mapping)
+                            else:
+                                sources = (
+                                    (weight, scales) if loader is None else loader()
+                                )
+                                destination = np.frombuffer(mapping, dtype=np.uint8)
+                                offset = 0
+                                for tensor in sources:
+                                    source = (
+                                        tensor.view(torch.uint8).reshape(-1).numpy()
+                                    )
+                                    for begin in range(0, source.size, 64 * 1024**2):
+                                        end = min(begin + 64 * 1024**2, source.size)
+                                        destination[offset + begin : offset + end] = (
+                                            source[begin:end]
+                                        )
+                                    offset += source.size
+                                del destination, source, sources
                         finally:
                             mapping.close()
                     os.replace(partial, data_path)

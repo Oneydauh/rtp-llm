@@ -221,7 +221,12 @@ class OwnedEngram(Engram, RtpModule):
                 None,
                 source.cache_identity(),
                 device,
-                loader=table_pair,
+                loader=table_pair if source.method == "scratch" else None,
+                load_into=(
+                    source.fill_shared_table
+                    if source.method == "fastsafetensors"
+                    else None
+                ),
                 table_shape=model.embed.shape,
             )
             pair = model._pinned.weight, model._pinned.scales.view(torch.float8_e8m0fnu)
