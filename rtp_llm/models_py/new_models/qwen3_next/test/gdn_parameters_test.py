@@ -137,7 +137,9 @@ class GdnOwnershipTest(unittest.TestCase):
             path = os.path.join(folder, "model.safetensors")
             save_file({"in_proj_ba.weight": values}, path)
             loader = NewModelLoader(
-                {}, NewLoaderConfig(device="cpu", load_method="fastsafetensors"), folder
+                {"model_type": "qwen3_next"},
+                NewLoaderConfig(device="cpu", load_method="fastsafetensors"),
+                model_path=folder,
             )
             for rank in range(2):
                 owner = self.model(rank)
