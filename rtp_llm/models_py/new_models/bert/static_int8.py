@@ -1,4 +1,4 @@
-"""Static W8A8 BERT: calibrated input steps and signed HF [out,in] matrices."""
+"""Static W8A8 BERT: calibrated steps and signed input-/output-major matrices."""
 
 import math
 
@@ -18,6 +18,10 @@ from rtp_llm.models_py.read_spec import (
 
 class BertStaticInt8Config(QuantizationConfig):
     """The BERT checkpoint contract is not a generic decoder quantization format."""
+
+    def __init__(self, quant_type, *, input_major=False):
+        super().__init__(quant_type)
+        self.input_major = input_major
 
     def get_quant_method(self, layer, prefix=""):
         return BertStaticInt8Linear(self)
@@ -59,8 +63,11 @@ class BertStaticInt8Linear(QuantizeMethodBase):
         key, row, _, _, _, out, inp = self._layout(layer, name)
         shape = tuple(shape)
         dim = None
-        if key == "weight" and shape == (out, inp):
+        input_major = self.quant_config.input_major
+        if key == "weight" and shape == ((inp, out) if input_major else (out, inp)):
             dim = 1 if row else 0
+            if input_major:
+                dim = 1 - dim
         elif key == "bias" and shape == (out,):
             dim = None if row else 0
         elif key == "input_scale" and math.prod(shape) == 1:
@@ -90,6 +97,8 @@ class BertStaticInt8Linear(QuantizeMethodBase):
                     raise ValueError(
                         f"{layer.prefix}.{name} must contain signed INT8 weights"
                     )
+                if self.quant_config.input_major:
+                    x = x.t()  # Only the rank-local rectangle has been materialized.
             elif not x.is_floating_point():
                 raise ValueError(f"{layer.prefix}.{name} must be floating point")
             target = getattr(layer, key)

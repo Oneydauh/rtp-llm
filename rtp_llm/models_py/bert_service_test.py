@@ -159,7 +159,15 @@ def check_tp_rank(rank, checkpoint, rendezvous):
         dist.destroy_process_group()
 
 
-def check_static_tp_rank(rank, checkpoint, rendezvous):
+def replace_fixture(values, path):
+    # load_file tensors are mmap views. Never truncate their backing inode
+    # while preparing the next checkpoint (can SIGBUS in native code).
+    tmp = Path(path).with_suffix(".tmp")
+    save_file(values, str(tmp))
+    tmp.replace(path)
+
+
+def check_static_tp_rank(rank, checkpoint, rendezvous, input_major):
     from rtp_llm.config.quant_config import Int8PerTensorQuantConfig
 
     dist = torch.distributed
@@ -185,15 +193,16 @@ def check_static_tp_rank(rank, checkpoint, rendezvous):
             rows = slice(rank * 8, (rank + 1) * 8)
             for part in ("query", "key", "value"):
                 src = prefix + "self." + part
-                expected_weights.append(values[src + ".qweight"][rows])
+                w = values[src + ".qweight"]
+                expected_weights.append((w.T if input_major else w)[rows])
                 expected_scales.append(values[src + ".scales"].expand(16)[rows])
             torch.testing.assert_close(layer.qkv.weight, torch.cat(expected_weights))
             torch.testing.assert_close(
                 layer.qkv.weight_scale, torch.cat(expected_scales)
             )
+            w = values[prefix + "output.dense.qweight"]
             torch.testing.assert_close(
-                layer.attn_output.weight,
-                values[prefix + "output.dense.qweight"][:, rows],
+                layer.attn_output.weight, (w.T if input_major else w)[:, rows]
             )
             torch.testing.assert_close(
                 layer.attn_output.weight_scale, values[prefix + "output.dense.scales"]
@@ -203,8 +212,14 @@ def check_static_tp_rank(rank, checkpoint, rendezvous):
 
 
 class BertServiceTest(unittest.TestCase):
-    @torch.inference_mode()
     def test_static_int8_checkpoint(self):
+        self._check_static_int8_checkpoint(False)
+
+    def test_static_int8_legacy_input_major_checkpoint(self):
+        self._check_static_int8_checkpoint(True)
+
+    @torch.inference_mode()
+    def _check_static_int8_checkpoint(self, input_major):
         from rtp_llm.config.quant_config import Int8PerTensorQuantConfig
 
         with tempfile.TemporaryDirectory() as d:
@@ -260,7 +275,11 @@ class BertServiceTest(unittest.TestCase):
                             (args[0] / s).round().clamp(-128, 127) * s,
                         )
                     )
-            save_file(values, path)
+            wire = {
+                k: v.T.contiguous() if input_major and k.endswith(".qweight") else v
+                for k, v in values.items()
+            }
+            replace_fixture(wire, path)
             inputs, lengths = packed_inputs()
             expected_hidden = torch.cat(
                 [
@@ -317,12 +336,17 @@ class BertServiceTest(unittest.TestCase):
                         )
             torch.multiprocessing.start_processes(
                 check_static_tp_rank,
-                args=(d, (root / "gloo").as_uri()),
+                args=(d, (root / "gloo").as_uri(), input_major),
                 nprocs=2,
                 start_method="fork",
             )
-            del values["encoder.layer.1.attention.self.value.scales"]
-            save_file(values, path)
+            if input_major:
+                key = "encoder.layer.0.intermediate.dense.qweight"
+                replace_fixture({**wire, key: wire[key].T.contiguous()}, path)
+                with self.assertRaisesRegex(ValueError, "Inconsistent"):
+                    public_load(root, "scratch", TaskType.DENSE_EMBEDDING, quant=quant)
+            del wire["encoder.layer.1.attention.self.value.scales"]
+            replace_fixture(wire, path)
             with self.assertRaisesRegex(RuntimeError, "weight_scale"):
                 public_load(root, "scratch", TaskType.DENSE_EMBEDDING, quant=quant)
 
@@ -344,7 +368,7 @@ class BertServiceTest(unittest.TestCase):
             path = str(root / "model.safetensors")
             names = load_file(path)
             del names["encoder.layer.1.attention.self.value.weight"]
-            save_file(names, path)
+            replace_fixture(names, path)
             for method in ("scratch", "fastsafetensors"):
                 with self.subTest(method=method), self.assertRaises(
                     (ValueError, RuntimeError)

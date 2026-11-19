@@ -14,7 +14,11 @@ from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.read_spec import ReadSpec, unwrap_checkpoint_tensor
 from rtp_llm.models_py.weight_mapper import WeightsMapper
 
-from .checkpoint_metadata import checkpoint_input_vocab_size, publish_input_vocab
+from .checkpoint_metadata import (
+    checkpoint_input_vocab_size,
+    publish_input_vocab,
+    static_int8_input_major,
+)
 from .parameters import BertEmbeddings, BertLayer, PackedBertAttention
 
 
@@ -135,8 +139,15 @@ class BertEncoderOwner(GptModelBase, RtpModule):
             else None
         )
         self.encoder = nn.Module()
+        input_major = static_int8 and static_int8_input_major(
+            config,
+            self.checkpoint_prefix,
+            owned,
+            tp_rank=load.tp_rank,
+            tp_size=load.tp_size,
+        )
         self.encoder.layer = nn.ModuleDict(
-            {str(i): BertLayer(config, load, i) for i in owned}
+            {str(i): BertLayer(config, load, i, input_major=input_major) for i in owned}
         )
         if static_int8:
             for i in owned:

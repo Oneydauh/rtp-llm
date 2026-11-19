@@ -131,7 +131,7 @@ class BertEmbeddings(RtpModule):
 
 
 class BertLayer(RtpModule):
-    def __init__(self, config, load, index):
+    def __init__(self, config, load, index, *, input_major=False):
         super().__init__()
         h, ffn = config.hidden_size, config.inter_size
         heads, dim = config.attn_config.head_num, config.attn_config.size_per_head
@@ -142,7 +142,7 @@ class BertLayer(RtpModule):
         if getattr(quant, "quant_type", None) == "pertensor_quant":
             from .static_int8 import BertStaticInt8Config
 
-            quant = BertStaticInt8Config("pertensor_quant")
+            quant = BertStaticInt8Config("pertensor_quant", input_major=input_major)
         common = dict(quant_config=quant, params_dtype=load.compute_dtype, bias=True)
         attn = dict(tp_size=load.attn_tp_size, tp_rank=load.attn_tp_rank, **common)
         mlp = dict(tp_size=load.ffn_tp_size, tp_rank=load.ffn_tp_rank, **common)
