@@ -91,6 +91,52 @@ class DeepSeekV41LongLogitsTest(
         a, b, argmax = float(a), float(b), int(argmax)
         self.assertTrue(math.isfinite(a) and math.isfinite(b))
         sampled = actual["output_ids"][0][0]
+        self.assertEqual(
+            argmax, sampled, "top-k=1 did not return the pre-sampler argmax"
+        )
+        # Do not mark a diagnostic successful with missing/misaligned CP
+        # rows, truncated per-layer traces, or an unobserved runtime head.
+        trace = {}
+        root = Path(os.environ["TEST_UNDECLARED_OUTPUTS_DIR"])
+        for rank in range(2):
+            rank_trace = root / f"v41_fixed_trace_rank{rank}.jsonl"
+            entries = [json.loads(line) for line in rank_trace.read_text().splitlines()]
+            self.assertTrue(entries, "missing V4.1 fixture trace")
+            stages = [row["stage"] for row in entries]
+            count = entries[0]["layers"]
+            self.assertGreater(count, 0)
+            expected = (
+                ["embedding"]
+                + [f"layer_{i}" for i in range(count)]
+                + ["hc_reduce", "norm", "lm_head"]
+            )
+            self.assertEqual(stages, expected)
+            self.assertTrue(all(row["rank"] == rank for row in entries))
+            self.assertEqual(entries[-1]["world"], 2)
+            trace[rank] = {row["stage"]: row for row in entries}
+        self.assertEqual(set(trace[0]), set(trace[1]))
+        for stage in trace[0]:
+            if stage != "lm_head":
+                owners = sum(trace[r][stage]["last_sha"] is not None for r in range(2))
+                self.assertEqual(
+                    owners, 1, f"{stage}: expected one owner of the last real token"
+                )
+        candidates = [
+            key for r in range(2) for key in trace[r]["lm_head"]["candidate_sha"]
+        ]
+        self.assertCountEqual(candidates, ["1606", "28"])
+        (self.output_dir / "v41_long_layer_trace.json").write_text(
+            json.dumps(
+                {
+                    "schema": 2,
+                    "loader": loader,
+                    "input_ids_sha256": digest,
+                    "ranks": trace,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
         summary = {
             "schema": 1,
             "loader": loader,
