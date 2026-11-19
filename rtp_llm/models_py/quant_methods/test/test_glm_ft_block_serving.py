@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import save_file
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
@@ -33,6 +34,26 @@ from rtp_llm.tools.convert.weights_convert import WeightConverter
 
 
 class LegacyWriterToServingTest(unittest.TestCase):
+    def _assert_exported_channel_scales(self, ft, expected_ft):
+        # Compare the serialized FT contract itself, before any consumer can
+        # reinterpret a scale's shape or mask an omitted expert's values.
+        suffix = ".weight_only_quant_scale"
+        weight_map = json.loads((ft / "model.safetensors.index.json").read_text())[
+            "weight_map"
+        ]
+        expected = {
+            "rank_00_00_00." + key: value
+            for key, value in expected_ft.items()
+            if key.endswith(suffix)
+        }
+        self.assertEqual(len(expected), 6)
+        self.assertEqual({k for k in weight_map if k.endswith(suffix)}, set(expected))
+        for key, scale in expected.items():
+            with self.subTest(ft_tensor=key), safe_open(
+                str(ft / weight_map[key]), framework="pt", device="cpu"
+            ) as shard:
+                torch.testing.assert_close(shard.get_tensor(key), scale, atol=0, rtol=0)
+
     def test_main_glm_quantized_writer_to_gpu(self):
         self._real_writer("block")
 
@@ -102,7 +123,7 @@ class LegacyWriterToServingTest(unittest.TestCase):
             config_path = hf / "config.json"
             metadata = json.loads(config_path.read_text())
             if mode == "channel":
-                weights, _ = channel_inputs()
+                weights, expected_ft = channel_inputs()
                 metadata["quantization_config"] = {
                     "quant_method": "compressed-tensors",
                     "config_groups": {
@@ -137,6 +158,8 @@ class LegacyWriterToServingTest(unittest.TestCase):
             env["QUANTIZATION"] = "FP8_PER_BLOCK" if mode == "online_block" else ""
             converter = WeightConverter(str(hf), "glm4_moe", env)
             self.assertEqual(converter.convert(str(ft)), 0)
+            if mode == "channel":
+                self._assert_exported_channel_scales(ft, expected_ft)
             self.assertIs(
                 json.loads((ft / "model.safetensors.index.json").read_text())[
                     "is_ft_style_weight"

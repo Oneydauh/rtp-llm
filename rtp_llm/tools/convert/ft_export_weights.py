@@ -20,13 +20,22 @@ class FTExportWeights:
         self, model_config, weights_info, misc_weights_info, database, *,
         force_cpu_load_weights=False, moe_pure_tp_preshard=False,
     ):
-        from rtp_llm.config.quant_config import Fp8BlockWiseQuantConfig
+        from rtp_llm.config.quant_config import (
+            Fp8BlockWiseQuantConfig,
+            Fp8PerChannelCompressedQuantConfig,
+            Fp8PerChannelQuarkQuantConfig,
+        )
 
-        if isinstance(getattr(model_config, "quant_config", None), Fp8BlockWiseQuantConfig):
-            # The package is intentionally lazy for serving. The offline
-            # descriptor registry, however, must know both prequantized and
-            # online block transforms before constructing any layer fields.
+        # The converter selects transforms from the descriptor registry when
+        # constructing fields. Import the matching plugin before that point:
+        # otherwise the unquantized field writes the kernel without its scales.
+        quant = getattr(model_config, "quant_config", None)
+        if isinstance(quant, Fp8BlockWiseQuantConfig):
             import_module("rtp_llm.model_loader.per_block_fp8_quant_weight")
+        elif isinstance(
+            quant, (Fp8PerChannelCompressedQuantConfig, Fp8PerChannelQuarkQuantConfig)
+        ):
+            import_module("rtp_llm.model_loader.per_channel_fp8_quant_weight")
 
         self._info = weights_info.create_model_weight_info(database)
         self._custom = tuple(misc_weights_info or ())
