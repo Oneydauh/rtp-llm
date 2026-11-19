@@ -29,6 +29,13 @@ py_test(
 )
 
 py_test(
+    name = "rocm_ptpc_weight_encoding_test",
+    srcs = ["rocm_ptpc_weight_encoding_test.py"],
+    deps = ["//rtp_llm/models_py:new_weight_loader"],
+    env = {"CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1"},
+)
+
+py_test(
     name = "bert_ptpc_epilogue_test",
     srcs = ["bert_ptpc_epilogue_test.py"],
     deps = ["//rtp_llm/models_py:new_weight_loader"],

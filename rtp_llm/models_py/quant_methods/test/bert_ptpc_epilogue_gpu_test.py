@@ -13,6 +13,48 @@ from rtp_llm.models_py.quant_methods.base import QuantizationConfig
 
 
 class BertPtpcGpuEpilogueTest(unittest.TestCase):
+    def test_online_projection_from_float_checkpoint_matches_canonical_ptpc(self):
+        from rtp_llm.models_py.layers.linear import ColumnParallelLinear
+        from rtp_llm.utils.swizzle_utils import swizzle_tensor
+
+        self.assertTrue(torch.cuda.is_available() and torch.version.hip)
+        quant = QuantizationConfig(
+            "fp8_per_channel_online", hw_kernel_config=SimpleNamespace(use_swizzleA=True)
+        )
+        layer = ColumnParallelLinear(
+            128, 256, bias=False, params_dtype=torch.bfloat16, quant_config=quant
+        ).cuda()
+        torch.manual_seed(91403169)
+        source = torch.randn(256, 128, dtype=torch.float32)
+        source[0].zero_()
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "online.safetensors")
+            save_file({"weight": source}, path)
+            layer.load_weights(load_file(path))
+            layer.process_weights_after_loading()
+
+        # Independent weight layout and quantization used by the legacy linear.
+        # Compare bytes before looking at the output so an activation/weight
+        # scale cancellation cannot hide a different encoding.
+        w = source.to(torch.bfloat16).cuda().t().contiguous()
+        s = (w.abs().amax(0, keepdim=True).clamp_min(1e-4) / 448.0).float()
+        q = (w / s).to(torch.float8_e4m3fn).t().contiguous()
+        if "gfx950" not in torch.cuda.get_device_properties(w.device).gcnArchName:
+            raw = q.view(torch.int8)
+            raw.masked_fill_(raw == -128, 0)
+            q = raw.view(torch.float8_e4m3fnuz)
+            s = s * 2
+        packed = swizzle_tensor(q, False).T
+        self.assertTrue(torch.equal(layer.weight.view(torch.uint8), packed.view(torch.uint8)))
+        torch.testing.assert_close(layer.weight_scale, s, rtol=0, atol=0)
+        from rtp_llm.models_py.modules.factory.linear.impl.rocm.fp8_ptpc_linear import (
+            RocmFp8PTPCLinearWithSwizzle,
+        )
+
+        legacy = RocmFp8PTPCLinearWithSwizzle(weight=packed, weight_scales=s, bias=None)
+        x = torch.randn(6, 128, dtype=torch.bfloat16, device="cuda")
+        torch.testing.assert_close(layer(x), legacy(x), rtol=0, atol=0)
+
     def test_bert_projection_checkpoint_bias_and_gelu_match_main(self):
         self.assertIsNotNone(torch.version.hip, "requires the ROCm target")
         self.assertTrue(torch.cuda.is_available(), "requires the assigned GPU")

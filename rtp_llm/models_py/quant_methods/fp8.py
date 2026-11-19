@@ -941,19 +941,15 @@ class Fp8PerChannelOnlineLinearMethod(_RocmPtpcEpilogueMixin, QuantizeMethodBase
             self.quant_config.hw_kernel_config,
         )
 
-        # Treat weight rows as "tokens" -> per-output-channel quant.
-        # fp8_weight: [N, K] float8_e4m3fn, scale: [N, 1] float32.
         is_hip = self._runtime_backend in (
             _ROCM_AITER_PTPC,
             _ROCM_HIPBLASLT_PTPC,
         )
-        quant_input = (
-            weight.to(torch.bfloat16)
-            if is_hip and weight.dtype != torch.bfloat16
-            else weight
-        )
-        fp8_weight, scale = _resolve_per_token_quant()(quant_input)
         if is_hip:
+            from .rocm_ptpc_weight import encode_rocm_ptpc_weight
+
+            encoded, scale = encode_rocm_ptpc_weight(weight)
+            fp8_weight, scale = _requant_per_channel_to_runtime_fp8(encoded, scale)
             self._rocm_executor = _prepare_rocm_fp8_ptpc_executor(
                 layer,
                 fp8_weight,
@@ -961,6 +957,7 @@ class Fp8PerChannelOnlineLinearMethod(_RocmPtpcEpilogueMixin, QuantizeMethodBase
                 self._runtime_backend,
             )
         else:
+            fp8_weight, scale = _resolve_per_token_quant()(weight)
             # torch._scaled_mm consumes scale_b as [1, N]. Materialize that
             # layout once after loading instead of transposing every forward.
             scale = scale.view(1, -1).contiguous()
