@@ -56,6 +56,11 @@ py_test(
 )
 
 py_test(
+    name = "v41_startup_memory_test",
+    srcs = ["v41_startup_memory.py", "v41_startup_memory_test.py"],
+)
+
+py_test(
     name = "comparison_utils_test",
     srcs = [
         "comparison_utils.py",
@@ -228,6 +233,7 @@ custom_smoke_test(
         "deepseek_v41_contract_test.py",
         "deepseek_v41_pd_contract_test.py",
         "deepseek_v41_dspark_contract_test.py",
+        "v41_startup_memory.py",
     ],
 )
 

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from rtp_llm.test.smoke import deepseek_v41_dspark_contract_test as dspark
 from rtp_llm.test.smoke import deepseek_v41_pd_contract_test as pd
+from rtp_llm.test.smoke.v41_startup_memory import record_v41_startup_events
 
 
 class DeepSeekV41FullContractTest(
@@ -22,6 +23,10 @@ class DeepSeekV41FullContractTest(
     # Keep the PD token/text repeatability and CED checks, and the DSpark
     # acceptance and verify-graph checks inherited from the two runners.
     compare_generation_logits = False
+
+    def start_servers(self):
+        with record_v41_startup_events(self.output_dir):
+            super().start_servers()
 
     def test_graph_engram_and_prefix_reuse(self):
         super().test_graph_engram_and_prefix_reuse()
