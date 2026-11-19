@@ -369,6 +369,11 @@ class Qwen2_VLMixin(BaseMultiModalMixin):
                 result.mm_part = embedding(mm_related_params, **kwargs)
         finally:
             torch.set_default_dtype(previous)
+        prepare_buffers = getattr(
+            result.mm_part, "prepare_newloader_runtime_buffers", None
+        )
+        if prepare_buffers is not None:
+            prepare_buffers(device)
         load_service_vision(
             result.mm_part.visual,
             ckpt_path,

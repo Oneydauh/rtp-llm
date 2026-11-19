@@ -28,11 +28,11 @@ from rtp_llm.models_py.serving_route_checkpoint_test import service
 from rtp_llm.multimodal.multimodal_mixin_factory import MultimodalMixinFactory
 
 
-def checkpoint(root, moe):
+def checkpoint(root, moe, *, vision_hidden_size=16):
     model_type = "qwen3_vl_moe" if moe else "qwen3_vl"
     vision = Qwen3VLVisionConfig(
         depth=1,
-        hidden_size=16,
+        hidden_size=vision_hidden_size,
         intermediate_size=32,
         out_hidden_size=4,
         num_heads=2,

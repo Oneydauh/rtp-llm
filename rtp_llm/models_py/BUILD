@@ -720,6 +720,24 @@ checkpoint_service_tests(
 )
 
 py_test(
+    name = "qwen3_vl_device_rotary_test",
+    srcs = [
+        "qwen3_vl_device_rotary_test.py",
+        "new_models/qwen3_vl/service_test.py",
+        "qwen3_moe_checkpoint_test.py",
+        "serving_route_checkpoint_test.py",
+    ],
+    tags = ["H20_CU13"],
+    exec_properties = {"gpu": "H20_CU13", "gpu_count": "1"},
+    deps = [
+        ":new_weight_loader",
+        "//rtp_llm:models",
+        "//rtp_llm:multimodal",
+        "//rtp_llm/cpp/model_rpc/proto:model_rpc_service_py_proto",
+    ],
+)
+
+py_test(
     name = "serving_route_deepseek_test",
     srcs = [
         "serving_route_checkpoint_test.py",

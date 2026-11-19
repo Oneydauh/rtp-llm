@@ -55,6 +55,12 @@ class Qwen3VLEmbeddingTest(TestCase):
         pixels = torch.randn(height * width, 24, generator=generator)
         return pixels, torch.tensor([[1, height, width]], dtype=torch.int64)
 
+    def test_cpu_runtime_frequencies_are_not_replaced(self):
+        frequencies = self.embedding.visual.rotary_pos_emb.inv_freq
+        self.embedding.prepare_newloader_runtime_buffers("cpu")
+        self.assertIs(self.embedding.visual.rotary_pos_emb.inv_freq, frequencies)
+        self.assertNotIn("rotary_pos_emb.inv_freq", self.embedding.visual.state_dict())
+
     def test_embedding_uses_pooled_output_and_preserves_deepstack(self):
         data = self.media(4, 4)
         with torch.inference_mode():

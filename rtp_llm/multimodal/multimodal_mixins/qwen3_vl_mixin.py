@@ -66,6 +66,27 @@ class Qwen3_VLImageEmbedding(Qwen2_5_VLImageEmbedding):
         self.visual = Qwen3VLVisionModel._from_config(config_hf.vision_config)
         self.spatial_merge_size = self.visual.spatial_merge_size
 
+    def prepare_newloader_runtime_buffers(self, device):
+        # Derived embeddings (e.g. Qwen3.5) construct different vision classes.
+        if not isinstance(self.visual, Qwen3VLVisionModel):
+            return
+        target = torch.device(device)
+        if target.type == "cuda" and target.index is None:
+            target = torch.device("cuda", torch.cuda.current_device())
+        rotary = self.visual.rotary_pos_emb
+        if rotary.inv_freq.device == target or (
+            target.type == "cpu" and rotary.inv_freq.device.type == "cpu"
+        ):
+            return
+        # inv_freq is intentionally absent from checkpoints. CPU pow + transfer
+        # is not bit-equivalent to the original target-device initialization;
+        # for 72-wide heads this can change even BF16 sine/cosine values.
+        # Rebuild just that buffer; preserve its non-persistent registration.
+        config = self.visual.config
+        with torch.device(target):
+            head_dim = config.hidden_size // config.num_heads
+            rotary.inv_freq = type(rotary)(head_dim // 2).inv_freq
+
     @property
     def _data_type(self):
         return self.visual.dtype
