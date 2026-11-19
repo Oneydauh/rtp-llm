@@ -112,6 +112,107 @@ def load(root, name, method):
 
 
 class Qwen2ServiceVariantsTest(unittest.TestCase):
+    def test_qwen2_vl_awq_packed_checkpoint(self):
+        from rtp_llm.config.quant_config import AWQConfig
+        from rtp_llm.models.qwen2_vl import QWen2_VL
+        from rtp_llm.models_py.model_loader import NewLoaderConfig, NewModelLoader
+        from rtp_llm.models_py.quant_methods.base import QuantizationConfig
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = dict(
+                vocab_size=16,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                hidden_size=32,
+                num_hidden_layers=1,
+                intermediate_size=64,
+                rms_norm_eps=1e-6,
+                rope_theta=10000,
+                vision_config={},
+                vision_start_token_id=10,
+                vision_end_token_id=11,
+            )
+            (root / "config.json").write_text(json.dumps(raw))
+            cfg = QWen2_VL.create_config(directory)
+            cfg.model_type, cfg.data_type = "qwen2_vl", "fp16"
+            source = AWQConfig(bits=4, group_size=16, is_quanted=True)
+            tensors = {
+                "model.embed_tokens.weight": torch.ones(16, 32).half(),
+                "model.norm.weight": torch.ones(32).half(),
+                "lm_head.weight": torch.ones(16, 32).half(),
+                "visual.probe": torch.ones(1),
+            }
+            prefix = "model.layers.0."
+            for role in ("input_layernorm", "post_attention_layernorm"):
+                tensors[prefix + role + ".weight"] = torch.ones(32).half()
+            base = []
+            for index, (role, k, n) in enumerate(
+                (
+                    ("self_attn.q_proj", 32, 32),
+                    ("self_attn.k_proj", 32, 16),
+                    ("self_attn.v_proj", 32, 16),
+                    ("self_attn.o_proj", 32, 32),
+                    ("mlp.gate_proj", 32, 64),
+                    ("mlp.up_proj", 32, 64),
+                    ("mlp.down_proj", 64, 32),
+                )
+            ):
+                fields = {
+                    "qweight": torch.full(
+                        (k, n // 8), 0x11111111 * (index + 1), dtype=torch.int32
+                    ),
+                    "qzeros": torch.full(
+                        (k // 16, n // 8), 0x11111111, dtype=torch.int32
+                    ),
+                    "scales": torch.full(
+                        (k // 16, n), (index + 1) / 8, dtype=torch.float16
+                    ),
+                }
+                if index < 3:
+                    tensors[prefix + role + ".bias"] = torch.full(
+                        (n,), float(index + 1)
+                    ).half()
+                tensors.update(
+                    {prefix + role + "." + key: value for key, value in fields.items()}
+                )
+                base.append(fields)
+            save_file(tensors, str(root / "model.safetensors"))
+            for method in ("scratch", "fastsafetensors"):
+                with self.subTest(method=method):
+                    load = NewLoaderConfig.from_runtime(
+                        ParallelismConfig(),
+                        device="cpu",
+                        load_method=method,
+                        compute_dtype=torch.float16,
+                        quant_config=QuantizationConfig("awq", source),
+                    )
+                    loader = NewModelLoader(cfg, load, model_path=directory)
+                    model = loader.load()
+                    self.assertEqual(loader.loaded_method.value, method)
+                    layer = model.layers[0]
+                    for target, parts in (
+                        (layer.self_attn.qkv_proj, base[:3]),
+                        (layer.self_attn.o_proj, base[3:4]),
+                        (layer.mlp.gate_up_proj, base[4:6]),
+                        (layer.mlp.down_proj, base[6:]),
+                    ):
+                        self.assertEqual(target.quant_method.method, "awq")
+                        for key in ("qweight", "qzeros", "scales"):
+                            torch.testing.assert_close(
+                                getattr(target, key),
+                                torch.cat([p[key] for p in parts], dim=1),
+                            )
+                    torch.testing.assert_close(
+                        layer.self_attn.qkv_proj.bias.flatten(),
+                        torch.cat(
+                            [
+                                tensors[prefix + "self_attn." + s + "_proj.bias"]
+                                for s in ("q", "k", "v")
+                            ]
+                        ),
+                    )
+
     def test_qwen2_vl_real_vision_and_biased_language_checkpoint(self):
         from rtp_llm.multimodal.multimodal_mixin_factory import MultimodalMixinFactory
         from rtp_llm.multimodal.multimodal_mixins.qwen2_vl.image_processing_qwen2_vl import (
@@ -126,16 +227,30 @@ class Qwen2ServiceVariantsTest(unittest.TestCase):
             tensors = fixture(root, head=True)
             config_path = root / "config.json"
             config = json.loads(config_path.read_text())
-            vision = dict(depth=1, embed_dim=8, hidden_size=4, num_heads=2,
-                          patch_size=2, spatial_merge_size=1, temporal_patch_size=1)
-            config.update(architectures=["Qwen2VLForConditionalGeneration"],
-                          model_type="qwen2_vl", vision_config=vision, rope_theta=10000,
-                          vision_start_token_id=5, vision_end_token_id=6)
+            vision = dict(
+                depth=1,
+                embed_dim=8,
+                hidden_size=4,
+                num_heads=2,
+                patch_size=2,
+                spatial_merge_size=1,
+                temporal_patch_size=1,
+            )
+            config.update(
+                architectures=["Qwen2VLForConditionalGeneration"],
+                model_type="qwen2_vl",
+                vision_config=vision,
+                rope_theta=10000,
+                vision_start_token_id=5,
+                vision_end_token_id=6,
+            )
             config_path.write_text(json.dumps(config))
             Qwen2VLImageProcessor().save_pretrained(root)
             reference = Qwen2VisionTransformerPretrainedModel(vision)
-            visual = {"visual." + n: p.detach().half()
-                      for n, p in reference.named_parameters()}
+            visual = {
+                "visual." + n: p.detach().half()
+                for n, p in reference.named_parameters()
+            }
             save_file(visual, str(root / "vision.safetensors"))
             index_path = root / "model.safetensors.index.json"
             index = json.loads(index_path.read_text())
@@ -145,20 +260,38 @@ class Qwen2ServiceVariantsTest(unittest.TestCase):
                 with self.subTest(method=method):
                     model = load(root, "qwen2_vl", method)
                     owner = model.py_model
-                    torch.testing.assert_close(owner.lm_head.weight, tensors["lm_head.weight"])
+                    torch.testing.assert_close(
+                        owner.lm_head.weight, tensors["lm_head.weight"]
+                    )
                     self.assertIsNotNone(owner.layers[0].self_attn.qkv_proj.bias)
                     mm = MultimodalMixinFactory._create_multimodal_mixin(
-                        model.model_config, SimpleNamespace(load_config=SimpleNamespace(
-                            load_method=method)), None, "cpu")
+                        model.model_config,
+                        SimpleNamespace(
+                            load_config=SimpleNamespace(load_method=method)
+                        ),
+                        None,
+                        "cpu",
+                    )
                     for name, param in mm.mm_part.visual.named_parameters():
-                        torch.testing.assert_close(param.float(), visual["visual." + name].float())
-                    features = torch.tensor([[2., 4., 6., 8.]])
-                    inputs = SimpleNamespace(input_ids=torch.tensor([1, 80]),
-                        embedding_inputs=SimpleNamespace(text_tokens_mask=torch.tensor([1, 0])),
-                        multimodal_inputs=SimpleNamespace(multimodal_features=[features],
-                            mm_features_locs=torch.tensor([1]), mm_extra_input=[]))
+                        torch.testing.assert_close(
+                            param.float(), visual["visual." + name].float()
+                        )
+                    features = torch.tensor([[2.0, 4.0, 6.0, 8.0]])
+                    inputs = SimpleNamespace(
+                        input_ids=torch.tensor([1, 80]),
+                        embedding_inputs=SimpleNamespace(
+                            text_tokens_mask=torch.tensor([1, 0])
+                        ),
+                        multimodal_inputs=SimpleNamespace(
+                            multimodal_features=[features],
+                            mm_features_locs=torch.tensor([1]),
+                            mm_extra_input=[],
+                        ),
+                    )
                     hidden, _, _ = owner._embed_multimodal_inputs(inputs)
-                    torch.testing.assert_close(hidden[0], tensors["model.embed_tokens.weight"][1])
+                    torch.testing.assert_close(
+                        hidden[0], tensors["model.embed_tokens.weight"][1]
+                    )
                     torch.testing.assert_close(hidden[1], features[0])
 
     def test_tool_selected_logits_survive_terminal_frame(self):
