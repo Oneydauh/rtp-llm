@@ -1,4 +1,4 @@
-"""Keep V4.1 FST file-sized staging allocations out of the model/KV allocator."""
+"""Configure V4 native file transfer and isolate V4.1's FST staging allocator."""
 
 import inspect
 
@@ -6,6 +6,15 @@ import torch
 
 
 def v41_file_staging_loader(base, model_type, device, *, cuda_backend, use_shm):
+    if (
+        model_type in ("deepseek_v4", "deepseek_v4_dspark")
+        and device.type == "cuda"
+        and cuda_backend == "Cuda"
+        and not use_shm
+    ):
+        from rtp_llm.models_py.v4_fst_nogds import checked_nogds_loader
+
+        return checked_nogds_loader(base)
     if (
         model_type not in ("deepseek_v41", "deepseek_v41_dspark")
         or device.type != "cuda"
