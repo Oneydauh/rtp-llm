@@ -103,6 +103,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
 import torch
 
+from rtp_llm.models_py.modules import v41_cache_model_trace
 from rtp_llm.models_py.modules.dsv41 import _profiler
 from rtp_llm.models_py.modules.dsv41.cp import (
     build_cp_context_for_forward,
@@ -524,6 +525,9 @@ def forward_layers(
             h = h.unsqueeze(-2).repeat(1, v4.hc_mult, 1)  # [T_total, hc, dim]
         else:
             h = prepare_hidden_fn(input_ids=input_ids, positions=positions)
+    cache_trace = v41_cache_model_trace.active()
+    if cache_trace is not None:
+        cache_trace.hidden("embedding", cp_ctx, h)
     tracing = _V41_FIXTURE.get()
     if tracing:
         _trace_fixture_layer("embedding", h, cp_ctx, len(v4.layers))
@@ -760,6 +764,13 @@ def forward_layers(
                         _trace_fixture_layer(
                             f"layer_{layer_idx}", h, layout, len(v4.layers)
                         )
+                    if cache_trace is not None:
+                        layout = (
+                            ced_tail.context
+                            if layer_idx == 20 and ced_in_l20
+                            else cp_ctx
+                        )
+                        cache_trace.hidden(f"layer_{layer_idx}", layout, h)
                     if layer_idx in capture_ids:
                         v4.capture_aux_hidden(layer_idx, h)
                     if write_cache_store_impl is not None:
@@ -787,6 +798,11 @@ def forward_layers(
             v4._note_aux_hidden_rows(h.size(0), is_cuda_graph=False)
             if ced_tail is not None:
                 ced_tail.restore_aux(v4)
+            if cache_trace is not None:
+                rows = original_cp_ctx.local_is_real.numel()
+                cache_trace.hidden(
+                    "target_export", original_cp_ctx, v4._mtp_hidden_buffer[:rows]
+                )
         else:
             _pre_hc_flat = h.flatten(-2)
             v4._write_mtp_hidden_buffer(_pre_hc_flat, is_cuda_graph=False)

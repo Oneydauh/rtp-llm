@@ -55,6 +55,34 @@ bool isV41LayerFixture(const GptModelInputs& inputs) {
     return hash == UINT64_C(0x83ef06b1e7cedebb);
 }
 
+// Dedicated diagnostic only. Validate the global, *unsplit* input on each
+// rank. Both target and DSpARK commit receive this geometry in prefillStep.
+int64_t v41CacheFixturePrefix(const GptModelInputs& inputs) {
+    static const bool enabled = [] {
+        const auto* flag = std::getenv("RTP_V41_CACHE_TRACE");
+        const auto* test = std::getenv("TEST_TARGET");
+        return flag && std::strcmp(flag, "1") == 0 && test
+               && std::strcmp(test, "//rtp_llm/test/smoke:deepseek_v41_cache_rounds_sm100_arm") == 0;
+    }();
+    if (!enabled || !inputs.v41_cache_fixture || inputs.warmup || inputs.is_fake_stream
+        || !inputs.combo_tokens.defined() || !inputs.input_lengths.defined() || inputs.input_lengths.numel() != 1
+        || !inputs.prefix_lengths.defined() || inputs.prefix_lengths.numel() != 1
+        || (inputs.sequence_lengths.defined() && inputs.sequence_lengths.numel())) {
+        return -1;
+    }
+    const auto n = inputs.combo_tokens.numel();
+    if (n != 783 && n != 271)
+        return -1;
+    const auto prefix = inputs.prefix_lengths.item<int>();
+    if ((prefix != 0 && prefix != 512) || n + prefix != 783 || inputs.input_lengths.item<int>() != n)
+        return -1;
+    const auto ids  = inputs.combo_tokens.to(torch::kCPU, torch::kInt32).contiguous();
+    uint64_t   hash = UINT64_C(14695981039346656037);
+    for (int64_t i = 0; i < n; ++i)
+        hash = (hash ^ static_cast<uint32_t>(ids.data_ptr<int32_t>()[i])) * UINT64_C(1099511628211);
+    return hash == (prefix == 0 ? UINT64_C(0x83ef06b1e7cedebb) : UINT64_C(0xeb924827a54454d3)) ? prefix : -1;
+}
+
 thread_local bool v41_layer_fixture_active = false;
 struct V41LayerFixtureScope {
     bool previous;
@@ -957,7 +985,9 @@ void PyWrappedModel::updateKVCacheKernelBlockId(const GptModelInputs& inputs) {
 
 GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
     RTP_LLM_PROFILE_SCOPE("py_model.forward");
-    V41LayerFixtureScope   trace_scope(dspark_model_role_ == DSparkModelRole::NONE && isV41LayerFixture(inputs));
+    V41LayerFixtureScope trace_scope(dspark_model_role_ == DSparkModelRole::NONE && isV41LayerFixture(inputs));
+    const int64_t        cache_fixture_prefix =
+        dspark_model_role_ == DSparkModelRole::PROPOSE ? -1 : v41CacheFixturePrefix(inputs);
     RuntimeWeightReadGuard weight_read(py_model_);
     if (direct_eplb_stats_) {
         // Eager and graph replay both write into these same address-stable
@@ -1077,6 +1107,8 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             && generation_prefill_graph_runner_ != nullptr && !is_generation_prefill_runner) {
             generation_prefill_cuda_graph_status = GenerationPrefillCudaGraphStatus::MIXED_PREFILL_DECODE_NOT_SUPPORTED;
         }
+        graph_state.v41_cache_proposal = inputs.v41_cache_fixture && dspark_model_role_ == DSparkModelRole::PROPOSE
+                                         && !inputs.warmup && !inputs.is_fake_stream;
         const bool can_run_graph = !capture_hidden_states && enable_cuda_graph_ && graph_runner != nullptr
                                    && graph_runner->canRun(py_model_inputs, graph_state);
         if (!capture_hidden_states && is_generation_prefill_runner && !can_run_graph) {
@@ -1112,8 +1144,16 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
                 v41_layer_fixture_active ?
                     py::module_::import("rtp_llm.models_py.modules.dsv41.prefill.forward")
                         .attr("_run_fixture_forward")(py_forward_method_, py_model_inputs, held_attn_pyobj_) :
+                cache_fixture_prefix >= 0 ?
+                    py::module_::import("rtp_llm.models_py.modules.v41_cache_model_trace")
+                        .attr("run_fixed")(
+                            cache_fixture_prefix, py_forward_method_, py_model_inputs, held_attn_pyobj_) :
                     py_forward_method_(py_model_inputs, held_attn_pyobj_);
             py_model_outputs = outputs.cast<PyModelOutputs>();
+            if (graph_state.v41_cache_proposal) {
+                py::module_::import("rtp_llm.models_py.modules.v41_cache_model_trace")
+                    .attr("first_proposal")(py_model_, py_model_inputs, "eager");
+            }
         }
 
         cache_store_write_cycle.finish();
