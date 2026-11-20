@@ -570,6 +570,20 @@ class DeepSeekV4DSparkModel(DSparkProposerMixin, DeepSeekV4Model):
                     q_len=1,
                     head_dim=int(attn.head_dim),
                 )
+            from rtp_llm.models_py.modules import v41_cache_model_trace
+
+            cache_probe = v41_cache_model_trace.active()
+            if cache_probe is not None:
+                cache_probe.draft_written(
+                    layer_idx,
+                    attn,
+                    pool,
+                    entries_per_block,
+                    cp_ctx,
+                    context_positions,
+                    context_req_ids,
+                    context_slots,
+                )
 
     def map_commit_rows(
         self,
@@ -622,6 +636,13 @@ class DeepSeekV4DSparkModel(DSparkProposerMixin, DeepSeekV4Model):
         # slot mapping / FP8 writer on every rank after the gather.
         req32 = torch.where(valid, req32, torch.full_like(req32, -1))
         pos32 = torch.where(valid, pos32, torch.full_like(pos32, -1))
+        from rtp_llm.models_py.modules import v41_cache_model_trace
+
+        trace = v41_cache_model_trace.active()
+        if trace is not None:
+            trace.hidden(
+                "draft_import", cp_ctx, inputs.input_hiddens.reshape(row_count, -1)
+            )
         return req32.contiguous(), pos32.contiguous(), cp_ctx
 
     def commit_feature_rows(
@@ -724,6 +745,12 @@ class DeepSeekV4DSparkModel(DSparkProposerMixin, DeepSeekV4Model):
 
             topk = int(global_indices.shape[-1])
             global_indices = global_indices.view(batch_size, gamma, topk).contiguous()
+            from rtp_llm.models_py.modules import v41_cache_model_trace
+
+            if v41_cache_model_trace.ENABLED:
+                v41_cache_model_trace.remember(
+                    self, layer_idx, prefix_lengths, global_indices, topk_length, pool
+                )
 
             sched_meta = get_or_build_sched_meta(
                 graph_metadata,
