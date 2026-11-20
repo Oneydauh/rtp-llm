@@ -988,9 +988,9 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
                 && has_context_request ?
             generation_prefill_cuda_graph_init_status_ :
             GenerationPrefillCudaGraphStatus::NOT_REQUESTED;
-    int8_t target_verify_graph_path = -1;
+    int8_t     target_verify_graph_path                  = -1;
     const auto with_generation_prefill_cuda_graph_status = [&](GptModelOutputs outputs) {
-        outputs.target_verify_graph_path = target_verify_graph_path;
+        outputs.target_verify_graph_path             = target_verify_graph_path;
         outputs.generation_prefill_cuda_graph_status = generation_prefill_cuda_graph_status;
         return outputs;
     };
@@ -1095,7 +1095,8 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
                 graph_state.current_real_graph_bs);
             py_model_inputs.attention_inputs.is_s_padded = true;
             py_model_outputs                             = graph_runner->forward(py_model_inputs, graph_state);
-            if (inputs.is_target_verify) target_verify_graph_path = 1;
+            if (inputs.is_target_verify)
+                target_verify_graph_path = 1;
             if (is_generation_prefill_runner) {
                 generation_prefill_cuda_graph_status = GenerationPrefillCudaGraphStatus::REPLAYED;
             }
@@ -1103,7 +1104,8 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         } else {
             py::gil_scoped_acquire gil;
             RTP_LLM_PROFILE_SCOPE("py_model.forward(normal)");
-            if (inputs.is_target_verify) target_verify_graph_path = 0;
+            if (inputs.is_target_verify)
+                target_verify_graph_path = 0;
             RTP_LLM_LOG_DEBUG("[PyWrappedModel] using normal forward, is_target_verify=%d, is_prefill=%d",
                               py_model_inputs.attention_inputs.is_target_verify,
                               py_model_inputs.attention_inputs.is_prefill);
@@ -1238,6 +1240,11 @@ torch::Tensor PyWrappedModel::computeLogits(const torch::Tensor& hidden) {
     RTP_LLM_PROFILE_SCOPE("py_model.computeLogits");
     const auto& head   = *weights_.lm_head;
     const auto& kernel = head.kernel;
+    if (std::getenv("RTP_V41_DRAFT_ROLE") && dspark_model_role_ == DSparkModelRole::PROPOSE) {
+        py::gil_scoped_acquire gil;
+        py::module_::import("rtp_llm.models_py.modules.v41_first_draft")
+            .attr("head_operand")(hidden, kernel, head.scales, device_props_.tp_rank, device_props_.tp_size);
+    }
     if (v41_layer_fixture_active) {
         py::gil_scoped_acquire gil;
         py::module_::import("rtp_llm.models_py.modules.dsv41.prefill.forward")

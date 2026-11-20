@@ -1195,7 +1195,23 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
     } else {
         {
             RTP_LLM_PROFILE_SCOPE("cuda_graph.forward(replayDecode)");
-            replayDecode(state.current_real_graph_bs);
+            if (state.v41_cache_proposal && std::getenv("RTP_V41_DRAFT_ROLE")) {
+                py::gil_scoped_acquire gil;
+                auto                   fixture = py::module_::import("rtp_llm.models_py.modules.v41_first_draft");
+                auto                   fixed   = fixture.attr("begin")(
+                    py_instance_, graph_instances_[getCurrentRealGraphSize(state)].mem_hold_.py_model_inputs_);
+                try {
+                    replayDecode(state.current_real_graph_bs);
+                    fixture.attr("finish")(
+                        fixed, graph_instances_[getCurrentRealGraphSize(state)].mem_hold_.decoder_layer_hidden_states_);
+                } catch (...) {
+                    fixture.attr("restore")(fixed);
+                    throw;
+                }
+                fixture.attr("restore")(fixed);
+            } else {
+                replayDecode(state.current_real_graph_bs);
+            }
         }
         outputs.hidden_states =
             graph_instances_[state.current_real_graph_bs].mem_hold_.decoder_layer_hidden_states_.slice(
