@@ -28,6 +28,7 @@ prefill/CP path and does not match its target-verify graph contract.
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Optional, Tuple
@@ -247,6 +248,10 @@ class DeepSeekV4DSparkModel(DSparkProposerMixin, DeepSeekV4Model):
         the graph (via ``get_or_build_sched_meta``), so the schedule-build
         kernels replay with the current device-side ``topk_length`` values.
         """
+        if os.getenv("RTP_V41_DRAFT_ROLE"):
+            from rtp_llm.models_py.modules.v41_first_draft import snapshot_ep
+
+            snapshot_ep(self)
         if not is_cuda_graph:
             return None
         return SimpleNamespace(
@@ -750,6 +755,19 @@ class DeepSeekV4DSparkModel(DSparkProposerMixin, DeepSeekV4Model):
                 v41_cache_model_trace.remember(
                     self, layer_idx, prefix_lengths, global_indices, topk_length, pool
                 )
+            if os.getenv("RTP_V41_DRAFT_ROLE"):
+                from rtp_llm.models_py.modules.v41_first_draft import remember
+
+                remember(
+                    self,
+                    layer_idx,
+                    x,
+                    query_positions,
+                    prefix_lengths,
+                    global_indices,
+                    topk_length,
+                    pool,
+                )
 
             sched_meta = get_or_build_sched_meta(
                 graph_metadata,
@@ -784,6 +802,10 @@ class DeepSeekV4DSparkModel(DSparkProposerMixin, DeepSeekV4Model):
         tokens_per_block: int,
         graph_metadata: Any,
     ) -> torch.Tensor:
+        if os.getenv("RTP_V41_DRAFT_ROLE"):
+            from rtp_llm.models_py.modules.v41_first_draft import remember_queries
+
+            remember_queries(self, query_ids)
         hidden = self.v4.embed(query_ids)
         hidden = hidden.unsqueeze(2).repeat(1, 1, self.v4.hc_mult, 1)
         metadata_by_geometry: dict[Tuple[int, int], DSparkMetadata] = {}

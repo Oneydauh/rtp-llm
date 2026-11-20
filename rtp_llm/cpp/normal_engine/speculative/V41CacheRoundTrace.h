@@ -12,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 #include "rtp_llm/cpp/models/SampleInfos.h"
 
@@ -22,12 +23,79 @@ inline bool fixedTarget() {
     return t && enabled && std::strcmp(enabled, "1") == 0
            && std::strcmp(t, "//rtp_llm/test/smoke:deepseek_v41_fixed_target_sm100_arm") == 0;
 }
+// Dedicated single-request fixture only. Python marks the same process after
+// the real first proposal graph has consumed all three matched cache windows.
+struct DraftProbe {
+    std::string dir, nonce, role, pending;
+    int64_t     anchor;
+};
+inline std::optional<DraftProbe> draftProbe() {
+    const char* test = std::getenv("TEST_TARGET");
+    const char* role = std::getenv("RTP_V41_DRAFT_ROLE");
+    if (!role || !test || std::strcmp(test, "//rtp_llm/test/smoke:deepseek_v41_first_draft_sm100_arm") != 0)
+        return std::nullopt;
+    const char* dir   = std::getenv("TEST_UNDECLARED_OUTPUTS_DIR");
+    const char* nonce = std::getenv("RTP_ARM_PAIR_NONCE");
+    if (!dir || !nonce || std::strlen(nonce) != 32 || std::strspn(nonce, "0123456789abcdef") != 32
+        || (std::strcmp(role, "oldfst") && std::strcmp(role, "newfst")))
+        return std::nullopt;
+    std::string path   = std::string(dir) + "/v41draft_pending_" + std::to_string(getpid());
+    int64_t     anchor = -1;
+    if (!(std::ifstream(path) >> anchor))
+        return std::nullopt;
+    return DraftProbe{dir, nonce, role, path, anchor};
+}
+inline std::string draftSha(const torch::Tensor& t) {
+    auto          cpu = t.detach().to(torch::kCPU).contiguous();
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(cpu.data_ptr()), cpu.numel() * cpu.element_size(), digest);
+    std::ostringstream s;
+    for (auto v : digest)
+        s << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(v);
+    return s.str();
+}
+inline void writeDraftScores(const DraftProbe&    p,
+                             const torch::Tensor& base,
+                             const torch::Tensor& bias,
+                             const torch::Tensor& scores,
+                             const torch::Tensor& probs,
+                             const torch::Tensor& temperature,
+                             const torch::Tensor& w1,
+                             const torch::Tensor& w2,
+                             const torch::Tensor& d2t,
+                             const torch::Tensor& sampled,
+                             const torch::Tensor& mapped) {
+    TORCH_CHECK(base.dim() == 2 && base.size(0) == 1 && torch::isfinite(scores).all().item<bool>(),
+                "unexpected paired draft scores");
+    auto          top    = torch::topk(scores, 4, -1);
+    auto          ids    = std::get<1>(top).reshape({-1}).cpu();
+    auto          values = std::get<0>(top).reshape({-1}).cpu();
+    std::ofstream f(p.dir + "/v41draft_scores.json");
+    TORCH_CHECK(f.good(), "cannot open paired draft score report");
+    f << "{\"family\":\"v41draft\",\"stage\":\"d_score\",\"role\":\"" << p.role << "\",\"nonce\":\"" << p.nonce
+      << "\",\"anchor\":" << p.anchor << ",\"base\":\"" << draftSha(base) << "\",\"bias\":\"" << draftSha(bias)
+      << "\",\"pre_sampler\":\"" << draftSha(scores) << "\",\"probabilities\":\"" << draftSha(probs)
+      << "\",\"w1_used\":\"" << draftSha(w1) << "\",\"w2\":\"" << draftSha(w2) << "\",\"d2t\":\""
+      << (d2t.defined() ? draftSha(d2t) : "identity") << "\",\"temperature\":" << std::setprecision(17)
+      << temperature.item<double>() << ",\"sampled\":" << sampled.item<int>() << ",\"mapped\":" << mapped.item<int>()
+      << ",\"top\":[";
+    for (int i = 0; i < 4; i++) {
+        if (i)
+            f << ",";
+        f << "[" << ids[i].item<int64_t>() << "," << values[i].item<double>() << "]";
+    }
+    f << "]}\n";
+    f.close();
+    TORCH_CHECK(f.good(), "cannot finish paired draft scores");
+    TORCH_CHECK(std::remove(p.pending.c_str()) == 0, "cannot disarm paired draft score probe");
+}
 inline bool enabled() {
     static const bool on = [] {
         const char* mode = std::getenv("RTP_V41_CACHE_TRACE");
         const char* test = std::getenv("TEST_TARGET");
         return mode && std::strcmp(mode, "1") == 0 && test
-               && (fixedTarget() || std::strcmp(test, "//rtp_llm/test/smoke:deepseek_v41_cache_rounds_sm100_arm") == 0);
+               && (fixedTarget() || std::strcmp(test, "//rtp_llm/test/smoke:deepseek_v41_cache_rounds_sm100_arm") == 0
+                   || std::strcmp(test, "//rtp_llm/test/smoke:deepseek_v41_first_draft_sm100_arm") == 0);
     }();
     return on;
 }
