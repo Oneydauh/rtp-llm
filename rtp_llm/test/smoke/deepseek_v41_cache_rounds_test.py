@@ -161,34 +161,89 @@ class CacheRoundFixture(
         )
         finalize(root, run)
         if os.environ.get("RTP_V41_CAUSAL_ROLE"):
-            # Fourth, separately identified request only. Original three
-            # HTTP/golden checks and their native round artifacts stay intact.
+            from rtp_llm.models_py.modules.v41_causal import CELLS
+
             self.assertEqual(loader, os.environ["RTP_V41_CAUSAL_ROLE"])
-            repeat = uuid.uuid4().hex
             replay = root / "v41_causal_replay_id"
-            replay.write_text(repeat)
-            try:
-                stage_tmp.write_text(f"{repeat} hit\n")
-                stage_tmp.replace(marker)
-                result = self.session.post(
-                    f"http://127.0.0.1:{self.server.port}/",
-                    json=golden["long_cache_hit"]["query"],
-                    timeout=600,
+            for mode in ("natural", *CELLS):
+                if mode == "natural":
+                    repeat, data = run, actual
+                else:
+                    repeat = uuid.uuid4().hex
+                    replay.write_text(f"{repeat} {mode}")
+                    try:
+                        stage_tmp.write_text(f"{repeat} hit\n")
+                        stage_tmp.replace(marker)
+                        result = self.session.post(
+                            f"http://127.0.0.1:{self.server.port}/",
+                            json=golden["long_cache_hit"]["query"],
+                            timeout=600,
+                        )
+                        result.raise_for_status()
+                        data = result.json()
+                    finally:
+                        marker.unlink(missing_ok=True)
+                        replay.unlink(missing_ok=True)
+                self.assertTrue(data["finished"] and data["aux_info"]["pd_sep"])
+                self.assertEqual(data["aux_info"][self.reuse_field], 512)
+                self.assertEqual(data["input_ids"], actual["input_ids"])
+                self.assertEqual(len(data["output_ids"]), 1)
+                emitted = data["output_ids"][0]
+                self.assertTrue(2 <= len(emitted) <= 24)
+                native = [
+                    json.loads(line)
+                    for line in (root / f"v41_cache_rounds_{repeat}_hit.jsonl")
+                    .read_text()
+                    .splitlines()
+                ]
+                self.assertEqual(
+                    data["aux_info"]["speculative_draft_rounds"], len(native)
                 )
-                result.raise_for_status()
-                data = result.json()
-            finally:
-                marker.unlink(missing_ok=True)
-                replay.unlink(missing_ok=True)
-            self.assertTrue(data["finished"] and data["aux_info"]["pd_sep"])
-            self.assertEqual(data["aux_info"][self.reuse_field], 512)
-            self.assertEqual(data["input_ids"], actual["input_ids"])
-            for mode in ("natural", "replay"):
+                self.assertGreater(len(native), 0)
+                offset, accepts = 1, []
+                for row in native:
+                    self.assertEqual(
+                        (row["run_id"], row["phase"], row["offset"]),
+                        (repeat, "hit", offset),
+                    )
+                    self.assertEqual(
+                        row["history_sha256_le_i32"], hash_ids(ids + emitted[:offset])
+                    )
+                    n = row["accept_len"]
+                    self.assertTrue(type(n) is int and 1 <= n <= 4)
+                    self.assertEqual(len(row["result"]), n)
+                    count = min(n, len(emitted) - offset)
+                    self.assertGreater(count, 0)
+                    self.assertEqual(
+                        row["result"][:count], emitted[offset : offset + count]
+                    )
+                    self.assertEqual(row["draft"][: n - 1], row["result"][: n - 1])
+                    accepts.append(min(count, n - 1))
+                    offset += count
+                self.assertEqual(offset, len(emitted))
+                outcome = dict(
+                    input_digest=DIGEST,
+                    reuse=512,
+                    decode_reuse=data["aux_info"]["decode_total_reuse_len"],
+                    output_count=len(emitted),
+                    output_hash=hash_ids(emitted),
+                    accepts=accepts,
+                    matches_golden=(
+                        emitted == golden["long_cache_hit"]["output_ids"][0]
+                        and data["response"] == golden["long_cache_hit"]["response"]
+                    ),
+                )
                 for rank in range(2):
                     output = root / f"v41_causal_{mode}_r{rank}.json"
                     self.assertTrue(
                         output.is_file(), "missing causal evidence: " + output.name
                     )
+                    part = json.loads(output.read_text())
+                    self.assertEqual(part["request_id"], repeat)
+                    part["outcome"] = outcome
+                    temp = output.with_suffix(".tmp")
+                    temp.write_text(json.dumps(part, separators=(",", ":")))
+                    temp.replace(output)
         self.assertTrue(
             exact,
             "fixture output differs from the unchanged golden; see v41_cache_rounds.json",
