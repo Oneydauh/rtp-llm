@@ -16,11 +16,11 @@ from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.modules.dsv4.block import Block
 from rtp_llm.models_py.modules.dsv4.fp8.attention import AttentionFP8
 from rtp_llm.models_py.modules.dsv4.transformer import V4Args, V4Transformer
-from rtp_llm.models_py.new_models.deepseek_v4.commit_attention import (
-    OwnedCommitOnlyAttentionFP8,
-)
 from rtp_llm.models_py.new_models.deepseek_v4.checkpoint_namespace import (
     V4CheckpointNamespace,
+)
+from rtp_llm.models_py.new_models.deepseek_v4.commit_attention import (
+    OwnedCommitOnlyAttentionFP8,
 )
 from rtp_llm.models_py.new_models.deepseek_v4.hc import OwnedHCHead, OwnedHCUnit
 from rtp_llm.models_py.weight_mapper import WeightsMapper
@@ -31,6 +31,7 @@ class OwnedV4Args(V4Args):
     lm_head_tp_size: int = 1
     lm_head_tp_rank: int = 0
     cuda_norm: bool = False
+    cuda_native_rms: bool = False
 
 
 def _checkpoint_norm(args, dtype):
@@ -41,6 +42,10 @@ def _checkpoint_norm(args, dtype):
     # The CUDA V4 prefill runner recognizes this runtime class and writes
     # the result back into its workspace. Only change who owns the weight.
     weight = nn.Parameter(torch.empty(args.dim, dtype=dtype), requires_grad=False)
+    if args.cuda_native_rms:
+        from .cuda_rms import native_rmsnorm
+
+        return CudaRMSNorm(weight, args.norm_eps, implementation=native_rmsnorm)
     return CudaRMSNorm(weight, args.norm_eps)
 
 
