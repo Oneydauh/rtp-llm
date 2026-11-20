@@ -67,6 +67,7 @@ def cuda13_suites():
             # mega_moe_se case on this same CP2/DP2 page-RR topology.
             smoke_test(
                 name="smoke_v4_flash_0731_pd_cp2ep2_dp2ep2_dspark_cprr_async_xgrammar_json_sm100",
+                data=["//rtp_llm/test/smoke/arm_causal_inputs:v4"],
                 task_info="data/model/deepseek_v4/q_r_v4_flash_0731_pd_cp2ep2_dp2ep2_dspark_async_xgrammar_json_sm100_arm.json",
                 sleep_time_qr=2,
                 smoke_args={
