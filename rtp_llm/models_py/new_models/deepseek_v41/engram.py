@@ -162,7 +162,7 @@ class OwnedEngramProjection(RtpModule):
 
 
 class OwnedEngram(Engram, RtpModule):
-    _normalize_gate_views = True
+    """Own the checkpoint, but inherit the serving gate's dispatch for every layout."""
 
     def __init__(self, config, layer_id, *, checkpoint_path=None):
         RtpModule.__init__(self)

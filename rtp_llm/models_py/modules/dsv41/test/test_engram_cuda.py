@@ -20,6 +20,69 @@ from rtp_llm.models_py.modules.dsv41.engram import (
 
 
 class EngramViewTest(unittest.TestCase):
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.version.hip is None, "requires NVIDIA CUDA"
+    )
+    @torch.inference_mode()
+    def test_checkpoint_ownership_does_not_change_gate_dispatch(self):
+        from rtp_llm.models_py.new_models.deepseek_v41.engram import OwnedEngram
+
+        if torch.cuda.get_device_capability()[0] < 8:
+            self.skipTest("requires native BF16")
+        cfg = dict(
+            engram_layer_ids=[1],
+            engram_num_embeddings=[8],
+            engram_max_ngram_size=2,
+            engram_n_heads=1,
+            engram_head_dim=32,
+            engram_compressed_vocab_size=8,
+            engram_pad_token_id=0,
+            engram_vocab_size=7,
+            hidden_size=5120,
+            hc_mult=4,
+            rms_norm_eps=1e-20,
+        )
+        owner = OwnedEngram(cfg, 1).cuda()
+        rng = torch.Generator(device="cuda").manual_seed(427)
+
+        def sample(*shape):
+            return torch.randn(
+                shape, device="cuda", generator=rng, dtype=torch.bfloat16
+            )
+
+        owner.load_weights({"q_weight": sample(4, 5120), "k_weight": sample(4, 5120)})
+        hidden, kv = sample(97, 4, 5120), sample(97, 25600)
+        ids = torch.arange(len(kv), device="cuda")
+        mask = ids % 7 != 0
+        # Isolate the gate: both owners receive exactly the same projected KV.
+        owner.embed_tokens = lambda indices, device: kv.unsqueeze(1)
+        projection = torch.nn.Identity()
+        object.__setattr__(owner.wkv, "_executor", projection)
+        baseline = Engram(
+            owner.layout,
+            0,
+            owner.embed_tokens,
+            projection,
+            owner.q_weight.detach(),
+            owner.k_weight.detach(),
+            owner.eps,
+        )
+        for strided in (False, True):
+            with self.subTest(strided=strided):
+                x = (
+                    torch.stack((hidden, hidden), dim=-1)[..., 0]
+                    if strided
+                    else torch.empty_like(hidden)
+                )
+                x.copy_(hidden)
+                expected = baseline(x, ids, mask)
+                aliases = expected.data_ptr() == x.data_ptr()
+                expected = expected.clone()
+                x.copy_(hidden)
+                result = owner(x, ids, mask)
+                self.assertEqual(result.data_ptr() == x.data_ptr(), aliases)
+                self.assertTrue(torch.equal(result, expected))
+
     @torch.inference_mode()
     def test_cpu_reference_accepts_views(self):
         h = torch.arange(24).reshape(3, 2, 4).float()[..., ::2]
