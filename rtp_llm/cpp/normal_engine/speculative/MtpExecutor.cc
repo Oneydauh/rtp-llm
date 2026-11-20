@@ -90,6 +90,7 @@ struct V4AuditRow {
     std::string   digest;
     int64_t       num_rows;
     bool          verify;
+    std::string   committed_chain;
 };
 
 // Only the actual target sampler reaches these two sites. The verify histories
@@ -156,12 +157,19 @@ std::vector<V4AuditRow> collectV4SmokeRows(
             for (int i = 0; i < length; ++i)
                 for (int j = 0; j < 4; ++j)
                     bytes[i * 4 + j] = static_cast<uint32_t>(history.data_ptr<int32_t>()[i]) >> (j * 8);
-            SHA256(bytes, length * 4, digest);
-            std::ostringstream hex;
-            for (auto v : digest)
-                hex << std::hex << std::setfill('0') << std::setw(2) << static_cast<unsigned>(v);
+            auto hashed = [&](int n) {
+                SHA256(bytes, n * 4, digest);
+                std::ostringstream hex;
+                for (auto v : digest)
+                    hex << std::hex << std::setfill('0') << std::setw(2) << static_cast<unsigned>(v);
+                return hex.str();
+            };
+            std::string chain;
+            if (index == 17)
+                for (int n = prompt; n <= length; ++n)
+                    chain += (n == prompt ? "" : ",") + hashed(n);
             found.push_back(
-                {index, batch, col, width, row, a, b, raw, verify ? scores(in.logits) : raw, hex.str(), nrows, verify});
+                {index, batch, col, width, row, a, b, raw, verify ? scores(in.logits) : raw, hashed(length), nrows, verify, std::move(chain)});
         }
     }
     return found;
@@ -170,7 +178,11 @@ std::vector<V4AuditRow> collectV4SmokeRows(
 void emitV4SmokeRows(const std::vector<V4AuditRow>& rows,
                      const torch::Tensor&           sampled,
                      const torch::Tensor&           accept_len    = {},
-                     const torch::Tensor&           accept_tokens = {}) {
+                     const torch::Tensor&           accept_tokens = {},
+                     const torch::Tensor&           draft_tokens = {},
+                     const torch::Tensor&           dspark_aux = {},
+                     const torch::Tensor&           lm_hidden = {},
+                     int                            graph_path = -1) {
     const auto integers = [](const torch::Tensor& t) {
         return t.defined() && (t.scalar_type() == at::kInt || t.scalar_type() == at::kLong);
     };
@@ -203,6 +215,37 @@ void emitV4SmokeRows(const std::vector<V4AuditRow>& rows,
             out << " masked_a=" << w.masked.a << " masked_b=" << w.masked.b << " masked_argmax=" << w.masked.argmax
                 << " accept_len=" << accepted;
         out << " sampled_target=" << target << " emitted=" << emitted;
+        if (verify && w.slot == 17) {
+            const bool bonus = w.col == w.width-1;
+            if (!integers(draft_tokens) || draft_tokens.dim()!=2 ||
+                draft_tokens.size(0)!=accept_len.numel() || draft_tokens.size(1)!=w.width-1) continue;
+            out << " draft_kind=" << (bonus ? "bonus" : "proposal")
+                << " draft_id=" << (bonus ? -1 : draft_tokens[w.batch][w.col].item<int>())
+                << " committed_sha_chain=" << w.committed_chain;
+            auto valid_rows = [&](const torch::Tensor& t, int64_t cols) {
+                return t.defined() && t.dim()==2 && t.size(0)==w.num_rows && t.size(1)==cols &&
+                    (t.scalar_type()==at::kBFloat16 || t.scalar_type()==at::kFloat);
+            };
+            auto hash_hidden = [](const torch::Tensor& t) {
+                auto c = t.detach().contiguous().cpu();
+                unsigned char digest[SHA256_DIGEST_LENGTH];
+                SHA256(reinterpret_cast<const unsigned char*>(c.data_ptr()),c.numel()*c.element_size(),digest);
+                std::ostringstream h;
+                for(unsigned char v:digest) h << std::hex << std::setfill('0') << std::setw(2) << static_cast<unsigned>(v);
+                return h.str();
+            };
+            out << " verify_exec=" << (graph_path == 1 ? "graph_runner" : graph_path == 0 ? "eager" : "unobserved");
+            // Existing DSpARK target graph output: three mean-over-HC segments in
+            // checkpoint dspark_target_layer_ids order (40,41,42), never draft hidden.
+            if(valid_rows(dspark_aux,3*4096)) {
+                out << " aux_dtype=" << (dspark_aux.scalar_type()==at::kBFloat16 ? "bf16" : "fp32");
+                for(int i=0;i<3;++i)
+                    out << " live_aux" << (40+i) << "_sha=" << hash_hidden(dspark_aux[w.row].narrow(0,i*4096,4096));
+            }
+            if(valid_rows(lm_hidden,4096))
+                out << " head_dtype=" << (lm_hidden.scalar_type()==at::kBFloat16 ? "bf16" : "fp32")
+                    << " live_lm_input_sha=" << hash_hidden(lm_hidden[w.row]);
+        }
         RTP_LLM_LOG_INFO("%s", out.str().c_str());
         std::ofstream(std::string(std::getenv("TEST_UNDECLARED_OUTPUTS_DIR")) + "/v4-target-witness-"
                           + std::to_string(w.slot) + "-" + (verify ? "verify" : "prefill") + ".txt",
@@ -1888,7 +1931,8 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                                           *spec_logits_result,
                                           speculative_sampler_output);
                 emitV4SmokeRows(witness,sampler_output.token_ids,speculative_sampler_output.accept_len,
-                                speculative_sampler_output.accept_tokens);
+                                speculative_sampler_output.accept_tokens, draft_sampler_output.token_ids,
+                                model_output.all_hidden_states, model_output.hidden_states, model_output.target_verify_graph_path);
             }
         }
         return absl::OkStatus();

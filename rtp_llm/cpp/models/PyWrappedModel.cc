@@ -950,7 +950,9 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
                 && has_context_request ?
             generation_prefill_cuda_graph_init_status_ :
             GenerationPrefillCudaGraphStatus::NOT_REQUESTED;
+    int8_t target_verify_graph_path = -1;
     const auto with_generation_prefill_cuda_graph_status = [&](GptModelOutputs outputs) {
+        outputs.target_verify_graph_path = target_verify_graph_path;
         outputs.generation_prefill_cuda_graph_status = generation_prefill_cuda_graph_status;
         return outputs;
     };
@@ -1053,6 +1055,7 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
                 graph_state.current_real_graph_bs);
             py_model_inputs.attention_inputs.is_s_padded = true;
             py_model_outputs                             = graph_runner->forward(py_model_inputs, graph_state);
+            if (inputs.is_target_verify) target_verify_graph_path = 1;
             if (is_generation_prefill_runner) {
                 generation_prefill_cuda_graph_status = GenerationPrefillCudaGraphStatus::REPLAYED;
             }
@@ -1060,6 +1063,7 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         } else {
             py::gil_scoped_acquire gil;
             RTP_LLM_PROFILE_SCOPE("py_model.forward(normal)");
+            if (inputs.is_target_verify) target_verify_graph_path = 0;
             RTP_LLM_LOG_DEBUG("[PyWrappedModel] using normal forward, is_target_verify=%d, is_prefill=%d",
                               py_model_inputs.attention_inputs.is_target_verify,
                               py_model_inputs.attention_inputs.is_prefill);

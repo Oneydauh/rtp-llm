@@ -166,6 +166,8 @@ struct GptModelOutputs {
 
     /** Downstream activations from a non-last target stage. */
     std::map<std::string, torch::Tensor> pp_intermediates;
+    // Observed target verify path, not the requested graph configuration.
+    int8_t target_verify_graph_path{-1};  // -1 unknown/not verify; 0 eager; 1 graph runner
 };
 
 struct CopyParams {
