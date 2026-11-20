@@ -376,10 +376,10 @@ def observe(trace, call, layer, cp, h, *args, **kwargs):
     ):
         for field in names:
             weight(label + "." + field, getattr(obj, field, None))
-    gate = layer.ffn.gate
-    weight("gate.bf16", gate._weight_bf16())
+    moe_gate = layer.ffn.gate
+    weight("gate.bf16", moe_gate._weight_bf16())
     for field in ("bias", "bias_vl", "tid2eid"):
-        value = getattr(gate, field, None)
+        value = getattr(moe_gate, field, None)
         if value is not None:
             weight("gate." + field, value)
     table = layer.engram.embed_tokens
@@ -423,7 +423,7 @@ def observe(trace, call, layer, cp, h, *args, **kwargs):
         if h.is_cuda and hasattr(layer.engram, "q_weight"):
             from rtp_llm.models_py.modules.dsv41 import engram as gate_module
 
-            def gate(fn, a, k):
+            def observe_engram_gate(fn, a, k):
                 if (
                     len(a) == 6
                     and a[2] is layer.engram.q_weight
@@ -432,7 +432,7 @@ def observe(trace, call, layer, cp, h, *args, **kwargs):
                     return _gate_witness(fn, a, k, valid, record)
                 return fn(*a, **k)
 
-            wrap(gate_module, "gated_engram_residual", gate)
+            wrap(gate_module, "gated_engram_residual", observe_engram_gate)
 
         shared = layer.ffn.shared_experts
         if not layer.ffn.fused_moe.includes_shared_expert and shared is not None:
@@ -533,7 +533,7 @@ def observe(trace, call, layer, cp, h, *args, **kwargs):
                 event("gate.scores", result.scores)
             return result
 
-        wrap(gate, "prepare_gate_payload", packed)
+        wrap(moe_gate, "prepare_gate_payload", packed)
 
         def expert_pack(fn, a, k):
             result = fn(*a, **k)
