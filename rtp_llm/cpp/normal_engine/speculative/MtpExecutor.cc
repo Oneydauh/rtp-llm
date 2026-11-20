@@ -2,6 +2,7 @@
 #include "rtp_llm/cpp/normal_engine/speculative/V4SmokeWitness.h"
 #include "rtp_llm/cpp/normal_engine/speculative/V41CacheRoundTrace.h"
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <openssl/sha.h>
 #include "rtp_llm/cpp/observability/ExecutionRecorder.h"
@@ -92,6 +93,7 @@ struct V4AuditRow {
     int64_t       num_rows;
     bool          verify;
     std::string   committed_chain;
+    int           history_last_id;
 };
 
 // Only the actual target sampler reaches these two sites. The verify histories
@@ -170,7 +172,7 @@ std::vector<V4AuditRow> collectV4SmokeRows(
                 for (int n = prompt; n <= length; ++n)
                     chain += (n == prompt ? "" : ",") + hashed(n);
             found.push_back(
-                {index, batch, col, width, row, a, b, raw, verify ? scores(in.logits) : raw, hashed(length), nrows, verify, std::move(chain)});
+                {index, batch, col, width, row, a, b, raw, verify ? scores(in.logits) : raw, hashed(length), nrows, verify, std::move(chain), history.data_ptr<int32_t>()[length-1]});
         }
     }
     return found;
@@ -183,7 +185,8 @@ void emitV4SmokeRows(const std::vector<V4AuditRow>& rows,
                      const torch::Tensor&           draft_tokens = {},
                      const torch::Tensor&           dspark_aux = {},
                      const torch::Tensor&           lm_hidden = {},
-                     int                            graph_path = -1) {
+                     int                            graph_path = -1,
+                     const std::function<torch::Tensor(int64_t,int,int)>& live_row = {}) {
     const auto integers = [](const torch::Tensor& t) {
         return t.defined() && (t.scalar_type() == at::kInt || t.scalar_type() == at::kLong);
     };
@@ -242,6 +245,20 @@ void emitV4SmokeRows(const std::vector<V4AuditRow>& rows,
                 out << " aux_dtype=" << (dspark_aux.scalar_type()==at::kBFloat16 ? "bf16" : "fp32");
                 for(int i=0;i<3;++i)
                     out << " live_aux" << (40+i) << "_sha=" << hash_hidden(dspark_aux[w.row].narrow(0,i*4096,4096));
+                if (live_row) {
+                    // Only this accepted row leaves the device. Corroborate its
+                    // raw residual bytes with the independent native DSpARK export.
+                    auto layers = live_row(w.row, w.width, w.history_last_id);
+                    if (layers.defined() && layers.scalar_type()==at::kBFloat16 && layers.dim()==3 &&
+                        layers.size(0)==44 && layers.size(1)==4 && layers.size(2)==4096 &&
+                        layers.device()==dspark_aux.device() &&
+                        torch::equal(layers.narrow(0,41,3).mean(1).reshape({3*4096}), dspark_aux[w.row])) {
+                        const auto single = layers.detach().contiguous().cpu();
+                        out << " live_raw_hc_sha=";
+                        for (int i=0;i<44;++i)
+                            out << (i ? "," : "") << hash_hidden(single[i]);
+                    }
+                }
             }
             if(valid_rows(lm_hidden,4096))
                 out << " head_dtype=" << (lm_hidden.scalar_type()==at::kBFloat16 ? "bf16" : "fp32")
@@ -1949,7 +1966,11 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                                           speculative_sampler_output);
                 emitV4SmokeRows(witness,sampler_output.token_ids,speculative_sampler_output.accept_len,
                                 speculative_sampler_output.accept_tokens, draft_sampler_output.token_ids,
-                                model_output.all_hidden_states, model_output.hidden_states, model_output.target_verify_graph_path);
+                                model_output.all_hidden_states, model_output.hidden_states, model_output.target_verify_graph_path,
+                                [&](int64_t row, int width, int last_id) {
+                                    const auto py = dynamic_cast<PyWrappedModel*>(model_.get());
+                                    return py ? py->getV4SmokeVerifyRow(row,width,last_id) : torch::Tensor{};
+                                });
                 if (v41_round) {
                     v41_cache_round::finish(
                         *v41_round, draft_sampler_output.token_ids, sampler_output.token_ids,
