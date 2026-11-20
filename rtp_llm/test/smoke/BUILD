@@ -255,6 +255,7 @@ custom_smoke_test(
         "deepseek_v41_pd_contract_test.py",
         "deepseek_v41_dspark_contract_test.py",
         "scripts/compare_v41_cache_rounds.py",
+        "//rtp_llm/test/smoke/arm_causal_inputs:v41",
     ],
 )
 
