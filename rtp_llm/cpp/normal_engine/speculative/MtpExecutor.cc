@@ -1,5 +1,6 @@
 #include "rtp_llm/cpp/normal_engine/speculative/MtpCompute.h"
 #include "rtp_llm/cpp/normal_engine/speculative/V4SmokeWitness.h"
+#include "rtp_llm/cpp/normal_engine/speculative/V41CacheRoundTrace.h"
 #include <fstream>
 #include <iomanip>
 #include <openssl/sha.h>
@@ -1211,6 +1212,11 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         RTP_LLM_PROFILE_SCOPE("executor.mtp.prefill_step(tp_sync_input)");
         int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
         model_input.skip_run  = streams.empty();
+        if (v41_cache_round::enabled() && is_dspark_ && role_type_ == RoleType::PREFILL && isTpRank0()
+            && !warm_up_ && streams.size() == 1 && !streams.front()->isFakeStream()) {
+            const auto input = streams.front()->generateInput();
+            model_input.v41_cache_fixture = input && v41_cache_round::matchesDecodePrompt(input->input_ids);
+        }
         tpSyncModelInputs(model_input, parallelism_config_);
         target_only = model_input.skip_lm_head;
         if (model_input.skip_run) {
@@ -1629,6 +1635,11 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                     batch_stream_processor_->buildDSparkRoundState(stream_groups, model_input, buffer_holder_);
                 batch_stream_processor_->prepareDSparkProposeModelInput(
                     dspark_round_state, proposal_input, buffer_holder_);
+                if (v41_cache_round::enabled() && role_type_ == RoleType::DECODE && !warm_up_
+                    && streams.size() == 1 && !streams.front()->isFakeStream()) {
+                    const auto input = streams.front()->generateInput();
+                    proposal_input.v41_cache_fixture = input && v41_cache_round::matchesDecodePrompt(input->input_ids);
+                }
                 ensureModelInputsOnCuda(proposal_input, "decode.prepare_dspark_proposal");
             }
             tpSyncModelInputs(proposal_input, parallelism_config_);
@@ -1918,6 +1929,8 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                 holdSamplerInputHostBuffers(buffer_holder_, sampler_input);
                 const auto witness = collectV4SmokeRows(stream_groups,sampler_input,model_output.logits,
                                                         propose_step_+1,true);
+                const auto v41_round = (is_dspark_ && role_type_ == RoleType::DECODE && v41_cache_round::enabled())
+                                           ? v41_cache_round::prepare(sampler_input) : std::nullopt;
                 sampler_output           = std::move(sampler_->forward(sampler_input));
                 sampler_output.all_probs = sampler_output.all_probs.reshape(
                     {(int64_t)batch_size, (int64_t)(propose_step_ + 1), (int64_t)vocab_size_});
@@ -1933,6 +1946,11 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                 emitV4SmokeRows(witness,sampler_output.token_ids,speculative_sampler_output.accept_len,
                                 speculative_sampler_output.accept_tokens, draft_sampler_output.token_ids,
                                 model_output.all_hidden_states, model_output.hidden_states, model_output.target_verify_graph_path);
+                if (v41_round) {
+                    v41_cache_round::finish(
+                        *v41_round, draft_sampler_output.token_ids, sampler_output.token_ids,
+                        speculative_sampler_output.accept_len, speculative_sampler_output.accept_tokens);
+                }
             }
         }
         return absl::OkStatus();
