@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from rtp_llm.models_py.layers.embedding import ParallelLMHead, VocabParallelEmbedding
+from rtp_llm.models_py.layers.embedding import VocabParallelEmbedding
 from rtp_llm.models_py.layers.norm import RMSNorm
 from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.modules.dsv4.block import Block
@@ -23,6 +23,7 @@ from rtp_llm.models_py.new_models.deepseek_v4.commit_attention import (
     OwnedCommitOnlyAttentionFP8,
 )
 from rtp_llm.models_py.new_models.deepseek_v4.hc import OwnedHCHead, OwnedHCUnit
+from rtp_llm.models_py.new_models.deepseek_v4.load_geometry import make_lm_head
 from rtp_llm.models_py.weight_mapper import WeightsMapper
 
 
@@ -226,13 +227,7 @@ class OwnedV4Transformer(V4Transformer, RtpModule):
             args.vocab_size, args.dim, params_dtype=params_dtype
         )
         self.norm = _checkpoint_norm(args, params_dtype)
-        self.head = ParallelLMHead(
-            args.vocab_size,
-            args.dim,
-            tp_size=args.lm_head_tp_size,
-            tp_rank=args.lm_head_tp_rank,
-            params_dtype=head_dtype,
-        )
+        self.head = make_lm_head(args, head_dtype)
         self.head_hc = OwnedHCHead(
             dim=args.dim,
             hc_mult=args.hc_mult,

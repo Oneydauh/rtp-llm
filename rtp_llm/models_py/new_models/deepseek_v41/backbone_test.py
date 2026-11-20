@@ -259,9 +259,12 @@ class BackboneCheckpointTest(unittest.TestCase):
         values["layers.1.engram.embed.weight"] = torch.ones(1)
         for rank in (0, 1):
             model = self.load(values, rank)
-            torch.testing.assert_close(
-                model.head.weight, values["head.weight"][rank * 4 : (rank + 1) * 4]
-            )
+            # OldFST allocates a multiple of eight rows per LM-head rank.
+            # With eight real tokens, rank one is entirely padding.
+            expected_head = values["head.weight"]
+            if rank == 1:
+                expected_head = torch.zeros_like(expected_head)
+            torch.testing.assert_close(model.head.weight, expected_head)
             torch.testing.assert_close(
                 model.embed.weight,
                 values["embed.weight"][:, rank * 32 : (rank + 1) * 32],

@@ -18,6 +18,7 @@ from rtp_llm.models_py.borrowed_parameters import (
 )
 from rtp_llm.models_py.model_loader import NewLoaderConfig, NewModelLoader
 from rtp_llm.models_py.module_base import RtpModule
+from rtp_llm.models_py.new_models.deepseek_v4.load_geometry import make_lm_head
 from rtp_llm.models_py.new_models.deepseek_v41.backbone import OwnedV41Transformer
 from rtp_llm.models_py.new_models.deepseek_v41.backbone_test import (
     args,
@@ -78,9 +79,7 @@ class _TargetGlobals(RtpModule):
         self.embed = OwnedV41Matrix(
             8, 64, shard_dim=1, tp_size=2, tp_rank=rank, dtype=torch.bfloat16
         )
-        self.head = OwnedV41Matrix(
-            8, 64, shard_dim=0, tp_size=2, tp_rank=rank, dtype=torch.bfloat16
-        )
+        self.head = make_lm_head(args(rank), torch.bfloat16)
 
 
 def load_into(model, path, rank, native_fst=False):

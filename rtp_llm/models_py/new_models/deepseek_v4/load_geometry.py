@@ -1,6 +1,20 @@
 """Check that the weight reader and the existing V4 runtime use the same ranks."""
 
 from rtp_llm.models_py.expert_placement import expert_placement_for_layer
+from rtp_llm.models_py.layers.embedding import ParallelLMHead
+
+
+def make_lm_head(args, dtype):
+    # The legacy head bypasses splitting only when head TP, DP and EP are
+    # all one. Under CP, head TP can differ from attention TP.
+    return ParallelLMHead(
+        args.vocab_size,
+        args.dim,
+        tp_size=args.lm_head_tp_size,
+        tp_rank=args.lm_head_tp_rank,
+        params_dtype=dtype,
+        tp_pad8=max(args.lm_head_tp_size, args.dp_size, args.ep_size) > 1,
+    )
 
 
 def validate_v4_static_placement(args, model_config, load_config):

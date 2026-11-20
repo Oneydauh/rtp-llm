@@ -3,6 +3,7 @@
 import torch
 
 from rtp_llm.models_py.module_base import RtpModule
+from rtp_llm.models_py.new_models.deepseek_v4.load_geometry import make_lm_head
 from rtp_llm.models_py.new_models.deepseek_v41.globals import OwnedV41Matrix
 from rtp_llm.models_py.new_models.deepseek_v41_dspark.auxiliary import (
     V41DSparkAuxiliaryWeights,
@@ -24,14 +25,7 @@ class V41DraftGlobalsMixin:
                     tp_rank=args.embedding_tp_rank,
                     dtype=torch.bfloat16,
                 )
-                self.head = OwnedV41Matrix(
-                    args.vocab_size,
-                    args.dim,
-                    shard_dim=0,
-                    tp_size=args.lm_head_tp_size,
-                    tp_rank=args.lm_head_tp_rank,
-                    dtype=head_dtype,
-                )
+                self.head = make_lm_head(args, head_dtype)
 
     def checkpoint_weight_name_filter(self):
         base = super().checkpoint_weight_name_filter()

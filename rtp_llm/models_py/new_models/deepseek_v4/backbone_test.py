@@ -328,7 +328,11 @@ class Dsv4FullBackboneCheckpointTest(unittest.TestCase):
         for rank in (0, 1):
             model = self.load(weights, rank)
             torch.testing.assert_close(model.embed.weight, weights["embed.weight"])
-            torch.testing.assert_close(model.head_weight, weights["head.weight"])
+            # LM-head TP=1, EP=2: the distributed loader still pads to 8.
+            expected_head = torch.nn.functional.pad(
+                weights["head.weight"], (0, 0, 0, 7)
+            )
+            torch.testing.assert_close(model.head_weight, expected_head)
             torch.testing.assert_close(model.head_hc.fn, weights["hc_head_fn"])
             self.assertIs(model.head_weight, model.head.weight)
             for index, block in enumerate(model.layers):

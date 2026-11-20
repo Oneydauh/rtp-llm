@@ -3,13 +3,13 @@
 import torch
 from torch import nn
 
-from rtp_llm.models_py.layers.embedding import ParallelLMHead
 from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.modules import RMSNorm
 from rtp_llm.models_py.modules.dsv4.ppu.block import PpuBlock
 from rtp_llm.models_py.modules.dsv4.ppu.transformer import PpuV4Transformer
 from rtp_llm.models_py.new_models.deepseek_v4.backbone import OwnedV4Transformer
 from rtp_llm.models_py.new_models.deepseek_v4.hc import _hc_parameters
+from rtp_llm.models_py.new_models.deepseek_v4.load_geometry import make_lm_head
 
 
 def _norm(args, dtype):
@@ -134,14 +134,7 @@ class PpuOwnedV4Transformer(PpuV4Transformer, OwnedV4Transformer):
             args.vocab_size, args.dim, args.tp_size, args.tp_rank, dtype=params_dtype
         )
         self.norm = _norm(args, params_dtype)
-        self.head = ParallelLMHead(
-            args.vocab_size,
-            args.dim,
-            tp_size=args.lm_head_tp_size,
-            tp_rank=args.lm_head_tp_rank,
-            params_dtype=head_dtype,
-            tp_pad8=True,
-        )
+        self.head = make_lm_head(args, head_dtype)
         self.head_hc = self.platform_provider.build_hc_head(
             *_hc_parameters(args.dim, args.hc_mult, head=True),
             dim=args.dim,
