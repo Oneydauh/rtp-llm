@@ -6,6 +6,8 @@ import os
 import re
 from contextlib import ExitStack
 from pathlib import Path
+from threading import get_ident
+from unittest.mock import patch
 
 import torch
 
@@ -22,7 +24,7 @@ def observe_fixture_layer(call, layer, cp, h, *args, **kwargs):
         raise ValueError("Missing V4.1 fixture Engram token mask")
     if not mask[valid].all().item():
         raise ValueError("The all-text fixed fixture has a masked real token")
-    result, metadata = {}, {}
+    result, metadata, gate = {}, {}, {}
 
     def save(stage, tensor):
         if stage in result or not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
@@ -46,6 +48,28 @@ def observe_fixture_layer(call, layer, cp, h, *args, **kwargs):
     # Snapshot inputs before running each module (Engram/norm may work in
     # place). This fixture is shorter than the norm-fusion/chunking thresholds.
     with ExitStack() as stack:
+        if h.is_cuda and hasattr(layer.engram, "q_weight"):
+            from rtp_llm.models_py.modules.dsv41 import engram as gate_module
+            from rtp_llm.models_py.modules.v41_causal import _gate_witness
+
+            original = gate_module.gated_engram_residual
+            owner_thread = get_ident()
+
+            def inspect_gate(*a, **kw):
+                if (
+                    get_ident() != owner_thread
+                    or len(a) != 6
+                    or a[2] is not layer.engram.q_weight
+                    or a[3] is not layer.engram.k_weight
+                ):
+                    return original(*a, **kw)
+                if gate:
+                    raise ValueError("Repeated Engram gate in the cold layer 1 fixture")
+                return _gate_witness(original, a, kw, valid, gate)
+
+            stack.enter_context(
+                patch.object(gate_module, "gated_engram_residual", inspect_gate)
+            )
         for name, module in (
             ("wkv", layer.engram.wkv),
             ("engram", layer.engram),
@@ -75,6 +99,7 @@ def observe_fixture_layer(call, layer, cp, h, *args, **kwargs):
                 positions=positions,
                 stages=result,
                 metadata=metadata,
+                **gate,
             ),
             sink,
             separators=(",", ":"),
