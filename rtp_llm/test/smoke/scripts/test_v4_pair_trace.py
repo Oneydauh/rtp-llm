@@ -24,6 +24,7 @@ class PairTest(unittest.TestCase):
         self.assertEqual(hashes[-1],v.SHA)
         text="v4_target_witness_v1 case=17 phase=verify output_token_1based=38 row=2 col=2 width=4 batch=0 accept_len=3 a_id=3315 b_id=2642 raw_a=4 raw_b=3 masked_a=-inf masked_b=3 raw_argmax=3315 masked_argmax=2642 sampled_target=2642 emitted=2642 draft_kind=proposal draft_id=1 prefix_sha256_le_i32="+v.SHA+" committed_sha_chain="+",".join(hashes)
         text += " verify_exec=graph_runner aux_dtype=bf16 head_dtype=bf16 "+" ".join(k+"="+v.SHA for k in ("live_aux40_sha","live_aux41_sha","live_aux42_sha","live_lm_input_sha"))
+        text += " live_raw_hc_sha="+",".join([v.SHA]*44)
         with tempfile.TemporaryDirectory() as t,patch.dict(os.environ,{"TEST_TMPDIR":t,"TEST_UNDECLARED_OUTPUTS_DIR":t,"TEST_TARGET":v.TARGET}):
             root=Path(t); marker=root/"v4-live38-replay.on"
             (root/"v4-target-witness-17-verify.txt").write_text(text+"\n")
@@ -52,9 +53,12 @@ class PairTest(unittest.TestCase):
             self.assertIsNone(compare(old,new)["fixed_prefill_replay"]["first_different_layer"])
             new["layers"][7]["sha256"]="5"*64
             self.assertEqual(compare(old,new)["fixed_prefill_replay"]["first_different_layer"],"layer.6")
+            new["sample"]["live_raw_layers"][12]["sha256"]="1"*64
+            self.assertEqual(compare(old,new)["first_different_observed_live_stage"],"layer.11.raw_hc")
             for j in range(14,38): new["committed_sha_chain"][j]="a"*64
             new["committed_prefix_sha256"]=new["committed_sha_chain"][-1]
             self.assertFalse(compare(old,new)["comparable_live_sample"])
+            self.assertIsNone(compare(old,new)["first_different_observed_live_stage"])
             self.assertEqual(compare(old,new)["first_different_committed_output_1based"],14)
             new["layers"].pop()
             with self.assertRaises(ValueError):compare(old,new)

@@ -8,11 +8,12 @@ import urllib.request
 from pathlib import Path
 
 TARGET = "//rtp_llm/test/smoke:smoke_v4_flash_0731_pd_cp2ep2_dp2ep2_dspark_cprr_async_xgrammar_json_sm100"
-SCHEMA = "rtp.v4.live38.v1"
+SCHEMA = "rtp.v4.live38.v2"
 FIXTURE = "v4_0731_xgrammar_17"
 SHA = "cba0af7f8765ce15615d4bb2c34e043080fbbc8816c41623db1abaa9578c3e47"
 PROMPT_SHA = "9bfcb2dd441fbf20c44897a746a66b3add4d5bc2b42d965f1845e318e1505e1c"
 STAGES = ["embed", *(f"layer.{i}" for i in range(43)), "final_norm"]
+RAW_LIVE = ["embed.raw_hc", *(f"layer.{i}.raw_hc" for i in range(43))]
 PROMPT = '<｜begin▁of▁sentence｜>You are a helpful assistant.<｜User｜>查询下北京的天气，json格式返回<｜Assistant｜></think>{"city":"北京","weather":"晴","temperature":"15°C","humidity":"30%","wind":"北风 3级","update_time":"2025-04-'
 
 
@@ -52,6 +53,9 @@ def sample(root):
         ("layer.40.mean_hc","live_aux40_sha","aux_dtype"),("layer.41.mean_hc","live_aux41_sha","aux_dtype"),
         ("layer.42.mean_hc","live_aux42_sha","aux_dtype"),("lm_head_input","live_lm_input_sha","head_dtype"))]
     require(all(validsha(z["sha256"]) and z["dtype"] in ("bf16","fp32") for z in record["live_layers"]),"incomplete_live_layers")
+    raw = values["live_raw_hc_sha"].split(",")
+    require(len(raw)==len(RAW_LIVE) and all(validsha(h) for h in raw),"missing_live_raw_layers")
+    record["live_raw_layers"]=[{"stage":k,"sha256":h,"dtype":"bf16"} for k,h in zip(RAW_LIVE,raw)]
     for k in ("raw_a","raw_b","masked_a","masked_b"):
         x = float(values[k])
         require(math.isfinite(x) or (k.startswith("masked") and x==-math.inf),"invalid_score")

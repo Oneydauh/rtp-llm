@@ -207,6 +207,14 @@ torch::Tensor PyWrappedModel::getMtpTargetHiddenStates(int64_t num_tokens) {
     return result.is_none() ? torch::Tensor() : result.cast<torch::Tensor>();
 }
 
+torch::Tensor PyWrappedModel::getV4SmokeVerifyRow(int64_t row, int width, int last_id) {
+    py::gil_scoped_acquire gil;
+    if (!py_model_ || !py::hasattr(py_model_, "get_v4_smoke_verify_row"))
+        return {};
+    auto selected = py_model_.attr("get_v4_smoke_verify_row")(row, width, last_id);
+    return selected.is_none() ? torch::Tensor{} : selected.cast<torch::Tensor>();
+}
+
 torch::Tensor PyWrappedModel::getMtpLastHiddenStates(int64_t num_tokens) {
     if (!py_model_) {
         return torch::Tensor();
