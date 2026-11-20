@@ -61,6 +61,18 @@ py_test(
 )
 
 py_test(
+    name = "v41_causal_protocol_test",
+    srcs = [
+        "scripts/compare_v41_causal.py",
+        "scripts/test_v41_causal.py",
+    ],
+    main = "scripts/test_v41_causal.py",
+    deps = ["//rtp_llm/models_py:modules", "//rtp_llm:safetensors"],
+    env = {"GPU_COUNT": "0", "CUDA_VISIBLE_DEVICES": ""},
+    tags = ["manual"],
+)
+
+py_test(
     name = "comparison_utils_test",
     srcs = [
         "comparison_utils.py",

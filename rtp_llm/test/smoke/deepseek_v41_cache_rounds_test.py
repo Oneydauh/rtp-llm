@@ -160,6 +160,35 @@ class CacheRoundFixture(
             json.dumps(doc, indent=2, allow_nan=False) + "\n"
         )
         finalize(root, run)
+        if os.environ.get("RTP_V41_CAUSAL_ROLE"):
+            # Fourth, separately identified request only. Original three
+            # HTTP/golden checks and their native round artifacts stay intact.
+            self.assertEqual(loader, os.environ["RTP_V41_CAUSAL_ROLE"])
+            repeat = uuid.uuid4().hex
+            replay = root / "v41_causal_replay_id"
+            replay.write_text(repeat)
+            try:
+                stage_tmp.write_text(f"{repeat} hit\n")
+                stage_tmp.replace(marker)
+                result = self.session.post(
+                    f"http://127.0.0.1:{self.server.port}/",
+                    json=golden["long_cache_hit"]["query"],
+                    timeout=600,
+                )
+                result.raise_for_status()
+                data = result.json()
+            finally:
+                marker.unlink(missing_ok=True)
+                replay.unlink(missing_ok=True)
+            self.assertTrue(data["finished"] and data["aux_info"]["pd_sep"])
+            self.assertEqual(data["aux_info"][self.reuse_field], 512)
+            self.assertEqual(data["input_ids"], actual["input_ids"])
+            for mode in ("natural", "replay"):
+                for rank in range(2):
+                    output = root / f"v41_causal_{mode}_r{rank}.json"
+                    self.assertTrue(
+                        output.is_file(), "missing causal evidence: " + output.name
+                    )
         self.assertTrue(
             exact,
             "fixture output differs from the unchanged golden; see v41_cache_rounds.json",
