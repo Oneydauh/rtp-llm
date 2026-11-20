@@ -1,5 +1,6 @@
 """Compare two CP ranks on both sides; accept only a replay of the same donor fixture."""
 
+import hashlib
 import json
 import re
 import sys
@@ -46,7 +47,8 @@ ORDER = (
 SHARED = tuple(
     "ffn.shared." + k for k in ("x", "x_sf", "gate_up", "hidden", "hidden_sf", "out")
 )
-GLOBAL = {"attn.kv_rope_gather", "attn.swa_write", "attn.swa_read", "attn.mla.kv"}
+KV_PATH = ("attn.kv_rope_gather", "attn.swa_write", "attn.swa_read", "attn.mla.kv")
+GLOBAL = set(KV_PATH)
 W = {
     "attn_norm",
     "ffn_norm",
@@ -77,6 +79,20 @@ def sha(v):
     return isinstance(v, str) and re.fullmatch("[0-9a-f]{64}", v)
 
 
+def kv_pair(a, b):
+    # Number, ordering and hex format of rows were checked by the caller.
+    def digest(v):
+        return hashlib.sha256(bytes.fromhex("".join(v["rows"]))).hexdigest()
+
+    return {
+        "from_digest": digest(a),
+        "to_digest": digest(b),
+        "different_positions": [
+            p for p, x, y in zip(a["pos"], a["rows"], b["rows"]) if x != y
+        ],
+    }
+
+
 def compare(docs):
     require(
         len(docs) == 4 and re.fullmatch("[0-9a-f]{32}", docs[0]["nonce"]), "pair nonce"
@@ -86,6 +102,8 @@ def compare(docs):
     repetitions = {}
     upstream = {}
     padding = {}
+    kv_chain = {}
+    kv_between_roles = {}
     for ix, d in enumerate(docs):
         role = ("oldfst", "newfst")[ix // 2]
         rank = ix % 2
@@ -153,13 +171,10 @@ def compare(docs):
                 and all(map(sha, v["rows"])),
                 "row coverage",
             )
-        require(
-            all(
-                ops[k]["rows"] == ops["attn.swa_read"]["rows"]
-                for k in ("attn.kv_rope_gather", "attn.swa_write", "attn.mla.kv")
-            ),
-            "fresh SWA read not proven",
-        )
+        kv_chain[key] = {
+            before + "->" + after: kv_pair(ops[before], ops[after])
+            for before, after in zip(KV_PATH, KV_PATH[1:])
+        }
         require(set(d["ab"]) == {"wq_a", "wkv"}, "missing isolated Q/KV replay")
         for k, v in d["ab"].items():
             require(
@@ -202,6 +217,9 @@ def compare(docs):
         require(sorted(p) == list(range(55)), "missing physical CP rank")
     for rank in (0, 1):
         a, b = docs[rank], docs[rank + 2]
+        kv_between_roles[str(rank)] = kv_pair(
+            a["ops"]["attn.mla.kv"], b["ops"]["attn.mla.kv"]
+        )
         require(
             a["relay_sha"] == b["relay_sha"] and a["ops"]["input"] == b["ops"]["input"],
             "different donor inputs",
@@ -233,10 +251,21 @@ def compare(docs):
             first = {"stage": k, "positions": sorted(pos)}
         if first40 is None and 40 in pos:
             first40 = k
+    fresh = not any(
+        pair["different_positions"]
+        for chain in kv_chain.values()
+        for pair in chain.values()
+    )
+    same_cache = fresh and not any(
+        pair["different_positions"] for pair in kv_between_roles.values()
+    )
     return {
         "valid": True,
         "same_donor_replayed_on_both": True,
-        "fresh_kv_only": True,
+        "fresh_kv_only": fresh,
+        "invalid_same_cache_for_downstream": not same_cache,
+        "fresh_kv_boundary_checks": kv_chain,
+        "mla_kv_old_to_new_by_rank": kv_between_roles,
         "runtime_weight_differences": weights,
         "natural_input_differing_positions_vs_donor": upstream,
         "physical_vs_valid_input": padding,
@@ -246,7 +275,7 @@ def compare(docs):
         "same_moe_executor": same_path,
         "qkv_isolated_replay": ab,
         "same_input_moe_repeat_differences": repetitions,
-        "interpretation": "Fused kernels are single boundaries; differing weights/layout or unstable same-input repeats preclude deterministic loader attribution.",
+        "interpretation": "Fused kernels are single boundaries. If invalid_same_cache_for_downstream is true, later differences are observations, not downstream kernel attribution. Differing weights/layout or unstable same-input repeats preclude deterministic loader attribution.",
     }
 
 
