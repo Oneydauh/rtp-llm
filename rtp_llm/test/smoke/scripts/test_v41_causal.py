@@ -57,6 +57,37 @@ class Attn(Identity):
 
 
 class CausalTest(unittest.TestCase):
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.version.hip is None, "requires NVIDIA CUDA"
+    )
+    @torch.inference_mode()
+    def test_actual_gate_launch_is_observed_without_changing_output(self):
+        from rtp_llm.models_py.modules.dsv41.engram import gated_engram_residual
+        from rtp_llm.test.smoke.scripts.compare_v41_causal import compare_gate
+
+        if torch.cuda.get_device_capability()[0] < 8:
+            self.skipTest("requires native BF16")
+        rng = torch.Generator(device="cuda").manual_seed(81)
+        h, kv, q, k = [
+            torch.randn(s, generator=rng, device="cuda", dtype=torch.bfloat16)
+            for s in ((17, 4, 5120), (17, 25600), (4, 5120), (4, 5120))
+        ]
+        mask = torch.arange(17, device="cuda") % 5 != 0
+        expected = gated_engram_residual(h.clone(), kv, q, k, 1e-20, mask)
+        record = {}
+        out = trace._gate_witness(
+            gated_engram_residual, (h, kv, q, k, 1e-20, mask), {"out": h}, mask, record
+        )
+        self.assertTrue(torch.equal(expected, out))
+        self.assertEqual(out.data_ptr(), h.data_ptr())
+        result = compare_gate(record, record)
+        self.assertEqual(result["actual_path"], ["triton", "triton"])
+        self.assertRegex(result["cubin_sha256"][0], "^[0-9a-f]{64}$")
+        self.assertEqual(result["actual_matches_native"], [True, True])
+        self.assertEqual(
+            set(record["engram_gate"]["launches"]), {"actual", "dense_native"}
+        )
+
     def test_native_linear_and_shared_workspace_operands(self):
         raw, packed, actual = (torch.tensor([n]) for n in (1, 2, 3))
         direct = NS(weight=actual, weight_scales=packed)
