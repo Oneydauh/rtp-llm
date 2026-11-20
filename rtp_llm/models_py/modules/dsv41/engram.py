@@ -27,6 +27,7 @@ import os
 import shutil
 import uuid
 import weakref
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
@@ -783,7 +784,15 @@ def gated_engram_residual(
         kv_supported
         and _engram_inject_supported(hidden, q_weight, k_weight, token_mask)
         and kv.is_contiguous()
-        and (out is None or out.is_contiguous())
+        and (
+            out is None
+            or (
+                out.is_contiguous()
+                and out.device == hidden.device
+                and out.shape == hidden.shape
+                and out.dtype == hidden.dtype
+            )
+        )
     ):
         from rtp_llm.models_py.modules.dsv41._engram_inject_triton import (
             engram_inject_kernel,
@@ -791,20 +800,28 @@ def gated_engram_residual(
 
         if out is None:
             out = torch.empty_like(hidden)
-        engram_inject_kernel[(hidden.numel() // (4 * 5120), 4)](
-            hidden,
-            kv,
-            q_weight,
-            k_weight,
-            hidden if token_mask is None else token_mask,
-            out,
-            DIM=5120,
-            HC=4,
-            HAS_MASK=token_mask is not None,
-            EPS=eps,
-            BLOCK=8192,
-            enable_fp_fusion=False,
+        # Triton chooses both target and stream from the thread's current
+        # device, not the pointer arguments. Preserve the caller's context.
+        guard = (
+            nullcontext()
+            if torch.cuda.current_device() == hidden.device.index
+            else torch.cuda.device(hidden.device)
         )
+        with guard:
+            engram_inject_kernel[(hidden.numel() // (4 * 5120), 4)](
+                hidden,
+                kv,
+                q_weight,
+                k_weight,
+                hidden if token_mask is None else token_mask,
+                out,
+                DIM=5120,
+                HC=4,
+                HAS_MASK=token_mask is not None,
+                EPS=eps,
+                BLOCK=8192,
+                enable_fp_fusion=False,
+            )
         return out
     tokens, copies, dim = hidden.shape
     key = kv[:, : copies * dim].reshape(tokens, copies, dim).float()
