@@ -84,6 +84,11 @@ class CausalTest(unittest.TestCase):
         self.assertEqual(result["actual_path"], ["triton", "triton"])
         self.assertRegex(result["cubin_sha256"][0], "^[0-9a-f]{64}$")
         self.assertEqual(result["actual_matches_native"], [True, True])
+        launch = record["engram_gate"]["launches"]["actual"]
+        self.assertTrue(launch["tensor_stream"])
+        self.assertRegex(
+            launch["code_segments"][".text.engram_inject_kernel"], "^[0-9a-f]{64}$"
+        )
         self.assertEqual(
             set(record["engram_gate"]["launches"]), {"actual", "dense_native"}
         )

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import struct
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
@@ -58,6 +59,38 @@ def _digest(x):
         "shape": list(x.shape),
         "sha256": sha.hexdigest(),
     }
+
+
+def _gate_code_segments(cubin):
+    """Fingerprint device instructions/constants, not DWARF or Bazel paths."""
+    if (
+        not isinstance(cubin, bytes)
+        or len(cubin) < 64
+        or cubin[:6] != b"\x7fELF\x02\x01"
+    ):
+        return {}
+    offset = struct.unpack_from("<Q", cubin, 40)[0]
+    stride, count, names = struct.unpack_from("<HHH", cubin, 58)
+    if stride < 64 or names >= count or offset + stride * count > len(cubin):
+        return {}
+
+    def section(i):
+        return struct.unpack_from("<IIQQQQ", cubin, offset + stride * i)
+
+    _, _, _, _, start, size = section(names)
+    strings = cubin[start : start + size]
+    result = {}
+    for i in range(count):
+        name_offset, kind, _, _, start, size = section(i)
+        end = strings.find(b"\0", name_offset)
+        if end < name_offset or not size or kind == 8 or start + size > len(cubin):
+            continue
+        name = strings[name_offset:end]
+        if name.startswith((b".text.", b".nv.constant", b".nv.merc.text")):
+            result[name.decode("ascii")] = hashlib.sha256(
+                cubin[start : start + size]
+            ).hexdigest()
+    return result
 
 
 def _gate_witness(fn, a, kw, valid, record):
@@ -145,11 +178,22 @@ def _gate_witness(fn, a, kw, valid, record):
             launch = real_kernel[grid]
 
             def run(*values, **params):
+                from triton.runtime import driver
+
+                launch_device = driver.active.get_current_device()
+                launch_on_tensor_stream = (
+                    launch_device == h.device.index
+                    and driver.active.get_current_stream(launch_device)
+                    == torch.cuda.current_stream(h.device).cuda_stream
+                )
                 compiled = launch(*values, **params)
                 cubin = getattr(compiled, "asm", {}).get("cubin")
                 info["launches"][stage] = dict(
                     grid=list(grid),
                     params=params,
+                    device_matches_tensor=launch_device == h.device.index,
+                    tensor_stream=launch_on_tensor_stream,
+                    code_segments=_gate_code_segments(cubin),
                     binary_sha256=(
                         hashlib.sha256(cubin).hexdigest()
                         if isinstance(cubin, bytes)
