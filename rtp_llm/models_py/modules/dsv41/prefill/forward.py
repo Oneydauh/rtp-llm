@@ -680,6 +680,19 @@ def forward_layers(
                 else v4.layers
             )
             for layer_idx, layer_call in enumerate(layer_calls):
+                if (
+                    cache_trace is not None
+                    and cache_trace.phase == "hit"
+                    and layer_idx == 1
+                    and os.environ.get("RTP_V41_CAUSAL_ROLE")
+                ):
+                    from functools import partial
+
+                    from rtp_llm.models_py.modules.v41_causal import observe
+
+                    layer_call = partial(
+                        observe, cache_trace, layer_call, v4.layers[1], cp_ctx
+                    )
                 if tracing and layer_idx == 1:
                     from functools import partial
 
