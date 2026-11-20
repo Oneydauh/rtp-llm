@@ -123,6 +123,18 @@ class CausalTest(unittest.TestCase):
         self.assertEqual(gpu_abi["scales"].flatten().tolist(), [23, 21])
 
     def test_real_call_private_transport(self):
+        self._real_call_private_transport("cpu")
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.version.hip is None, "requires NVIDIA CUDA"
+    )
+    @torch.inference_mode()
+    def test_hit512_installs_engram_and_moe_hooks_together(self):
+        if torch.cuda.get_device_capability()[0] < 8:
+            self.skipTest("requires native BF16")
+        self._real_call_private_transport("cuda")
+
+    def _real_call_private_transport(self, device):
         from safetensors import safe_open
 
         with TemporaryDirectory() as a, TemporaryDirectory() as b, TemporaryDirectory() as tmp:
@@ -141,7 +153,7 @@ class CausalTest(unittest.TestCase):
                     local_is_real=valid,
                     global_positions=torch.tensor([639, 1]),
                 )
-                h = torch.full((2, 4, 5120), seed, dtype=torch.bfloat16)
+                h = torch.full((2, 4, 5120), seed, dtype=torch.bfloat16, device=device)
                 prev = NS(pre_mix_out=torch.full((2, 4), seed, dtype=torch.float32))
                 hc = HC()
                 hc._previous_ref = lambda: prev
@@ -157,6 +169,8 @@ class CausalTest(unittest.TestCase):
                     engram_hashes=torch.zeros((2, 24), dtype=torch.long),
                 )
                 net.engram.wkv = Identity()
+                net.engram.q_weight = torch.ones_like(h[0])
+                net.engram.k_weight = torch.ones_like(h[0])
                 net.engram.embed_tokens = NS(
                     weight=torch.zeros((1, 256), dtype=torch.uint8),
                     scales=torch.zeros((1, 8), dtype=torch.uint8),
@@ -165,7 +179,7 @@ class CausalTest(unittest.TestCase):
                 for field in ("wq_a", "wkv", "wq_b", "wo_b"):
                     setattr(net.attn, field, Identity())
                 net.ffn.gate = NS(
-                    _weight_bf16=lambda: h[0], prepare_gate_payload=lambda: None
+                    _weight_bf16=lambda: h[0], prepare_gate_payload=lambda: NS(scores=h[:, 0])
                 )
                 net.ffn.fused_moe = NS(
                     fused_experts=NS(forward_gate_pack=lambda: None),
@@ -180,6 +194,15 @@ class CausalTest(unittest.TestCase):
                 used = {}
 
                 def block(x, input_ids):
+                    if device == "cuda":
+                        from rtp_llm.models_py.modules.dsv41 import engram
+
+                        kv = torch.cat([x.flatten(1), x[:, 0]], dim=-1)
+                        engram.gated_engram_residual(
+                            x, kv, net.engram.q_weight, net.engram.k_weight,
+                            1e-20, valid.to(device),
+                        )
+                    net.ffn.gate.prepare_gate_payload()
                     common = NS(
                         batch_size=1,
                         cp_on=True,
@@ -207,6 +230,11 @@ class CausalTest(unittest.TestCase):
                     ),
                 ):
                     trace.observe(state, block, net, cp, h, ids)
+                path = root / f"v41_causal_{mode}_r{rank}.json"
+                document = json.loads(path.read_bytes())
+                self.assertIn("gate.scores", dict(document["events"]))
+                if device == "cuda":
+                    self.assertTrue(document["engram_gate"]["complete"])
                 self.assertEqual(prev.pre_mix_out[0, 0].item(), seed)
                 return used
 
