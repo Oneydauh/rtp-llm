@@ -78,6 +78,7 @@ class DeepSeekV4DSparkForCausalLM(OwnedV4ModelMixin, DeepSeekV4DSparkModel, RtpM
             self._dspark_markov_rank,
             norm_eps=args.norm_eps,
             prefill_commit_only=self._commit_only_prefill,
+            device=load_config.device,
         )
         self.WEIGHTS_MAPPER = _DraftMapper(self)
 

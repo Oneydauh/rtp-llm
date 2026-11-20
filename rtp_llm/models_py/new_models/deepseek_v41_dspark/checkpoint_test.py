@@ -167,6 +167,8 @@ class DraftCheckpointTest(unittest.TestCase):
                     )
                 )
                 draft = _CheckpointOwner(rank, True)
+                self.assertTrue(draft.v4.embed.weight.is_meta)
+                self.assertTrue(draft.v4.head.weight.is_meta)
                 bind_borrowed_parameters(
                     draft,
                     {
@@ -178,6 +180,7 @@ class DraftCheckpointTest(unittest.TestCase):
                 before = target.head.weight.clone()
                 NewModelLoader._prepare_model_for_fastsafetensors(draft, "cpu")
                 load_into(draft, path, rank, native_fst=True)
+                self.assertIs(draft.v4.embed.weight, target.embed.weight)
                 self.assertIs(draft.v4.head.weight, target.head.weight)
                 torch.testing.assert_close(target.head.weight, before)
                 self.assertEqual(

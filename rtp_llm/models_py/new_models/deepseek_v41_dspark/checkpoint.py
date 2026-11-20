@@ -13,24 +13,25 @@ class V41DraftGlobalsMixin:
     def create_global_modules(self, args, head_dtype):
         super().create_global_modules(args, head_dtype)
         if self.commit_only:
-            # CPU placeholders are replaced by exact target Parameters before
-            # checkpoint dispatch or FST device preallocation.
-            self.embed = OwnedV41Matrix(
-                args.vocab_size,
-                args.dim,
-                shard_dim=1,
-                tp_size=args.embedding_tp_size,
-                tp_rank=args.embedding_tp_rank,
-                dtype=torch.bfloat16,
-            )
-            self.head = OwnedV41Matrix(
-                args.vocab_size,
-                args.dim,
-                shard_dim=0,
-                tp_size=args.lm_head_tp_size,
-                tp_rank=args.lm_head_tp_rank,
-                dtype=head_dtype,
-            )
+            # Both globals are mandatory target loans on PREFILL. Keep shard
+            # shape and dtype for binding validation, but allocate no storage.
+            with torch.device("meta"):
+                self.embed = OwnedV41Matrix(
+                    args.vocab_size,
+                    args.dim,
+                    shard_dim=1,
+                    tp_size=args.embedding_tp_size,
+                    tp_rank=args.embedding_tp_rank,
+                    dtype=torch.bfloat16,
+                )
+                self.head = OwnedV41Matrix(
+                    args.vocab_size,
+                    args.dim,
+                    shard_dim=0,
+                    tp_size=args.lm_head_tp_size,
+                    tp_rank=args.lm_head_tp_rank,
+                    dtype=head_dtype,
+                )
 
     def checkpoint_weight_name_filter(self):
         base = super().checkpoint_weight_name_filter()
@@ -74,7 +75,7 @@ class V41DraftParameterMixin:
     }
 
     def _install_draft_auxiliary(
-        self, hidden_size, target_ids, vocab_size, rank, head_stage
+        self, hidden_size, target_ids, vocab_size, rank, head_stage, *, device="cpu"
     ):
         self.auxiliary = V41DSparkAuxiliaryWeights(
             hidden_size,
@@ -84,6 +85,7 @@ class V41DraftParameterMixin:
             norm_eps=self._v4_args.norm_eps,
             prefill_commit_only=self._commit_only_prefill,
             head_stage=head_stage,
+            device=device,
         )
         self.WEIGHTS_MAPPER = _DraftMapper(self)
 
