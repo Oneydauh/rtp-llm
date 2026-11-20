@@ -16,12 +16,18 @@
 #include "rtp_llm/cpp/models/SampleInfos.h"
 
 namespace rtp_llm::v41_cache_round {
+inline bool fixedTarget() {
+    const char* t       = std::getenv("TEST_TARGET");
+    const char* enabled = std::getenv("RTP_V41_FIXED_TARGET");
+    return t && enabled && std::strcmp(enabled, "1") == 0
+           && std::strcmp(t, "//rtp_llm/test/smoke:deepseek_v41_fixed_target_sm100_arm") == 0;
+}
 inline bool enabled() {
     static const bool on = [] {
         const char* mode = std::getenv("RTP_V41_CACHE_TRACE");
         const char* test = std::getenv("TEST_TARGET");
         return mode && std::strcmp(mode, "1") == 0 && test
-               && std::strcmp(test, "//rtp_llm/test/smoke:deepseek_v41_cache_rounds_sm100_arm") == 0;
+               && (fixedTarget() || std::strcmp(test, "//rtp_llm/test/smoke:deepseek_v41_cache_rounds_sm100_arm") == 0);
     }();
     return on;
 }
@@ -77,6 +83,26 @@ inline bool matchesDecodePrompt(const torch::Tensor& prompt) {
     auto snapshot = prompt.cpu().contiguous();
     return hashIds(snapshot.data_ptr<int32_t>(), 783)
            == "ba6a5e4d28d7dc1a743354919c00be1d8fae404ef6e45500363093d6824829d6";
+}
+// Only the marked hit, on the sampling root, before verify/Engram rows are built.
+// Later rounds and all regular smoke requests retain the native draft proposals.
+inline bool replaceFirstVerifyRow(torch::Tensor& proposals, const torch::Tensor& ends, const torch::Tensor& anchors) {
+    if (!ends.defined() || ends.numel() != 1 || ends.item<int64_t>() != 783)
+        return false;
+    TORCH_CHECK(anchors.defined() && anchors.numel() == 1 && anchors.item<int64_t>() == 1606,
+                "unexpected anchor for the V4.1 fixed verify fixture");
+    TORCH_CHECK(proposals.defined() && proposals.dim() == 2 && proposals.size(0) == 1 && proposals.size(1) == 3,
+                "unexpected candidate geometry");
+    proposals = torch::tensor({11556, 2521, 304}, proposals.options()).reshape({1, 3});
+    return true;
+}
+inline bool fixFirstCandidates(torch::Tensor&       proposals,
+                               const torch::Tensor& ends,
+                               const torch::Tensor& anchors,
+                               const torch::Tensor& prompt) {
+    const auto s = stage();
+    return fixedTarget() && s && s->phase == "hit" && matchesDecodePrompt(prompt)
+           && replaceFirstVerifyRow(proposals, ends, anchors);
 }
 // Prepare on the D-side TP sampling root before the actual sampler, finish
 // with its outputs after rejection and processor caps. Never access live
@@ -143,6 +169,12 @@ inline void finish(const Round&         ctx,
         row << std::setprecision(17) << ",\"first_verify_logits\":{\"draft_id\":" << d
             << ",\"draft_id_target_logit\":" << sd << ",\"sampled_target_id\":" << t
             << ",\"sampled_id_target_logit\":" << st << "}";
+        if (fixedTarget() && ctx.phase == "hit") {
+            TORCH_CHECK(tokenArray(draft[0]) == "[11556,2521,304]", "fixed candidate proof missing");
+            const double a = ctx.first_scores[305].item<double>(), b = ctx.first_scores[16].item<double>();
+            TORCH_CHECK(std::isfinite(a) && std::isfinite(b), "nonfinite fixed candidate logits");
+            row << ",\"fixed_scores\":{\"305\":" << a << ",\"16\":" << b << "}";
+        }
     }
     row << ",\"draft\":" << tokenArray(draft[0]) << ",\"target\":" << tokenArray(target.select(1, target.size(1) - 1))
         << ",\"accept_len\":" << n << ",\"result\":" << tokenArray(accepted_ids[0].narrow(0, 0, n)) << "}\n";

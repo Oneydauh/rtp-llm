@@ -3,6 +3,11 @@
 package(default_visibility = ["//rtp_llm/test/smoke:__pkg__"])
 
 filegroup(
+    name = "v41draft",
+    srcs = glob(["v41draft_p0.safetensors", "v41draft_p1.safetensors", "v41draft_d0.safetensors"], allow_empty = True),
+)
+
+filegroup(
     name = "v4",
     srcs = glob(["v4_r0.safetensors", "v4_r1.safetensors"], allow_empty = True),
 )

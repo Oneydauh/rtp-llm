@@ -171,22 +171,34 @@ std::vector<V4AuditRow> collectV4SmokeRows(
             if (index == 17)
                 for (int n = prompt; n <= length; ++n)
                     chain += (n == prompt ? "" : ",") + hashed(n);
-            found.push_back(
-                {index, batch, col, width, row, a, b, raw, verify ? scores(in.logits) : raw, hashed(length), nrows, verify, std::move(chain), history.data_ptr<int32_t>()[length-1]});
+            found.push_back({index,
+                             batch,
+                             col,
+                             width,
+                             row,
+                             a,
+                             b,
+                             raw,
+                             verify ? scores(in.logits) : raw,
+                             hashed(length),
+                             nrows,
+                             verify,
+                             std::move(chain),
+                             history.data_ptr<int32_t>()[length - 1]});
         }
     }
     return found;
 }
 
-void emitV4SmokeRows(const std::vector<V4AuditRow>& rows,
-                     const torch::Tensor&           sampled,
-                     const torch::Tensor&           accept_len    = {},
-                     const torch::Tensor&           accept_tokens = {},
-                     const torch::Tensor&           draft_tokens = {},
-                     const torch::Tensor&           dspark_aux = {},
-                     const torch::Tensor&           lm_hidden = {},
-                     int                            graph_path = -1,
-                     const std::function<torch::Tensor(int64_t,int,int)>& live_row = {}) {
+void emitV4SmokeRows(const std::vector<V4AuditRow>&                         rows,
+                     const torch::Tensor&                                   sampled,
+                     const torch::Tensor&                                   accept_len    = {},
+                     const torch::Tensor&                                   accept_tokens = {},
+                     const torch::Tensor&                                   draft_tokens  = {},
+                     const torch::Tensor&                                   dspark_aux    = {},
+                     const torch::Tensor&                                   lm_hidden     = {},
+                     int                                                    graph_path    = -1,
+                     const std::function<torch::Tensor(int64_t, int, int)>& live_row      = {}) {
     const auto integers = [](const torch::Tensor& t) {
         return t.defined() && (t.scalar_type() == at::kInt || t.scalar_type() == at::kLong);
     };
@@ -220,48 +232,51 @@ void emitV4SmokeRows(const std::vector<V4AuditRow>& rows,
                 << " accept_len=" << accepted;
         out << " sampled_target=" << target << " emitted=" << emitted;
         if (verify && w.slot == 17) {
-            const bool bonus = w.col == w.width-1;
-            if (!integers(draft_tokens) || draft_tokens.dim()!=2 ||
-                draft_tokens.size(0)!=accept_len.numel() || draft_tokens.size(1)!=w.width-1) continue;
+            const bool bonus = w.col == w.width - 1;
+            if (!integers(draft_tokens) || draft_tokens.dim() != 2 || draft_tokens.size(0) != accept_len.numel()
+                || draft_tokens.size(1) != w.width - 1)
+                continue;
             out << " draft_kind=" << (bonus ? "bonus" : "proposal")
                 << " draft_id=" << (bonus ? -1 : draft_tokens[w.batch][w.col].item<int>())
                 << " committed_sha_chain=" << w.committed_chain;
             auto valid_rows = [&](const torch::Tensor& t, int64_t cols) {
-                return t.defined() && t.dim()==2 && t.size(0)==w.num_rows && t.size(1)==cols &&
-                    (t.scalar_type()==at::kBFloat16 || t.scalar_type()==at::kFloat);
+                return t.defined() && t.dim() == 2 && t.size(0) == w.num_rows && t.size(1) == cols
+                       && (t.scalar_type() == at::kBFloat16 || t.scalar_type() == at::kFloat);
             };
             auto hash_hidden = [](const torch::Tensor& t) {
-                auto c = t.detach().contiguous().cpu();
+                auto          c = t.detach().contiguous().cpu();
                 unsigned char digest[SHA256_DIGEST_LENGTH];
-                SHA256(reinterpret_cast<const unsigned char*>(c.data_ptr()),c.numel()*c.element_size(),digest);
+                SHA256(reinterpret_cast<const unsigned char*>(c.data_ptr()), c.numel() * c.element_size(), digest);
                 std::ostringstream h;
-                for(unsigned char v:digest) h << std::hex << std::setfill('0') << std::setw(2) << static_cast<unsigned>(v);
+                for (unsigned char v : digest)
+                    h << std::hex << std::setfill('0') << std::setw(2) << static_cast<unsigned>(v);
                 return h.str();
             };
             out << " verify_exec=" << (graph_path == 1 ? "graph_runner" : graph_path == 0 ? "eager" : "unobserved");
             // Existing DSpARK target graph output: three mean-over-HC segments in
             // checkpoint dspark_target_layer_ids order (40,41,42), never draft hidden.
-            if(valid_rows(dspark_aux,3*4096)) {
-                out << " aux_dtype=" << (dspark_aux.scalar_type()==at::kBFloat16 ? "bf16" : "fp32");
-                for(int i=0;i<3;++i)
-                    out << " live_aux" << (40+i) << "_sha=" << hash_hidden(dspark_aux[w.row].narrow(0,i*4096,4096));
+            if (valid_rows(dspark_aux, 3 * 4096)) {
+                out << " aux_dtype=" << (dspark_aux.scalar_type() == at::kBFloat16 ? "bf16" : "fp32");
+                for (int i = 0; i < 3; ++i)
+                    out << " live_aux" << (40 + i)
+                        << "_sha=" << hash_hidden(dspark_aux[w.row].narrow(0, i * 4096, 4096));
                 if (live_row) {
                     // Only this accepted row leaves the device. Corroborate its
                     // raw residual bytes with the independent native DSpARK export.
                     auto layers = live_row(w.row, w.width, w.history_last_id);
-                    if (layers.defined() && layers.scalar_type()==at::kBFloat16 && layers.dim()==3 &&
-                        layers.size(0)==44 && layers.size(1)==4 && layers.size(2)==4096 &&
-                        layers.device()==dspark_aux.device() &&
-                        torch::equal(layers.narrow(0,41,3).mean(1).reshape({3*4096}), dspark_aux[w.row])) {
+                    if (layers.defined() && layers.scalar_type() == at::kBFloat16 && layers.dim() == 3
+                        && layers.size(0) == 44 && layers.size(1) == 4 && layers.size(2) == 4096
+                        && layers.device() == dspark_aux.device()
+                        && torch::equal(layers.narrow(0, 41, 3).mean(1).reshape({3 * 4096}), dspark_aux[w.row])) {
                         const auto single = layers.detach().contiguous().cpu();
                         out << " live_raw_hc_sha=";
-                        for (int i=0;i<44;++i)
+                        for (int i = 0; i < 44; ++i)
                             out << (i ? "," : "") << hash_hidden(single[i]);
                     }
                 }
             }
-            if(valid_rows(lm_hidden,4096))
-                out << " head_dtype=" << (lm_hidden.scalar_type()==at::kBFloat16 ? "bf16" : "fp32")
+            if (valid_rows(lm_hidden, 4096))
+                out << " head_dtype=" << (lm_hidden.scalar_type() == at::kBFloat16 ? "bf16" : "fp32")
                     << " live_lm_input_sha=" << hash_hidden(lm_hidden[w.row]);
         }
         RTP_LLM_LOG_INFO("%s", out.str().c_str());
@@ -1229,9 +1244,9 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         RTP_LLM_PROFILE_SCOPE("executor.mtp.prefill_step(tp_sync_input)");
         int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
         model_input.skip_run  = streams.empty();
-        if (v41_cache_round::enabled() && is_dspark_ && role_type_ == RoleType::PREFILL && isTpRank0()
-            && !warm_up_ && streams.size() == 1 && !streams.front()->isFakeStream()) {
-            const auto input = streams.front()->generateInput();
+        if (v41_cache_round::enabled() && is_dspark_ && role_type_ == RoleType::PREFILL && isTpRank0() && !warm_up_
+            && streams.size() == 1 && !streams.front()->isFakeStream()) {
+            const auto input              = streams.front()->generateInput();
             model_input.v41_cache_fixture = input && v41_cache_round::matchesDecodePrompt(input->input_ids);
         }
         tpSyncModelInputs(model_input, parallelism_config_);
@@ -1323,9 +1338,9 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
                     sampler_input,
                     batch_stream_processor_->gatherSamplerInput(stream_groups, model_input, model_output));
                 holdSamplerInputHostBuffers(buffer_holder_, sampler_input);
-                const auto witness = collectV4SmokeRows(stream_groups,sampler_input,sampler_input.logits,1,false);
+                const auto witness = collectV4SmokeRows(stream_groups, sampler_input, sampler_input.logits, 1, false);
                 sampler_output     = std::move(sampler_->forward(sampler_input));
-                emitV4SmokeRows(witness,sampler_output.token_ids);
+                emitV4SmokeRows(witness, sampler_output.token_ids);
                 update_draft_input = !is_dspark_;
             }
         }
@@ -1635,8 +1650,8 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         return target_execution_status;
     }
 
-    mtp::DSparkRoundState                     dspark_round_state;
-    size_t                                    batch_size = 0;
+    mtp::DSparkRoundState dspark_round_state;
+    size_t                batch_size = 0;
 
     if (is_dspark_) {
         // Proposal and target verification are two model phases with different
@@ -1652,9 +1667,9 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                     batch_stream_processor_->buildDSparkRoundState(stream_groups, model_input, buffer_holder_);
                 batch_stream_processor_->prepareDSparkProposeModelInput(
                     dspark_round_state, proposal_input, buffer_holder_);
-                if (v41_cache_round::enabled() && role_type_ == RoleType::DECODE && !warm_up_
-                    && streams.size() == 1 && !streams.front()->isFakeStream()) {
-                    const auto input = streams.front()->generateInput();
+                if (v41_cache_round::enabled() && role_type_ == RoleType::DECODE && !warm_up_ && streams.size() == 1
+                    && !streams.front()->isFakeStream()) {
+                    const auto input                 = streams.front()->generateInput();
                     proposal_input.v41_cache_fixture = input && v41_cache_round::matchesDecodePrompt(input->input_ids);
                 }
                 ensureModelInputsOnCuda(proposal_input, "decode.prepare_dspark_proposal");
@@ -1678,8 +1693,21 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         {
             RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(prepare_dspark_target_and_tp_sync)");
             if (isTpRank0()) {
+                bool fixed_candidates = false;
+                if (v41_cache_round::fixedTarget() && role_type_ == RoleType::DECODE && !warm_up_ && streams.size() == 1
+                    && !streams.front()->isFakeStream()) {
+                    const auto input = streams.front()->generateInput();
+                    fixed_candidates = input
+                                       && v41_cache_round::fixFirstCandidates(draft_sampler_output.token_ids,
+                                                                              dspark_round_state.committed_ends,
+                                                                              dspark_round_state.anchors,
+                                                                              input->input_ids);
+                }
                 batch_stream_processor_->prepareDSparkTargetVerifyModelInput(
                     dspark_round_state, model_input, draft_sampler_output.token_ids, buffer_holder_);
+                if (fixed_candidates)
+                    TORCH_CHECK(v41_cache_round::tokenArray(model_input.combo_tokens) == "[1606,11556,2521,304]",
+                                "actual target-verify input did not consume the fixed candidates");
                 draft_token_ids_t = model_input.combo_tokens.reshape(
                     {static_cast<int64_t>(batch_size), static_cast<int64_t>(propose_step_ + 1)});
                 ensureModelInputsOnCuda(model_input, "decode.prepare_dspark_target_verify");
@@ -1944,10 +1972,11 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                 }
                 auto& sampler_input = sampler_input_status.value();
                 holdSamplerInputHostBuffers(buffer_holder_, sampler_input);
-                const auto witness = collectV4SmokeRows(stream_groups,sampler_input,model_output.logits,
-                                                        propose_step_+1,true);
-                const auto v41_round = (is_dspark_ && role_type_ == RoleType::DECODE && v41_cache_round::enabled())
-                                           ? v41_cache_round::prepare(sampler_input) : std::nullopt;
+                const auto witness =
+                    collectV4SmokeRows(stream_groups, sampler_input, model_output.logits, propose_step_ + 1, true);
+                const auto v41_round = (is_dspark_ && role_type_ == RoleType::DECODE && v41_cache_round::enabled()) ?
+                                                    v41_cache_round::prepare(sampler_input) :
+                                                    std::nullopt;
                 sampler_output           = std::move(sampler_->forward(sampler_input));
                 sampler_output.all_probs = sampler_output.all_probs.reshape(
                     {(int64_t)batch_size, (int64_t)(propose_step_ + 1), (int64_t)vocab_size_});
@@ -1960,17 +1989,24 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                                           sampler_output,
                                           *spec_logits_result,
                                           speculative_sampler_output);
-                emitV4SmokeRows(witness,sampler_output.token_ids,speculative_sampler_output.accept_len,
-                                speculative_sampler_output.accept_tokens, draft_sampler_output.token_ids,
-                                model_output.all_hidden_states, model_output.hidden_states, model_output.target_verify_graph_path,
+                emitV4SmokeRows(witness,
+                                sampler_output.token_ids,
+                                speculative_sampler_output.accept_len,
+                                speculative_sampler_output.accept_tokens,
+                                draft_sampler_output.token_ids,
+                                model_output.all_hidden_states,
+                                model_output.hidden_states,
+                                model_output.target_verify_graph_path,
                                 [&](int64_t row, int width, int last_id) {
                                     const auto py = dynamic_cast<PyWrappedModel*>(model_.get());
-                                    return py ? py->getV4SmokeVerifyRow(row,width,last_id) : torch::Tensor{};
+                                    return py ? py->getV4SmokeVerifyRow(row, width, last_id) : torch::Tensor{};
                                 });
                 if (v41_round) {
-                    v41_cache_round::finish(
-                        *v41_round, draft_sampler_output.token_ids, sampler_output.token_ids,
-                        speculative_sampler_output.accept_len, speculative_sampler_output.accept_tokens);
+                    v41_cache_round::finish(*v41_round,
+                                            draft_sampler_output.token_ids,
+                                            sampler_output.token_ids,
+                                            speculative_sampler_output.accept_len,
+                                            speculative_sampler_output.accept_tokens);
                 }
             }
         }
@@ -2374,7 +2410,6 @@ GptModelOutputs MtpExecutor::runTargetVerifyForward(GptModelInputs& model_input,
     model_input.is_target_verify = false;
     return model_output;
 }
-
 
 bool MtpExecutor::asyncPrepareAllowed(bool requested, bool target_commit_hooks) {
     return requested && !target_commit_hooks;
