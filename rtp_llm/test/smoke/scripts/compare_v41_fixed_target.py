@@ -50,9 +50,23 @@ def compare(a, b):
 
 
 if __name__ == "__main__":
-    print(
-        json.dumps(
-            compare(*(json.loads(Path(p).read_bytes()) for p in sys.argv[1:])),
-            allow_nan=False,
+    try:
+        result = compare(*(json.loads(Path(p).read_bytes()) for p in sys.argv[1:]))
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        reasons = {
+            "invalid target control",
+            "not the same invocation and history",
+            "OldFST reference failed to reproduce historical first verify",
+        }
+        print(
+            json.dumps(
+                dict(
+                    valid=False,
+                    reason=(
+                        str(exc) if str(exc) in reasons else "incomplete target control"
+                    ),
+                )
+            )
         )
-    )
+        sys.exit(2)
+    print(json.dumps(result, allow_nan=False))
