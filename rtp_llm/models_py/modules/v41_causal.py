@@ -60,6 +60,130 @@ def _digest(x):
     }
 
 
+def _gate_witness(fn, a, kw, valid, record):
+    """At the actual gate call: observe its launch and shadow the same pre-write values."""
+    import triton
+
+    from rtp_llm.models_py.modules.dsv41 import _engram_inject_triton as native
+    from rtp_llm.models_py.modules.dsv41.engram import _engram_inject_supported
+
+    h, kv, q, k, eps, mask = a
+    if h.shape[0] < 2 or valid.dtype != torch.bool or valid.shape != h.shape[:1]:
+        record["engram_gate"] = {"incomplete": "unexpected fixture row selection"}
+        return fn(*a, **kw)
+
+    def digest(x):
+        return _digest(x[valid])["sha256"]
+
+    def outcome(value):
+        live = (
+            value[valid]
+            .detach()
+            .contiguous()
+            .view(torch.uint8)
+            .flatten(1)
+            .cpu()
+            .numpy()
+        )
+        info["outcomes"][stage] = hashlib.sha256(live).hexdigest()
+        info["outcome_rows"][stage] = [hashlib.sha256(row).hexdigest() for row in live]
+
+    def abi(x):
+        return dict(
+            dtype=str(x.dtype),
+            shape=list(x.shape),
+            stride=list(x.stride()),
+            offset=x.storage_offset(),
+            alignment=x.data_ptr() % 256,
+        )
+
+    info = dict(
+        eps=float(eps).hex(),
+        torch=str(torch.__version__),
+        triton=str(triton.__version__),
+        capability=list(torch.cuda.get_device_capability(h.device)),
+        inference=torch.is_inference_mode_enabled(),
+        grad=torch.is_grad_enabled(),
+        tf32=torch.backends.cuda.matmul.allow_tf32,
+        abi={},
+        operands={},
+        launches={},
+        outcomes={},
+        outcome_rows={},
+        out_is_hidden=kw.get("out") is h,
+    )
+    out_arg = kw.get("out")
+    info["out_abi"] = None if out_arg is None else abi(out_arg)
+    info["entry_strided_operands"] = []
+    info["pre_fix_path"] = (
+        "triton"
+        if (
+            _engram_inject_supported(h, q, k, mask)
+            and kv.dtype == torch.bfloat16
+            and kv.device == h.device
+            and kv.shape == h.shape[:-2] + (5 * 5120,)
+            and kv.is_contiguous()
+        )
+        else "torch"
+    )
+    for key, value in zip(("h", "kv", "q", "k", "mask"), (h, kv, q, k, mask)):
+        if value is None:
+            info["abi"][key] = None
+            info["operands"][key] = None
+            continue
+        if not value.is_contiguous():
+            info["entry_strided_operands"].append(key)
+        info["abi"][key] = abi(value)
+        info["operands"][key] = (
+            digest(value) if key in ("h", "kv", "mask") else _digest(value)["sha256"]
+        )
+    real_kernel = native.engram_inject_kernel
+    stage = "actual"
+
+    class Witness:
+        def __getitem__(self, grid):
+            launch = real_kernel[grid]
+
+            def run(*values, **params):
+                compiled = launch(*values, **params)
+                cubin = getattr(compiled, "asm", {}).get("cubin")
+                info["launches"][stage] = dict(
+                    grid=list(grid),
+                    params=params,
+                    binary_sha256=(
+                        hashlib.sha256(cubin).hexdigest()
+                        if isinstance(cubin, bytes)
+                        else None
+                    ),
+                    aliases_hidden=values[0].data_ptr() == values[-1].data_ptr(),
+                    operands=[abi(v) for v in values],
+                )
+                return compiled
+
+            return run
+
+    # The production call can overwrite h. Snapshot first; do not hand the
+    # snapshot to production, as that could change dispatch and aliasing.
+    saved = h.clone(memory_format=torch.contiguous_format)
+    with patch.object(native, "engram_inject_kernel", Witness()):
+        out = fn(*a, **kw)
+        outcome(out)
+        stage = "dense_native"
+        operands = (saved, kv.contiguous(), q.contiguous(), k.contiguous(), eps)
+        outcome(fn(*operands, None if mask is None else mask.contiguous()))
+        stage = "torch_ref"
+        live_mask = torch.ones_like(valid) if mask is None else mask
+        strided_mask = torch.stack((live_mask, live_mask), -1)[:, 0]
+        assert not strided_mask.is_contiguous()
+        outcome(fn(*operands, strided_mask))
+    info["actual_path"] = "triton" if "actual" in info["launches"] else "torch"
+    info["complete"] = (
+        "dense_native" in info["launches"] and "torch_ref" not in info["launches"]
+    )
+    record["engram_gate"] = info
+    return out
+
+
 def _schema(data, meta, nonce, rank):
     if meta != dict(
         nonce=nonce, role="oldfst", family="v41", rank=str(rank), stage="layer1.hit512"
@@ -295,6 +419,20 @@ def observe(trace, call, layer, cp, h, *args, **kwargs):
                 return intercept(fn, a, k)
 
             stack.enter_context(patch.object(obj, attr, wrapped))
+
+        if h.is_cuda and hasattr(layer.engram, "q_weight"):
+            from rtp_llm.models_py.modules.dsv41 import engram as gate_module
+
+            def gate(fn, a, k):
+                if (
+                    len(a) == 6
+                    and a[2] is layer.engram.q_weight
+                    and a[3] is layer.engram.k_weight
+                ):
+                    return _gate_witness(fn, a, k, valid, record)
+                return fn(*a, **k)
+
+            wrap(gate_module, "gated_engram_residual", gate)
 
         shared = layer.ffn.shared_experts
         if not layer.ffn.fused_moe.includes_shared_expert and shared is not None:

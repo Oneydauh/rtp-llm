@@ -17,7 +17,46 @@ from rtp_llm.models_py.modules.dsv41.engram import (
     _PinnedSharedTable,
     gated_engram_residual,
 )
-from rtp_llm.models_py.modules.dsv41.utils import V41MXFP8Linear
+
+
+class EngramViewTest(unittest.TestCase):
+    @torch.inference_mode()
+    def test_cpu_reference_accepts_views(self):
+        h = torch.arange(24).reshape(3, 2, 4).float()[..., ::2]
+        kv = torch.ones(3, 6)
+        w = torch.ones(2, 2)
+        self.assertTrue(
+            torch.equal(
+                gated_engram_residual(h, kv, w, w, 1e-20, normalize_views=True),
+                gated_engram_residual(h.contiguous(), kv, w, w, 1e-20),
+            )
+        )
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.version.hip is None, "requires NVIDIA CUDA"
+    )
+    @torch.inference_mode()
+    def test_native_gate_matches_tight_for_each_strided_operand(self):
+        if torch.cuda.get_device_capability()[0] < 8:
+            self.skipTest("requires native BF16")
+        rng = torch.Generator(device="cuda").manual_seed(427)
+        base = [
+            torch.randn(shape, generator=rng, device="cuda", dtype=torch.bfloat16)
+            for shape in ((19, 4, 5120), (19, 25600), (4, 5120), (4, 5120))
+        ]
+        base.append(torch.arange(19, device="cuda") % 4 != 0)
+
+        def run(seq, **kwargs):
+            return gated_engram_residual(*seq[:4], 1e-20, seq[4], **kwargs)
+
+        expected = run(base)
+        for i in range(5):
+            with self.subTest(operand=i):
+                seq = base.copy()
+                seq[i] = torch.stack((seq[i], seq[i]), dim=-1)[..., 0]
+                orig = seq[0].clone()
+                self.assertTrue(torch.equal(expected, run(seq, normalize_views=True)))
+                self.assertTrue(torch.equal(orig, seq[0]))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires a CUDA GPU")
@@ -31,6 +70,7 @@ class EngramProjectionWarmupTest(unittest.TestCase):
         from rtp_llm.models_py.modules.dsv41.dsv41_kernel_jit_warmup import (
             collect_v41_dense_shapes,
         )
+        from rtp_llm.models_py.modules.dsv41.utils import V41MXFP8Linear
         from rtp_llm.models_py.new_models.deepseek_v41.engram import (
             OwnedEngramProjection,
         )
@@ -323,6 +363,8 @@ class EngramCudaTest(unittest.TestCase):
         )
 
     def test_complete_engram_capture_changes_input_and_preserves_mask(self):
+        from rtp_llm.models_py.modules.dsv41.utils import V41MXFP8Linear
+
         projection = V41MXFP8Linear(
             (torch.randn(640, 384, device="cuda") * 0.02).to(torch.float8_e4m3fn),
             torch.ones(20, 12, device="cuda").to(torch.float8_e8m0fnu),

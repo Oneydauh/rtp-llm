@@ -126,6 +126,44 @@ def read(root, role, mode, rank):
     return d
 
 
+def compare_gate(old, new):
+    records = [r.get("engram_gate", {}) for r in (old, new)]
+    if not all(r.get("complete") for r in records):
+        return {"status": "incomplete"}
+    a, b = records
+    same = {
+        name: a["outcomes"][name] == b["outcomes"][name]
+        for name in ("actual", "dense_native", "torch_ref")
+    }
+    pos = old.get("positions")
+    first = {}
+    if pos is not None and pos == new.get("positions"):
+        for name in same:
+            x, y = (r["outcome_rows"][name] for r in records)
+            if len(x) != len(y) or len(x) != len(pos):
+                return {"status": "incomplete", "reason": "gate row count mismatch"}
+            first[name] = min((p for p, i, j in zip(pos, x, y) if i != j), default=None)
+    return dict(
+        status="compared",
+        operands_equal=a["operands"] == b["operands"],
+        eps_equal=a["eps"] == b["eps"],
+        outcomes_equal=same,
+        first_logical_difference=first,
+        entry_strided_operands=[r["entry_strided_operands"] for r in records],
+        pre_fix_paths=[r["pre_fix_path"] for r in records],
+        actual_path=[r["actual_path"] for r in records],
+        actual_matches_native=[
+            r["outcomes"]["actual"] == r["outcomes"]["dense_native"] for r in records
+        ],
+        actual_matches_reference=[
+            r["outcomes"]["actual"] == r["outcomes"]["torch_ref"] for r in records
+        ],
+        cubin_sha256=[
+            r["launches"].get("actual", {}).get("binary_sha256") for r in records
+        ],
+    )
+
+
 def compare(old, new):
     reports = [{"rank": r} for r in range(2)]
     nonces = set()
@@ -230,6 +268,7 @@ def compare(old, new):
             if first is None and len(left) != len(right):
                 raise ValueError("unmatched trailing V4.1 stages")
             reports[rank][mode] = {
+                "engram_gate": compare_gate(a, b),
                 "first_observed_difference": first,
                 "differing_native_weights": weights,
                 "causal_interpretation": (

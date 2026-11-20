@@ -162,6 +162,8 @@ class OwnedEngramProjection(RtpModule):
 
 
 class OwnedEngram(Engram, RtpModule):
+    _normalize_gate_views = True
+
     def __init__(self, config, layer_id, *, checkpoint_path=None):
         RtpModule.__init__(self)
         self.layout = EngramLayout(config)

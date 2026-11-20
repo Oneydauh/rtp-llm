@@ -702,7 +702,7 @@ def mxfp8_activation_reference(x: torch.Tensor) -> torch.Tensor:
     return values.reshape(x.shape).to(x.dtype)
 
 
-def _engram_inject_supported(hidden, q_weight, k_weight, token_mask):
+def _engram_inject_supported(hidden, q_weight, k_weight, token_mask, *, dense=True):
     return (
         not torch.is_grad_enabled()
         and hidden.is_cuda
@@ -713,7 +713,8 @@ def _engram_inject_supported(hidden, q_weight, k_weight, token_mask):
         and all(
             value.dtype == torch.bfloat16
             and value.device == hidden.device
-            and value.is_contiguous()
+            and value.layout == torch.strided
+            and (not dense or value.is_contiguous())
             for value in (hidden, q_weight, k_weight)
         )
         and (
@@ -722,7 +723,8 @@ def _engram_inject_supported(hidden, q_weight, k_weight, token_mask):
                 token_mask.device == hidden.device
                 and token_mask.dtype == torch.bool
                 and token_mask.shape == hidden.shape[:-2]
-                and token_mask.is_contiguous()
+                and token_mask.layout == torch.strided
+                and (not dense or token_mask.is_contiguous())
             )
         )
     )
@@ -737,6 +739,7 @@ def gated_engram_residual(
     token_mask: Optional[torch.Tensor] = None,
     *,
     out: Optional[torch.Tensor] = None,
+    normalize_views: bool = False,
 ) -> torch.Tensor:
     """Exact normalized signed-square-root gate used by the reference.
 
@@ -744,12 +747,43 @@ def gated_engram_residual(
     owns disjoint rows; the reference materializes its result before copying.
     The caller supplies a contiguous output disjoint from the other inputs.
     """
-    if (
-        _engram_inject_supported(hidden, q_weight, k_weight, token_mask)
-        and kv.shape == hidden.shape[:-2] + (5 * 5120,)
+    kv_supported = (
+        kv.shape == hidden.shape[:-2] + (5 * 5120,)
         and kv.dtype == torch.bfloat16
         and kv.device == hidden.device
+        and kv.layout == torch.strided
+    )
+    if (
+        normalize_views
+        and kv_supported
+        and any(
+            v is not None and not v.is_contiguous()
+            for v in (hidden, kv, q_weight, k_weight, token_mask)
+        )
+        and _engram_inject_supported(
+            hidden, q_weight, k_weight, token_mask, dense=False
+        )
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(hidden.device)[0] >= 8
+    ):
+        # NewLoader may supply logical views. Tensor layout must not choose a
+        # different accumulation order for the same supported inference gate.
+        if not hidden.is_contiguous():
+            hidden = hidden.contiguous()
+            if out is None:
+                out = hidden  # An owned dense copy, not the caller's input.
+        kv, q_weight, k_weight = (
+            kv.contiguous(),
+            q_weight.contiguous(),
+            k_weight.contiguous(),
+        )
+        if token_mask is not None:
+            token_mask = token_mask.contiguous()
+    if (
+        kv_supported
+        and _engram_inject_supported(hidden, q_weight, k_weight, token_mask)
         and kv.is_contiguous()
+        and (out is None or out.is_contiguous())
     ):
         from rtp_llm.models_py.modules.dsv41._engram_inject_triton import (
             engram_inject_kernel,
@@ -912,7 +946,14 @@ class Engram(nn.Module):
         rows = self.embed_tokens(hash_ids, hidden.device).flatten(-2)
         kv = self.wkv(rows)
         return gated_engram_residual(
-            hidden, kv, self.q_weight, self.k_weight, self.eps, token_mask, out=out
+            hidden,
+            kv,
+            self.q_weight,
+            self.k_weight,
+            self.eps,
+            token_mask,
+            out=out,
+            normalize_views=getattr(self, "_normalize_gate_views", False),
         )
 
 
