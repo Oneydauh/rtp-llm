@@ -82,13 +82,17 @@ def _schema(data, meta, nonce, rank):
             raise ValueError("invalid V4.1 fixture tensor " + key)
 
 
-def _read(rank, nonce, positions):
+def _read(rank, nonce, positions, *, old_root=None):
     from safetensors import safe_open
 
     path = (
-        Path(os.environ["TEST_SRCDIR"])
-        / os.environ["TEST_WORKSPACE"]
-        / (f"rtp_llm/test/smoke/arm_causal_inputs/v41_r{rank}.safetensors")
+        (old_root / "arm_causal_private" / f"v41_r{rank}.safetensors")
+        if old_root is not None
+        else (
+            Path(os.environ["TEST_SRCDIR"])
+            / os.environ["TEST_WORKSPACE"]
+            / (f"rtp_llm/test/smoke/arm_causal_inputs/v41_r{rank}.safetensors")
+        )
     )
     if not path.is_file() or not 0 < path.stat().st_size < 12 << 20:
         raise ValueError("missing or oversized V4.1 private fixture")
@@ -100,6 +104,33 @@ def _read(rank, nonce, positions):
     if not torch.equal(data["positions"], positions):
         raise ValueError("paired V4.1 CP rank owns different rows")
     return data
+
+
+# "replay" retains the original both-Old artifact name.
+CELLS = {
+    "replay_nn": (False, False),
+    "replay_on": (True, False),
+    "replay_no": (False, True),
+    "replay": (True, True),
+}
+
+
+def _slot_geometry(meta, entries):
+    # Absolute physical page numbers vary between workers/requests. Preserve
+    # the logical row -> (page equality class, ring offset) correspondence.
+    slots = meta.cache_slot_mapping.detach().flatten()[:127].cpu().tolist()
+    if len(slots) != 127 or not 0 < entries <= 65536:
+        raise ValueError("invalid V4.1 SWA physical slot geometry")
+    blocks, canonical = {}, []
+    for position, slot in enumerate(slots, 385):
+        if slot == -1:
+            canonical.append([-1, -1])
+            continue
+        block, offset = divmod(slot, entries)
+        if slot < 0 or offset != position % entries:
+            raise ValueError("V4.1 SWA slot does not address its logical ring offset")
+        canonical.append([blocks.setdefault(block, len(blocks)), offset])
+    return dict(entries=entries, logical_start=385, slots=canonical)
 
 
 def observe(trace, call, layer, cp, h, *args, **kwargs):
@@ -124,10 +155,18 @@ def observe(trace, call, layer, cp, h, *args, **kwargs):
     positions = cp.global_positions.reshape(-1)[valid].long().cpu()
     marker = trace.root / "v41_causal_replay_id"
     replay = marker.is_file()
-    if replay and marker.read_text() != trace.run:
-        raise ValueError("mismatched V4.1 repeat request")
-    mode = "replay" if replay else "natural"
-    incoming = _read(rank, nonce, positions) if replay and role == "newfst" else {}
+    mode = "natural"
+    if replay:
+        pair = marker.read_text().split()
+        if len(pair) != 2 or pair[0] != trace.run or pair[1] not in CELLS:
+            raise ValueError("mismatched V4.1 repeat request")
+        mode = pair[1]
+    use_mix, use_swa = CELLS.get(mode, (False, False))
+    incoming = (
+        _read(rank, nonce, positions, old_root=trace.root if role == "oldfst" else None)
+        if replay
+        else {}
+    )
     relay = {"positions": positions}
     record = dict(
         schema=1,
@@ -138,6 +177,13 @@ def observe(trace, call, layer, cp, h, *args, **kwargs):
         rank=rank,
         positions=positions.tolist(),
         events=[],
+        request_id=trace.run,
+        cp=dict(
+            size=2,
+            rank=rank,
+            local_rows=len(valid),
+            live_rows=valid.nonzero().flatten().tolist(),
+        ),
         weights={},
         skipped=[],
     )
@@ -165,14 +211,14 @@ def observe(trace, call, layer, cp, h, *args, **kwargs):
     def boundary(name, value):
         event(name + ".observed", value)
         if not replay:
+            if role == "oldfst":
+                relay[name] = value[valid].detach().to("cpu", copy=True).contiguous()
             return value
         # Only valid request rows are serialized. Canonicalize padding on BOTH
         # replay arms, without mutating the ordinary request or the source tensor.
         out = torch.zeros_like(value)
         live = value[valid].detach().contiguous()
-        if role == "oldfst":
-            relay[name] = live.cpu()
-        else:
+        if name == "incoming" or use_mix:
             live = incoming[name].to(value.device)
         out[valid] = live
         event(name + ".used", out)
@@ -378,11 +424,13 @@ def observe(trace, call, layer, cp, h, *args, **kwargs):
             if prefix.shape != (127, 512) or prefix.dtype != torch.bfloat16:
                 raise ValueError("invalid V4.1 decoded SWA operand")
             event("swa_tail.observed", prefix, layout="global")
-            if replay:
-                if role == "oldfst":
-                    relay["swa_tail"] = prefix.detach().cpu().contiguous()
-                else:
-                    prefix.copy_(incoming["swa_tail"])
+            record["swa_geometry"] = _slot_geometry(
+                meta, int(layer.attn._swa_entries_per_block())
+            )
+            if not replay and role == "oldfst":
+                relay["swa_tail"] = prefix.detach().to("cpu", copy=True).contiguous()
+            if use_swa:
+                prefix.copy_(incoming["swa_tail"])
             event("swa_tail.used", prefix, layout="global")
             return out
 
@@ -428,7 +476,7 @@ def observe(trace, call, layer, cp, h, *args, **kwargs):
         record["skipped"].append("shared executor operands")
     with (trace.root / f"v41_causal_{mode}_r{rank}.json").open("x") as f:
         json.dump(record, f, separators=(",", ":"))
-    if replay and role == "oldfst":
+    if not replay and role == "oldfst":
         from safetensors.torch import save_file
 
         provenance = dict(

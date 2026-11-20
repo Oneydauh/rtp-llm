@@ -11,7 +11,7 @@ from unittest.mock import patch
 import torch
 
 from rtp_llm.models_py.modules import v41_causal as trace
-from rtp_llm.test.smoke.scripts.compare_v41_causal import CORE, compare
+from rtp_llm.test.smoke.scripts.compare_v41_causal import CORE, PROMPT, compare
 
 
 class Identity(torch.nn.Module):
@@ -27,6 +27,9 @@ class HC(Identity):
 class Attn(Identity):
     layer_id = 1
     compress_ratio = 0
+
+    def _swa_entries_per_block(self):
+        return 128
 
     def _swa_prefill_concat(self, qkv, common):
         return torch.full((1, 398, 512), self.seed, dtype=torch.bfloat16)
@@ -96,7 +99,7 @@ class CausalTest(unittest.TestCase):
             fixture = Path(tmp) / "w/rtp_llm/test/smoke/arm_causal_inputs"
             fixture.mkdir(parents=True)
 
-            def invoke(role, root, seed):
+            def invoke(role, root, seed, mode="natural"):
                 root = Path(root)
                 rank = 0
                 ids = torch.tensor([2, 4])
@@ -141,7 +144,8 @@ class CausalTest(unittest.TestCase):
                 net._try_mega_mhc = lambda *args: None
                 net.ffn_hc.pre_mix_out = prev.pre_mix_out
                 state = NS(root=root, run=run, phase="hit", prefix=512)
-                (root / "v41_causal_replay_id").write_text(run)
+                if mode != "natural":
+                    (root / "v41_causal_replay_id").write_text(run + " " + mode)
                 used = {}
 
                 def block(x, input_ids):
@@ -149,7 +153,10 @@ class CausalTest(unittest.TestCase):
                         batch_size=1,
                         cp_on=True,
                         any_cont=True,
-                        swa_meta=NS(cache_gather_lens=torch.tensor([127])),
+                        swa_meta=NS(
+                            cache_gather_lens=torch.tensor([127]),
+                            cache_slot_mapping=torch.arange(385, 512).view(1, -1),
+                        ),
                     )
                     buf = net.attn._swa_prefill_concat(None, common)
                     used.update(
@@ -172,13 +179,22 @@ class CausalTest(unittest.TestCase):
                 self.assertEqual(prev.pre_mix_out[0, 0].item(), seed)
                 return used
 
-            old = invoke("oldfst", a, 3)
+            original = invoke("oldfst", a, 3)
             old_path = Path(a) / "arm_causal_private/v41_r0.safetensors"
             with safe_open(str(old_path), framework="pt") as f:
                 self.assertEqual(set(f.keys()), trace.KEYS)
                 self.assertEqual(f.get_tensor("incoming").shape, (1, 4, 5120))
             (fixture / "v41_r0.safetensors").symlink_to(old_path)
-            new = invoke("newfst", b, 9)
+            for mode, (use_mix, use_swa) in trace.CELLS.items():
+                old = invoke("oldfst", a, 3, mode)
+                new = invoke("newfst", b, 9, mode)
+                self.assertTrue(torch.equal(old["x"], new["x"]))
+                self.assertEqual(new["mix"][0, 0].item(), 3 if use_mix else 9)
+                self.assertEqual(new["raw"][0, 126, 0].item(), 3 if use_swa else 9)
+                self.assertEqual(new["raw"][0, 127, 0].item(), 9)
+            self.assertEqual(
+                original["x"][1, 0, 0].item(), 3
+            )  # natural padding unchanged
             self.assertFalse((Path(b) / "arm_causal_private").exists())
             self.assertTrue(
                 torch.equal(old["x"], new["x"]) and torch.equal(old["mix"], new["mix"])
@@ -199,12 +215,12 @@ class CausalTest(unittest.TestCase):
                 root.mkdir()
                 for rank in range(2):
                     pos = list(range(512 + rank, 783, 2))
-                    for mode in ("natural", "replay"):
+                    for i, mode in enumerate(("natural", *trace.CELLS)):
                         val = dict(
                             sha256="2" * 64, shape=[len(pos), 4], dtype="torch.float32"
                         )
                         names = set(CORE)
-                        if mode == "replay":
+                        if mode != "natural":
                             names.update(("incoming.used", "previous_mix.used"))
                         rec = dict(
                             schema=1,
@@ -214,6 +230,27 @@ class CausalTest(unittest.TestCase):
                             rank=rank,
                             role=root.name,
                             positions=pos,
+                            cp=dict(
+                                size=2,
+                                rank=rank,
+                                local_rows=len(pos),
+                                live_rows=list(range(len(pos))),
+                            ),
+                            request_id=f"{i+1:032x}",
+                            swa_geometry=dict(
+                                entries=128,
+                                logical_start=385,
+                                slots=[[0, k % 128] for k in range(385, 512)],
+                            ),
+                            outcome=dict(
+                                input_digest=PROMPT,
+                                reuse=512,
+                                decode_reuse=0,
+                                output_count=2,
+                                output_hash="c" * 64,
+                                accepts=[0],
+                                matches_golden=True,
+                            ),
                             weights={"w": val},
                             skipped=[],
                             events=[[s, val] for s in sorted(names)],
@@ -222,6 +259,34 @@ class CausalTest(unittest.TestCase):
                             json.dumps(rec)
                         )
             self.assertEqual(compare(*roots)["status"], "compared")
+            # Give only the New mix a causal effect; SWA has no contrast.
+            for rank in (0, 1):
+                for mode in ("natural", *trace.CELLS):
+                    path = roots[1] / f"v41_causal_{mode}_r{rank}.json"
+                    doc = json.loads(path.read_text())
+                    ev = dict(doc["events"])
+                    ev["previous_mix.observed"]["sha256"] = "a" * 64
+                    local_mix = mode == "natural" or not trace.CELLS[mode][0]
+                    if local_mix:
+                        if mode != "natural":
+                            ev["previous_mix.used"]["sha256"] = "a" * 64
+                        ev["outgoing"]["sha256"] = "d" * 64
+                        doc["outcome"].update(output_hash="e" * 64, accepts=[1])
+                    path.write_text(json.dumps(doc))
+            result = compare(*roots)
+            mix = result["new_factor_contrasts"]["mix_at_natural_swa"]
+            self.assertEqual(
+                (
+                    mix["operand_changed"],
+                    mix["layer1_changed"],
+                    mix["output_changed"],
+                    mix["accepted"],
+                ),
+                (True, True, True, [1, 0]),
+            )
+            self.assertFalse(
+                result["new_factor_contrasts"]["swa_at_natural_mix"]["operand_changed"]
+            )
             target = roots[1] / "v41_causal_replay_r1.json"
             doc = json.loads(target.read_text())
             dict(doc["events"])["incoming.used"]["sha256"] = "d" * 64
