@@ -163,12 +163,39 @@ class PairedInputs(unittest.TestCase):
             lambda d: d[2]["ab"].pop("wq_a"),
             lambda d: d[1]["ops"].pop("ffn.shared.out"),
             lambda d: d[0]["repeat_moe"].pop("ffn.pack.x"),
-            lambda d: d[0]["ops"]["attn.swa_read"]["rows"].__setitem__(40, "b" * 64),
+            lambda d: d[0]["ops"]["attn.swa_read"]["rows"].pop(),
+            lambda d: d[0]["ops"]["attn.swa_read"]["pos"].__setitem__(40, 39),
         ):
             d = reports()
             mutate(d)
             with self.assertRaises(ValueError):
                 compare(d)
+
+    def test_changed_cache_is_evidence_not_a_missing_fixture(self):
+        d = reports()
+        self.assertFalse(compare(d)["invalid_same_cache_for_downstream"])
+        d[3]["ops"]["attn.swa_read"]["rows"][40] = "b" * 64
+        r = compare(d)
+        self.assertTrue(r["valid"] and r["invalid_same_cache_for_downstream"])
+        self.assertFalse(r["fresh_kv_only"])
+        self.assertEqual(r["first_different_boundary_at_position40"], "attn.swa_read")
+        chain = r["fresh_kv_boundary_checks"]["newfst1"]
+        pair = chain["attn.swa_write->attn.swa_read"]
+        self.assertEqual(pair["different_positions"], [40])
+        self.assertNotEqual(pair["from_digest"], pair["to_digest"])
+        self.assertEqual(
+            chain["attn.swa_read->attn.mla.kv"]["different_positions"], [40]
+        )
+        self.assertEqual(r["mla_kv_old_to_new_by_rank"]["1"]["different_positions"], [])
+        # Even if every role's chain is internally consistent, different
+        # Old/New actual MLA inputs still rule out downstream attribution.
+        for stage in GLOBAL:
+            d[3]["ops"][stage]["rows"][40] = "b" * 64
+        r = compare(d)
+        self.assertTrue(r["fresh_kv_only"] and r["invalid_same_cache_for_downstream"])
+        self.assertEqual(
+            r["mla_kv_old_to_new_by_rank"]["1"]["different_positions"], [40]
+        )
 
 
 if __name__ == "__main__":
