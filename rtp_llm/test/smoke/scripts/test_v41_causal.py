@@ -54,6 +54,40 @@ class Attn(Identity):
 
 
 class CausalTest(unittest.TestCase):
+    def test_native_linear_and_shared_workspace_operands(self):
+        raw, packed, actual = (torch.tensor([n]) for n in (1, 2, 3))
+        direct = NS(weight=actual, weight_scales=packed)
+        wrapped = NS(weight=raw, weight_scales=raw, v41_runtime_linear=direct)
+        self.assertEqual(trace._native_pair(wrapped), (actual, packed))
+        self.assertEqual(
+            trace._native_pair(NS(weight=raw, v41_runtime_linear=None)), (None, None)
+        )
+        shared = NS(w13=wrapped, w2=direct)
+        fast = NS(
+            _prepared_shared_experts=shared,
+            _w13_parts=(packed, actual),
+            _w2_parts=(raw, actual),
+        )
+        self.assertEqual(
+            trace._shared_pairs(shared), ((actual, packed), (actual, packed))
+        )
+        self.assertEqual(
+            trace._shared_pairs(shared, fast), (fast._w13_parts, fast._w2_parts)
+        )
+        with self.assertRaisesRegex(ValueError, "unbound"):
+            trace._shared_pairs(NS(), fast)
+
+    def test_lookup_uses_live_uva_source_and_target_index_device(self):
+        h = torch.tensor([[1], [2], [3]], dtype=torch.uint8)
+        # Exercise source selection on CPU; do not claim this runs a CUDA UVA read.
+        table = NS(weight=h, scales=h, _uva=(h + 10, h + 20))
+        ids = torch.tensor([2, 0])
+        host = dict(trace._lookup_rows(table, ids, False))
+        gpu_abi = dict(trace._lookup_rows(table, ids, True))
+        self.assertEqual(host["weight"].flatten().tolist(), [3, 1])
+        self.assertEqual(gpu_abi["weight"].flatten().tolist(), [13, 11])
+        self.assertEqual(gpu_abi["scales"].flatten().tolist(), [23, 21])
+
     def test_real_call_private_transport(self):
         from safetensors import safe_open
 

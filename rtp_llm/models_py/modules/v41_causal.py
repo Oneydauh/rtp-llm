@@ -14,6 +14,36 @@ TARGET = "//rtp_llm/test/smoke:deepseek_v41_cache_rounds_sm100_arm"
 KEYS = {"positions", "incoming", "previous_mix", "swa_tail"}
 
 
+def _native_pair(op):
+    # The owner may have raw checkpoint scales as well as its executor's
+    # different, packed scales. Never substitute a raw field for a missing
+    # native operand (the comparator reports missing tensors as incomplete).
+    op = getattr(op, "v41_runtime_linear", op)
+    return getattr(op, "weight", None), getattr(op, "weight_scales", None)
+
+
+def _lookup_rows(table, ids, cuda_lookup):
+    pair = table._uva if cuda_lookup else (table.weight, table.scales)
+    if pair is None or len(pair) != 2:
+        raise ValueError("runtime Engram lookup has no bound tables")
+    for field, tensor in zip(("weight", "scales"), pair):
+        if tensor.element_size() != 1 or tensor.ndim != 2:
+            raise ValueError("unexpected runtime Engram table layout")
+        yield field, tensor.view(torch.uint8).index_select(
+            0, ids.to(device=tensor.device)
+        )
+
+
+def _shared_pairs(module, fast=None):
+    if fast is None:
+        return (_native_pair(module.w13), _native_pair(module.w2))
+    # _run_prepared has completed, so these are the GEMM operands it
+    # actually used, even when a stale wrapper refers to different buffers.
+    if fast._prepared_shared_experts is not module:
+        raise ValueError("unbound V4.1 shared expert workspace")
+    return fast._w13_parts, fast._w2_parts
+
+
 def _digest(x):
     x = x.detach()
     sha = hashlib.sha256()
@@ -160,14 +190,8 @@ def observe(trace, call, layer, cp, h, *args, **kwargs):
         ("wq_b", layer.attn.wq_b),
         ("wo_b", layer.attn.wo_b),
     ):
-        native = getattr(owner, "v41_runtime_linear", owner)
-        for field in ("weight", "weight_scales"):
-            weight(key + "." + field, getattr(native, field, None))
-    fused = getattr(layer.attn, "wq_a_wkv", None)
-    if fused is not None:
-        native = getattr(fused, "v41_runtime_linear", fused)
-        for field in ("weight", "weight_scales"):
-            weight("fused_qkv." + field, getattr(native, field, None))
+        for field, value in zip(("weight", "weight_scales"), _native_pair(owner)):
+            weight(key + "." + field, value)
     for label, obj, names in (
         ("engram", layer.engram, ("q_weight", "k_weight")),
         ("attn_hc", layer.attn_hc, ("fn", "base", "scale")),
@@ -199,22 +223,14 @@ def observe(trace, call, layer, cp, h, *args, **kwargs):
     ):
         raise ValueError("unexpected Engram fixture lookup")
     weight("engram.addresses", ids)
-    for field in ("weight", "scales"):
-        weight(
-            "engram.selected." + field,
-            getattr(table, field).view(torch.uint8).index_select(0, ids),
-        )
+    for field, rows in _lookup_rows(table, ids, layer.engram_hashes.is_cuda):
+        weight("engram.selected." + field, rows)
     experts = layer.ffn.fused_moe.fused_experts
     for field in ("_mega_l1_w", "_mega_l1_sf", "_mega_l2_w", "_mega_l2_sf"):
         weight("experts." + field, getattr(experts, field, None))
     if layer.ffn.fused_moe.includes_shared_expert:
         for field in ("_se_l1_w", "_se_l1_sf", "_se_l2_w", "_se_l2_sf"):
             weight("experts." + field, getattr(experts, field, None))
-    else:
-        for key in ("w13", "w2"):
-            linear = getattr(layer.ffn.shared_experts, key, None)
-            for field in ("weight", "weight_scales"):
-                weight("shared." + key + "." + field, getattr(linear, field, None))
 
     event("input_ids", args[0])
     event("hash_ids", layer.engram_hashes)
@@ -233,6 +249,38 @@ def observe(trace, call, layer, cp, h, *args, **kwargs):
                 return intercept(fn, a, k)
 
             stack.enter_context(patch.object(obj, attr, wrapped))
+
+        shared = layer.ffn.shared_experts
+        if not layer.ffn.fused_moe.includes_shared_expert and shared is not None:
+
+            def shared_used(module, out, fast=None):
+                for key, pair in zip(("w13", "w2"), _shared_pairs(module, fast)):
+                    for field, value in zip(("weight", "weight_scales"), pair):
+                        weight("shared." + key + "." + field, value)
+                event(
+                    "shared." + ("prepared" if fast is not None else "module") + ".out",
+                    out,
+                )
+
+            stack.callback(
+                shared.register_forward_hook(lambda m, _a, o: shared_used(m, o)).remove
+            )
+            runtime = getattr(layer.ffn, "_runtime", layer.ffn)
+            executor = runtime._moe._shared_executor
+            fast = getattr(executor, "_fast_path", None)
+            if fast is not None:
+
+                def fast_shared(fn, a, k):
+                    out = fn(*a, **k)
+                    try:
+                        shared_used(a[0], out, fast)
+                    except (AttributeError, RuntimeError, TypeError, ValueError):
+                        # Production catches exceptions here and would rerun a
+                        # fallback. A failed observation must not select it.
+                        record["skipped"].append("prepared shared observation")
+                    return out
+
+                wrap(fast, "_run_prepared", fast_shared)
 
         for key, module in (
             ("engram_wkv", layer.engram.wkv),
@@ -278,14 +326,19 @@ def observe(trace, call, layer, cp, h, *args, **kwargs):
         def pre_qkv(fn, a, k):
             result = fn(*a, **k)
             if result is not None:
+                for field, value in zip(
+                    ("weight", "weight_scales"), _native_pair(layer.attn.wq_a_wkv)
+                ):
+                    weight("fused_qkv." + field, value)
                 event("fused_qkv.qr", result[0].squeeze(0))
                 event("fused_qkv.kv", result[1].squeeze(0))
             else:
                 for key in ("wq_a", "wkv"):
                     op = getattr(layer.attn, key)
-                    op = getattr(op, "v41_runtime_linear", op)
-                    for field in ("weight", "weight_scales"):
-                        weight(key + "." + field, getattr(op, field, None))
+                    for field, value in zip(
+                        ("weight", "weight_scales"), _native_pair(op)
+                    ):
+                        weight(key + "." + field, value)
             return result
 
         wrap(layer.attn, "_try_fused_qr_kv", pre_qkv)
@@ -368,6 +421,11 @@ def observe(trace, call, layer, cp, h, *args, **kwargs):
         out = call(h, *args, **kwargs)
     event("outgoing", out)
     event("next_mix", layer.ffn_hc.pre_mix_out)
+    if (
+        not layer.ffn.fused_moe.includes_shared_expert
+        and "shared.w13.weight" not in record["weights"]
+    ):
+        record["skipped"].append("shared executor operands")
     with (trace.root / f"v41_causal_{mode}_r{rank}.json").open("x") as f:
         json.dump(record, f, separators=(",", ":"))
     if replay and role == "oldfst":
