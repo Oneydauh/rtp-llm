@@ -449,6 +449,7 @@ def forward_layers(
 
     capture_ids = frozenset(v4.capture_aux_hidden_layer_ids)
     from rtp_llm.models_py.modules.dsv4.prefill.v4_fixed_replay import open_trace
+
     replay = open_trace(v4, cp_ctx, input_ids, prepare_hidden_fn)
     if replay is not None:
         replay.observe("embed", h)
@@ -621,6 +622,14 @@ def forward_layers(
             )
             for layer_idx, layer_call in enumerate(layer_calls):
                 with layer_forward_range(layer_idx):
+                    if replay is not None and layer_idx == 1:
+                        from rtp_llm.models_py.modules.dsv4.prefill.v4_l1_ops import (
+                            instrument,
+                        )
+
+                        layer_call = instrument(
+                            replay, v4.layers[layer_idx], layer_call
+                        )
                     h = layer_call(
                         h,  # [T, hc, dim]
                         input_ids,  # [T]
