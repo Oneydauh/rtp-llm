@@ -177,6 +177,9 @@ def run_layer(trace, layer, call, role, nonce, h, ids, positions, cu, **kwargs):
     shared = chunked._moe._shared_executor
     weights = effective_weights(layer, gate, experts, shared)
     thread = threading.get_ident()
+    from .v4_norm40 import NormProbe
+
+    norm_probe = NormProbe(trace)
 
     def row(tag, t, global_rows=False):
         record = repeated if in_repeat else stages
@@ -198,7 +201,10 @@ def run_layer(trace, layer, call, role, nonce, h, ids, positions, cu, **kwargs):
 
     def hc(fn, tag, pre):
         def observed(*args, **kw):
-            v = fn(*args, **kw)
+            if tag == "ffn.hc_pre" and threading.get_ident() == thread:
+                v = norm_probe.hc_call(fn, args, kw)
+            else:
+                v = fn(*args, **kw)
             if threading.get_ident() == thread:
                 for k, t in zip((".mix", ".post", ".comb"), v) if pre else (("", v),):
                     row(tag + k, t)
@@ -234,6 +240,7 @@ def run_layer(trace, layer, call, role, nonce, h, ids, positions, cu, **kwargs):
 
             replace(obj, key, wrapped)
 
+        norm_probe.hooks(layer, replace)
         fast = layer._prefill_fast_hc_impls()
         replace(
             layer,
@@ -329,10 +336,16 @@ def run_layer(trace, layer, call, role, nonce, h, ids, positions, cu, **kwargs):
             ),
             after=lambda v, args, kw: row("attn.wo_a", v),
         )
+
+        def gate_input(args, kw):
+            if not in_repeat:
+                norm_probe.save("live.gate_input", args[0])
+            row("ffn.norm", args[0])
+
         around(
             gate,
             "_bf16_scores",
-            before=lambda args, kw: row("ffn.norm", args[0]),
+            before=gate_input,
             after=lambda v, args, kw: row("ffn.router", v),
         )
 
@@ -377,6 +390,7 @@ def run_layer(trace, layer, call, role, nonce, h, ids, positions, cu, **kwargs):
             nonlocal in_repeat
             if threading.get_ident() != thread:
                 return first_ffn(x, input_ids, *args, **kw)
+            norm_probe.save("live.moe_input", x)
             xs, ids_copy = x.clone(), input_ids.clone()
             first = first_ffn(x, input_ids, *args, **kw).clone()
             row("ffn.combined", first)
@@ -395,6 +409,7 @@ def run_layer(trace, layer, call, role, nonce, h, ids, positions, cu, **kwargs):
         out = call(vin, ids, positions, cu, **kwargs)
         row("output", out)
     public = {
+        "norm40": norm_probe.finish(layer),
         "family": "v4",
         "role": role,
         "nonce": nonce,

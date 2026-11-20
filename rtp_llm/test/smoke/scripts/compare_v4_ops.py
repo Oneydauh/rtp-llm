@@ -79,6 +79,159 @@ def sha(v):
     return isinstance(v, str) and re.fullmatch("[0-9a-f]{64}", v)
 
 
+def compare_norm(docs):
+    live = (
+        "live.hc_residual",
+        "live.hc_splitk_dot",
+        "live.hc_splitk_sq",
+        "live.hc_mix",
+        "live.norm_input",
+        "live.norm_output",
+        "live.moe_input",
+        "live.gate_input",
+    )
+    edges = (
+        ("live.hc_mix", "live.norm_input"),
+        ("live.norm_output", "live.moe_input"),
+        ("live.moe_input", "live.gate_input"),
+        ("live.hc_mix", "fused.mix"),
+        ("live.hc_mix", "split.mix"),
+        ("fused.mix", "split.mix"),
+        ("live.hc_mix", "reconstructed.fma_bf16"),
+        ("live.hc_mix", "reconstructed.nonfma_bf16"),
+        ("live.norm_output", "rms.out"),
+        ("live.norm_output", "rms.in"),
+        ("rms.out", "rms.pdl_on"),
+        ("rms.out", "rms.pdl_off"),
+        ("live.norm_output", "ref.f32_once"),
+        ("live.norm_output", "ref.bf16_before_weight"),
+        ("live.norm_output", "ref.f64_once"),
+    )
+    roles = {}
+    ranks = {}
+    parsed = {}
+
+    def diff(a, b):
+        if a is None or b is None:
+            return None
+        if (a["pos"], a["dtype"], a["shape"]) != (b["pos"], b["dtype"], b["shape"]):
+            return {"layout_match": False}
+        return {
+            "layout_match": True,
+            "different_positions": [
+                p for p, l, r in zip(a["pos"], a["rows"], b["rows"]) if l != r
+            ],
+        }
+
+    for d in docs:
+        label = d["role"] + str(d["rank"])
+        n = d.get("norm40")
+        if not isinstance(n, dict) or n.get("schema") != 1:
+            roles[label] = {"status": "missing"}
+            continue
+        data = {}
+        invalid = []
+        for k, v in n.get("events", {}).items():
+            if (
+                not isinstance(v, dict)
+                or v.get("pos") != d["ops"]["input"]["pos"]
+                or not isinstance(v.get("shape"), list)
+                or not isinstance(v.get("dtype"), str)
+                or not isinstance(v.get("rows"), list)
+                or len(v["rows"]) != len(v["pos"])
+                or not all(map(sha, v["rows"]))
+            ):
+                invalid.append(k)
+            else:
+                data[k] = v
+        parsed[label] = data
+        roles[label] = {
+            "path": n.get("path"),
+            "metadata": n.get("meta"),
+            "unavailable": n.get("unavailable"),
+            "missing_live": [k for k in live if k not in data],
+            "invalid_events": invalid,
+            "within_run": {
+                a + "->" + b: diff(data.get(a), data.get(b)) for a, b in edges
+            },
+        }
+    for rank in (0, 1):
+        l, r = docs[rank], docs[rank + 2]
+        a = parsed.get("oldfst" + str(rank), {})
+        b = parsed.get("newfst" + str(rank), {})
+        common = {k: diff(a.get(k), b.get(k)) for k in sorted(set(a) | set(b))}
+        first = next(
+            (k for k in live if (common.get(k) or {}).get("different_positions")), None
+        )
+        q = {
+            "observed": common,
+            "first_observed_live": first,
+            "missing_either": [k for k in live if k not in a or k not in b],
+        }
+        ref = common.get("ref.f64_once") or {}
+        if (
+            a.get("ref.f64_once")
+            and 40 in a["ref.f64_once"]["pos"]
+            and ref.get("layout_match")
+            and 40 not in ref["different_positions"]
+        ):
+            old = l["norm40"].get("rounding40", {})
+            new = r["norm40"].get("rounding40", {})
+            pairs = {}
+            for k in sorted(set(old) & set(new)):
+                vals = [old[k], new[k]]
+                if not all(
+                    isinstance(v, dict)
+                    and v.get("valid") is True
+                    and v.get("channels") == 4096
+                    and isinstance(v.get("delta"), list)
+                    and all(
+                        isinstance(p, list)
+                        and len(p) == 2
+                        and all(type(s) is int for s in p)
+                        and 0 <= p[0] < 4096
+                        for p in v["delta"]
+                    )
+                    and len({p[0] for p in v["delta"]}) == len(v["delta"])
+                    for v in vals
+                ):
+                    continue
+                am, bm = (dict(v["delta"]) for v in vals)
+                channels = [
+                    [i, am.get(i, 0), bm.get(i, 0)]
+                    for i in sorted(set(am) | set(bm))
+                    if am.get(i, 0) != bm.get(i, 0)
+                ]
+                pairs[k] = {
+                    "different_channels_old_new_ulp_from_ref": channels,
+                    "old_deviations": len(am),
+                    "new_deviations": len(bm),
+                    "old_near_tie": vals[0].get("within_1e_4_ulp_of_tie"),
+                    "new_near_tie": vals[1].get("within_1e_4_ulp_of_tie"),
+                }
+            q["against_identical_bf16_rounded_f64_reference_at_40"] = pairs
+
+        def equal(k):
+            v = common.get(k) or {}
+            return v.get("layout_match") and v.get("different_positions") == []
+
+        def role_eps(d):
+            return (d.get("norm40") or {}).get("meta", {}).get("rms_eps")
+
+        q["same_rms_operands"] = bool(
+            equal("live.norm_input")
+            and l["weights"]["ffn_norm"] == r["weights"]["ffn_norm"]
+            and role_eps(l) is not None
+            and role_eps(l) == role_eps(r)
+        )
+        ranks[str(rank)] = q
+    return {
+        "per_role": roles,
+        "per_rank": ranks,
+        "interpretation": "Same-operand shadow outputs are observational controls. No attribution across missing boundaries or different inputs, epsilons or effective weights.",
+    }
+
+
 def kv_pair(a, b):
     # Number, ordering and hex format of rows were checked by the caller.
     def digest(v):
@@ -262,6 +415,7 @@ def compare(docs):
     return {
         "valid": True,
         "same_donor_replayed_on_both": True,
+        "hc_rms_probe": compare_norm(docs),
         "fresh_kv_only": fresh,
         "invalid_same_cache_for_downstream": not same_cache,
         "fresh_kv_boundary_checks": kv_chain,
