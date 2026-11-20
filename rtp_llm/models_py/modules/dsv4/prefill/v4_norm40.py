@@ -174,11 +174,23 @@ class NormProbe:
         spy(big, "_run_deepgemm_splitk_gemm", "in_hc", "hc", capture_split)
         import flashinfer.norm as fin
 
+        self.meta["flashinfer_cuda_dispatch"] = getattr(fin, "_USE_CUDA_NORM", None)
+        props = torch.cuda.get_device_properties(layer.ffn_norm.weight.device)
+        self.meta["rms_gpu"] = {
+            "sm": [props.major, props.minor],
+            "multiprocessors": props.multi_processor_count,
+            "block_shared_mem_optin": props.shared_memory_per_block_optin,
+            "cuda_toolkit": torch.version.cuda,
+        }
+
         def native(a, kw, out):
             self.meta["flashinfer_pdl_argument"] = kw.get("enable_pdl", "default")
             self.meta["flashinfer_output_alias"] = a[0].data_ptr() == out.data_ptr()
 
         spy(fin, "rmsnorm", "in_norm", "rms", native)
+        if callable(getattr(layer.ffn_norm, "_implementation", None)):
+            self.meta["configured_rms"] = _id(layer.ffn_norm._implementation)
+            spy(layer.ffn_norm, "_implementation", "in_norm", "rms", native)
         orig = layer.ffn_norm.forward
         self.meta["norm_callable"] = _id(orig)
 
@@ -347,6 +359,36 @@ class NormProbe:
                             k, launch(x, ip, **opts)
                         ),
                     )
+
+                def explicit_cuda():
+                    from flashinfer.jit.norm import gen_norm_module
+                    from flashinfer.utils import device_support_pdl
+
+                    scratch = x.clone()
+                    out = torch.empty_like(scratch)
+                    gen_norm_module().build_and_load().rmsnorm(
+                        out, scratch, w, eps, device_support_pdl(scratch.device)
+                    )
+                    measure("rms.cuda_jit", out)
+
+                def explicit_cute():
+                    from flashinfer.norm.kernels import rmsnorm_cute
+                    from flashinfer.utils import device_support_pdl
+
+                    scratch = x.clone()
+                    out = torch.empty_like(scratch)
+                    rmsnorm_cute(
+                        scratch,
+                        w,
+                        out,
+                        eps,
+                        weight_bias=0.0,
+                        enable_pdl=device_support_pdl(scratch.device),
+                    )
+                    measure("rms.cute", out)
+
+                attempt("rms.cuda_jit", explicit_cuda)
+                attempt("rms.cute", explicit_cute)
                 for i, y in enumerate(hs or (None, None)):
                     if y is not None:
                         k = ("fused", "split")[i] + ".then_native_rms"
