@@ -604,6 +604,12 @@ def _deepgemm_warmup_lock_path() -> str:
         return os.path.join("/tmp", f"rtp_llm_dsv4_deepgemm_warmup_{os.getuid()}.lock")
 
 
+def _arm_startup_evidence() -> bool:
+    return os.environ.get("RTP_ARM_STARTUP_TIMING") == "1" and os.environ.get(
+        "TEST_TARGET"
+    ) == "//rtp_llm/test/smoke:deepseek_v41_long_prefill_logits_sm100_arm"
+
+
 def _run_deepgemm_warmup_launches_serialized(label: str, launch_fn: Any) -> None:
     """Serialize DeepGEMM dummy launches across rank processes sharing a cache."""
 
@@ -614,8 +620,18 @@ def _run_deepgemm_warmup_launches_serialized(label: str, launch_fn: Any) -> None
     wait_start = time.time()
     logging.info("[%s] rank=%d waiting for serialized DeepGEMM JIT lock", label, rank)
     with open(lock_path, "a", encoding="utf-8") as lock_file:
+        trace = _arm_startup_evidence()
+        if trace:
+            info = os.fstat(lock_file.fileno())
+            start = time.monotonic()
+            logging.info("[ARM_LOCK] wait rank=%d pid=%d lock=%d:%d label=%s",
+                         rank, os.getpid(), info.st_dev, info.st_ino, label)
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
+            if trace:
+                acquired = time.monotonic()
+                logging.info("[ARM_LOCK] acquired rank=%d pid=%d lock=%d:%d wait_s=%.6f label=%s",
+                             rank, os.getpid(), info.st_dev, info.st_ino, acquired-start, label)
             wait_time = time.time() - wait_start
             logging.info(
                 "[%s] rank=%d entered serialized DeepGEMM JIT lock after %.2fs",
@@ -626,6 +642,9 @@ def _run_deepgemm_warmup_launches_serialized(label: str, launch_fn: Any) -> None
             launch_fn()
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            if trace:
+                logging.info("[ARM_LOCK] released rank=%d pid=%d lock=%d:%d held_s=%.6f label=%s",
+                             rank, os.getpid(), info.st_dev, info.st_ino, time.monotonic()-acquired, label)
     logging.info("[%s] rank=%d released serialized DeepGEMM JIT lock", label, rank)
 
 
@@ -735,7 +754,18 @@ def _run_deepgemm_warmup_launch_with_retry(
     attempts = _DEEPGEMM_WARMUP_COMPILE_RETRIES + 1
     for attempt in range(1, attempts + 1):
         try:
-            launch_fn()
+            if _arm_startup_evidence():
+                rank = _dist_rank()
+                start = time.monotonic()
+                logging.info("[ARM_LAUNCH] begin rank=%d pid=%d attempt=%d %s %s",
+                             rank, os.getpid(), attempt, label, detail)
+                try:
+                    launch_fn()
+                finally:
+                    logging.info("[ARM_LAUNCH] end rank=%d pid=%d attempt=%d host_s=%.6f %s %s",
+                                 rank, os.getpid(), attempt, time.monotonic()-start, label, detail)
+            else:
+                launch_fn()
             return
         except RuntimeError as error:
             if not _is_deepgemm_nvcc_compile_error(error):

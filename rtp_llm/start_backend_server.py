@@ -5,7 +5,7 @@ import signal
 import sys
 import time
 import traceback
-from contextlib import suppress
+from contextlib import ExitStack, contextmanager, suppress
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from typing import List, Optional
@@ -68,6 +68,60 @@ def _send_pipe_status(pipe_writer, status: str, message: str, error_trace: str =
         logging.warning(f"Failed to send status via pipe: {e}")
 
 
+@contextmanager
+def _arm_pair_startup_timing(rank):
+    """Opt-in cold-start evidence for the paired ARM runner only."""
+    if os.environ.get("RTP_ARM_STARTUP_TIMING") != "1" or os.environ.get(
+        "TEST_TARGET"
+    ) != "//rtp_llm/test/smoke:deepseek_v41_long_prefill_logits_sm100_arm":
+        yield
+        return
+
+    import faulthandler
+    from pathlib import Path
+
+    from triton import knobs
+
+    root = Path(os.environ["TEST_UNDECLARED_OUTPUTS_DIR"]) / "arm_startup_timing"
+    root.mkdir(exist_ok=True)
+    tag = f"r{rank}-p{os.getpid()}"
+    start = time.monotonic()
+    logging.info("[ARM_STARTUP] rank=%d pid=%d begin", rank, os.getpid())
+    with ExitStack() as cleanup:
+        out = cleanup.enter_context((root / f"stacks-{tag}.log").open("w"))
+        print(f"rank={rank} pid={os.getpid()} stack_interval_s=60", file=out, flush=True)
+        faulthandler.dump_traceback_later(60, repeat=True, file=out)
+        cleanup.callback(faulthandler.cancel_dump_traceback_later)
+        # nvcc writes its own phase timings, including ptxas. Do not replace
+        # the compiler, change its path, or count dummy GPU launches as compiles.
+        envkey = "NVCC_APPEND_FLAGS"
+        previous = os.environ.get(envkey)
+        os.environ[envkey] = ((previous or "") + f" --time={root}/nvcc-{tag}.csv").strip()
+        if previous is None:
+            cleanup.callback(os.environ.pop, envkey, None)
+        else:
+            cleanup.callback(os.environ.__setitem__, envkey, previous)
+        listener = knobs.compilation.listener
+
+        def observe(**event):
+            if listener is not None:
+                listener(**event)
+            times = event["times"]
+            logging.info(
+                "[ARM_TRITON] rank=%d pid=%d kernel=%s cache_hit=%s total_us=%d lowering_us=%d",
+                rank, os.getpid(), getattr(event["src"], "name", "?"),
+                event["cache_hit"], times.total, times.total_lowering,
+            )
+
+        knobs.compilation.listener = observe
+        cleanup.callback(setattr, knobs.compilation, "listener", listener)
+        try:
+            yield
+        finally:
+            logging.info("[ARM_STARTUP] rank=%d pid=%d end elapsed_s=%.3f",
+                         rank, os.getpid(), time.monotonic() - start)
+
+
 def local_rank_start(
     global_controller: ConcurrencyController,
     py_env_configs: PyEnvConfigs,
@@ -113,10 +167,11 @@ def local_rank_start(
             setproctitle(f"rtp_llm_rank-{local_rank}")
         set_global_controller(global_controller)
         install_oom_dump()
-        from rtp_llm.server.backend_manager import BackendManager
+        with _arm_pair_startup_timing(world_rank):
+            from rtp_llm.server.backend_manager import BackendManager
 
-        backend_manager = BackendManager(py_env_configs)
-        backend_manager.start()
+            backend_manager = BackendManager(py_env_configs)
+            backend_manager.start()
         # Defer these handlers until model loading completes.
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)

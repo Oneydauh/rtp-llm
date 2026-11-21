@@ -1,6 +1,8 @@
 """CED bounded replay over main P/D routing with CP2 prefill and TP2 decode."""
 
 import logging
+import json
+import os
 import re
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -108,8 +110,24 @@ class DeepSeekV41PDContractTest(contract.DeepSeekV41ContractTest):
                 )
                 for manager in (self.server, self.graph_server)
             ]
-            for result in starts:
-                self.assertTrue(result.result())
+            try:
+                for result in starts:
+                    self.assertTrue(result.result())
+            finally:
+                if os.environ.get("RTP_ARM_STARTUP_TIMING") == "1" and os.environ.get(
+                    "TEST_TARGET"
+                ) == "//rtp_llm/test/smoke:deepseek_v41_long_prefill_logits_sm100_arm":
+                    # Record the boundary even if the first future failed before
+                    # its peer finished. No inference request has been issued.
+                    from concurrent.futures import wait
+
+                    wait(starts)
+                    root = Path(os.environ["TEST_UNDECLARED_OUTPUTS_DIR"])
+                    sizes = {}
+                    for role, manager in (("prefill", self.server), ("decode", self.graph_server)):
+                        if manager.log_file_path and Path(manager.log_file_path).is_file():
+                            sizes[role] = Path(manager.log_file_path).stat().st_size
+                    (root / "arm_startup_sizes.json").write_text(json.dumps(sizes))
 
     def _long_prefix_reuse_checks(self, prompt):
         # Fresh SWA uses BF16 while a reused prefix uses MXFP8-dequantized KV.
