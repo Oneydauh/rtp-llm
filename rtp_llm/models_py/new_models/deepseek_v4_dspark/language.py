@@ -5,11 +5,12 @@ No legacy ModelWeights object is constructed or consumed here.
 
 import torch
 
-from rtp_llm.models_py.layers.embedding import ParallelLMHead, VocabParallelEmbedding
+from rtp_llm.models_py.layers.embedding import VocabParallelEmbedding
 from rtp_llm.models_py.model_desc.deepseek_v4_dspark_model import DeepSeekV4DSparkModel
 from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.new_models.deepseek_v4.backbone import OwnedV4Transformer
 from rtp_llm.models_py.new_models.deepseek_v4.language import OwnedV4ModelMixin
+from rtp_llm.models_py.new_models.deepseek_v4.load_geometry import make_lm_head
 from rtp_llm.models_py.new_models.deepseek_v4_dspark.auxiliary import (
     DSparkAuxiliaryWeights,
 )
@@ -32,13 +33,7 @@ class DSparkV4Backbone(OwnedV4Transformer):
                 self.embed = VocabParallelEmbedding(
                     args.vocab_size, args.dim, params_dtype=params_dtype
                 )
-                self.head = ParallelLMHead(
-                    args.vocab_size,
-                    args.dim,
-                    tp_size=args.lm_head_tp_size,
-                    tp_rank=args.lm_head_tp_rank,
-                    params_dtype=head_dtype,
-                )
+                self.head = make_lm_head(args, head_dtype)
 
     def checkpoint_weight_name_filter(self):
         base = super().checkpoint_weight_name_filter()
@@ -78,6 +73,7 @@ class DeepSeekV4DSparkForCausalLM(OwnedV4ModelMixin, DeepSeekV4DSparkModel, RtpM
             self._dspark_markov_rank,
             norm_eps=args.norm_eps,
             prefill_commit_only=self._commit_only_prefill,
+            device=load_config.device,
         )
         self.WEIGHTS_MAPPER = _DraftMapper(self)
 

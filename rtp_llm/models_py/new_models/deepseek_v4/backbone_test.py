@@ -252,11 +252,12 @@ class Dsv4FullBackboneCheckpointTest(unittest.TestCase):
                 weights[prefix + "ffn.gate.bias"] = torch.tensor([0.1, 0.2, 0.3, 0.4])
         return weights
 
-    def load(self, weights, rank=0, *, cuda_norm=False):
+    def load(self, weights, rank=0, *, cuda_norm=False, cuda_native_rms=False):
         from safetensors.torch import save_file
 
         args = self.args(rank)
         args.cuda_norm = cuda_norm
+        args.cuda_native_rms = cuda_native_rms
         model = OwnedV4Transformer(args)
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "model.safetensors")
@@ -283,7 +284,9 @@ class Dsv4FullBackboneCheckpointTest(unittest.TestCase):
         NewModelLoader._validate_loaded_weights(model)
         return model
 
-    def test_cuda_norm_uses_original_prefill_output_workspace_and_loaded_parameter(self):
+    def test_cuda_norm_uses_original_prefill_output_workspace_and_loaded_parameter(
+        self,
+    ):
         from unittest.mock import patch
 
         from rtp_llm.models_py.modules.base.cuda.norm import RMSNorm as CudaRMSNorm
@@ -307,12 +310,29 @@ class Dsv4FullBackboneCheckpointTest(unittest.TestCase):
             self.assertIs(block._prefill_fast_norm(model.layers[0].attn_norm, x), x)
         self.assertIs(forward.call_args.kwargs["output"], x)
 
+    def test_arm_native_norm_bound_to_checkpointed_modules(self):
+        from rtp_llm.models_py.new_models.deepseek_v4.cuda_rms import native_rmsnorm
+
+        weights = self.weights()
+        model = self.load(weights, cuda_norm=True, cuda_native_rms=True)
+        for node, key in (
+            (model.layers[0].attn_norm, "layers.0.attn_norm.weight"),
+            (model.layers[0].ffn_norm, "layers.0.ffn_norm.weight"),
+            (model.norm, "norm.weight"),
+        ):
+            self.assertIs(node._implementation, native_rmsnorm)
+            self.assertTrue(torch.equal(node.weight, weights[key]))
+
     def test_real_native_checkpoint_full_swa_csa_hca_moe_hc_tree(self):
         weights = self.weights()
         for rank in (0, 1):
             model = self.load(weights, rank)
             torch.testing.assert_close(model.embed.weight, weights["embed.weight"])
-            torch.testing.assert_close(model.head_weight, weights["head.weight"])
+            # LM-head TP=1, EP=2: the distributed loader still pads to 8.
+            expected_head = torch.nn.functional.pad(
+                weights["head.weight"], (0, 0, 0, 7)
+            )
+            torch.testing.assert_close(model.head_weight, expected_head)
             torch.testing.assert_close(model.head_hc.fn, weights["hc_head_fn"])
             self.assertIs(model.head_weight, model.head.weight)
             for index, block in enumerate(model.layers):
@@ -465,7 +485,9 @@ class Dsv4FullBackboneCheckpointTest(unittest.TestCase):
                 model.weight = published
                 model._release_runtime_weight_source()
                 self.assertIs(model.weight, published)
-                self.assertIs(published.get_global_weight("lm_head"), model.v4.head.weight)
+                self.assertIs(
+                    published.get_global_weight("lm_head"), model.v4.head.weight
+                )
                 resource = types.SimpleNamespace(
                     kv_cache=None,
                     is_speculative=False,

@@ -1,4 +1,17 @@
 py_test(
+    name = "cuda_rms_order_test",
+    srcs = ["cuda_rms_order_test.py"],
+    deps = ["//rtp_llm/models_py:new_weight_loader", "//rtp_llm:torch"],
+    tags = ["SM100_ARM_CU13"],
+    env = {"GPU_COUNT": "1"},
+    exec_properties = {"gpu": "SM100_ARM_CU13", "gpu_count": "1"},
+    target_compatible_with = select({
+        "@//:using_cuda13_arm": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
+py_test(
     name = "ppu_moe_bind_device_test",
     srcs = ["ppu_moe_bind_device_test.py", "ppu_moe_owner_test.py"],
     data = ["//rtp_llm/models_py:ppu_sources"],

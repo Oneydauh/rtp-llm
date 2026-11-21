@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 from rtp_llm.models_py.module_base import RtpModule
+from rtp_llm.models_py.new_models.deepseek_v4.load_geometry import validate_load_groups
 from rtp_llm.models_py.new_models.deepseek_v41.backbone import runtime_backbone_class
 
 
@@ -67,7 +68,9 @@ class OwnedV41Mixin:
     def validate_runtime_device(self, device):
         super().validate_runtime_device(device)
         if torch.device(device).type != "cpu":
-            from rtp_llm.models_py.modules.dsv4.native_ops import require_serving_bindings
+            from rtp_llm.models_py.modules.dsv4.native_ops import (
+                require_serving_bindings,
+            )
 
             require_serving_bindings()
 
@@ -103,8 +106,7 @@ class OwnedV41Mixin:
         args = self._v4_args
         if not args.v41_config:
             raise ValueError("V4.1 cannot substitute V4 config or cache geometry")
-        args.tp_size, args.tp_rank = load_config.attn_tp_size, load_config.attn_tp_rank
-        args.ep_size, args.ep_rank = load_config.ep_size, load_config.ep_rank
+        validate_load_groups(args, load_config)
         args.lm_head_tp_size, args.lm_head_tp_rank = (
             load_config.lm_head_tp_size,
             load_config.lm_head_tp_rank,
@@ -117,7 +119,7 @@ class OwnedV41Mixin:
         self.WEIGHTS_MAPPER = _BackboneMapper(self.v4)
 
     def create_backbone(self, args, load_config):
-        return runtime_backbone_class()(
+        return runtime_backbone_class(target_block_device=load_config.device)(
             args,
             checkpoint_path=self._owned_checkpoint_path,
             head_dtype=(

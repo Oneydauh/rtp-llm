@@ -93,6 +93,20 @@ def config_and_load(folder, rank=0, *, engram=False, method="scratch"):
 
 
 class V41ServiceOwnerTest(unittest.TestCase):
+    def test_reader_cannot_replace_the_service_attention_or_expert_rank(self):
+        with tempfile.TemporaryDirectory() as root:
+            for group in ("attention", "expert"):
+                with self.subTest(group=group):
+                    config, load = config_and_load(root, rank=0)
+                    # Reader ranks are a snapshot. Simulate a stale snapshot
+                    # by changing the serving group before owner construction.
+                    if group == "attention":
+                        load.parallelism_config.tp_rank = 1
+                    else:
+                        load.parallelism_config.ep_rank = 1
+                    with self.assertRaisesRegex(ValueError, group + " rank mismatch"):
+                        get_model_class(config.model_type)(config, load)
+
     def test_accelerator_preflight_requires_the_serving_binding_before_allocation(self):
         with tempfile.TemporaryDirectory() as root:
             model, _, _, _ = self.staged(root)

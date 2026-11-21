@@ -61,7 +61,9 @@ class OwnedV4ModelMixin:
     def validate_runtime_device(self, device):
         super().validate_runtime_device(device)
         if torch.device(device).type != "cpu":
-            from rtp_llm.models_py.modules.dsv4.native_ops import require_serving_bindings
+            from rtp_llm.models_py.modules.dsv4.native_ops import (
+                require_serving_bindings,
+            )
 
             require_serving_bindings()
 
@@ -86,8 +88,13 @@ class OwnedV4ModelMixin:
         )
         args = OwnedV4Args(**asdict(self._v4_args))
         args.cuda_norm = (
-            torch.device(load_config.device).type == "cuda" and torch.version.hip is None
+            torch.device(load_config.device).type == "cuda"
+            and torch.version.hip is None
         )
+        if args.cuda_norm:
+            from .cuda_rms import use_native_rms
+
+            args.cuda_native_rms = use_native_rms(load_config.device)
         validate_load_groups(args, load_config)
         validate_v4_static_placement(args, model_config, load_config)
         args.lm_head_tp_size = load_config.lm_head_tp_size

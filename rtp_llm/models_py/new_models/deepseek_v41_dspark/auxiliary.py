@@ -7,8 +7,10 @@ Markov embedding/head. It never constructs legacy ModelWeights.
 
 import torch
 
-from rtp_llm.models_py.layers.norm import RMSNorm
 from rtp_llm.models_py.module_base import RtpModule
+from rtp_llm.models_py.new_models.deepseek_v4_dspark.auxiliary import (
+    make_draft_main_norm,
+)
 from rtp_llm.models_py.new_models.deepseek_v41_dspark.markov_head import (
     V41DSparkMarkovHead,
 )
@@ -26,6 +28,7 @@ class V41DSparkAuxiliaryWeights(RtpModule):
         norm_eps=1e-6,
         prefill_commit_only=False,
         head_stage=2,
+        device="cpu",
     ):
         super().__init__()
         target_layer_ids = tuple(target_layer_ids)
@@ -54,7 +57,9 @@ class V41DSparkAuxiliaryWeights(RtpModule):
         self.main_proj = Dsv41MXFP8Linear(
             hidden_size * len(target_layer_ids), hidden_size
         )
-        self.main_norm = RMSNorm(hidden_size, eps=norm_eps, params_dtype=torch.bfloat16)
+        self.main_norm = make_draft_main_norm(
+            hidden_size, norm_eps, torch.bfloat16, device
+        )
         self.markov_head = (
             None
             if prefill_commit_only

@@ -27,6 +27,7 @@ class DeepSeekV41DSparkForCausalLM(
             self._v4_args.vocab_size,
             self._dspark_markov_rank,
             self._v4_args.n_layers - 1,
+            device=load_config.device,
         )
 
     def create_backbone(self, args, load_config):

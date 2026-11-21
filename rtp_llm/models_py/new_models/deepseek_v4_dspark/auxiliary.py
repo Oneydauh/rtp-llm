@@ -8,8 +8,28 @@ import torch
 
 from rtp_llm.models_py.layers.norm import RMSNorm
 from rtp_llm.models_py.module_base import RtpModule
+from rtp_llm.models_py.modules.base.cuda.norm import RMSNorm as CudaRMSNorm
 from rtp_llm.models_py.new_models.deepseek_v4_dspark.markov_head import DSparkMarkovHead
+from rtp_llm.models_py.runtime_weight_update import prepare_leaf_weight_updates
 from rtp_llm.models_py.weight_mapper import WeightsMapper
+
+
+class _CudaDraftMainNorm(CudaRMSNorm, RtpModule):
+    """Use the serving norm's forward with a checkpoint-owned, updatable weight."""
+
+    supports_independent_weight_updates = True
+
+    def prepare_weight_updates(self, weights):
+        return prepare_leaf_weight_updates(self, weights)
+
+
+def make_draft_main_norm(dim, eps, dtype, device):
+    # Destination chooses the executor; the Parameter itself is created in
+    # the loader's current staging context and filled by checkpoint dispatch.
+    if torch.device(device).type == "cuda" and torch.version.cuda is not None:
+        weight = torch.nn.Parameter(torch.empty(dim, dtype=dtype), requires_grad=False)
+        return _CudaDraftMainNorm(weight, eps)
+    return RMSNorm(dim, eps=eps, params_dtype=dtype)
 
 
 class DSparkAuxiliaryWeights(RtpModule):
@@ -26,6 +46,7 @@ class DSparkAuxiliaryWeights(RtpModule):
         prefill_commit_only=False,
         padded_draft_vocab_size=None,
         head_stage=2,
+        device="cpu",
     ):
         super().__init__()
         target_layer_ids = tuple(target_layer_ids)
@@ -56,7 +77,9 @@ class DSparkAuxiliaryWeights(RtpModule):
             tp_rank=0,
             partition="replicated",
         )
-        self.main_norm = RMSNorm(hidden_size, eps=norm_eps, params_dtype=params_dtype)
+        self.main_norm = make_draft_main_norm(
+            hidden_size, norm_eps, params_dtype, device
+        )
         self.markov_head = (
             None
             if prefill_commit_only

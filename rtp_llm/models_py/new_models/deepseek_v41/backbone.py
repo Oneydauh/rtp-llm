@@ -2,6 +2,7 @@
 
 import os
 import weakref
+from functools import partial
 
 import torch
 from torch import nn
@@ -11,6 +12,7 @@ from rtp_llm.models_py.module_base import RtpModule
 from rtp_llm.models_py.modules.dsv41.bounded_replay import (
     enabled as bounded_replay_enabled,
 )
+from rtp_llm.models_py.new_models.deepseek_v4.load_geometry import make_lm_head
 from rtp_llm.models_py.new_models.deepseek_v41.attention import (
     OwnedV41Attention,
     OwnedV41CommitAttention,
@@ -206,14 +208,7 @@ class OwnedV41Transformer(RtpModule):
             dtype=torch.bfloat16,
         )
         self.norm = self.norm_type(args.dim, args.norm_eps, torch.bfloat16)
-        self.head = OwnedV41Matrix(
-            args.vocab_size,
-            args.dim,
-            shard_dim=0,
-            tp_size=args.lm_head_tp_size,
-            tp_rank=args.lm_head_tp_rank,
-            dtype=head_dtype,
-        )
+        self.head = make_lm_head(args, head_dtype)
         self.head_hc = self.head_type(self.layers[-1].ffn_hc)
 
     @property
@@ -269,15 +264,34 @@ def _checkpoint_native_hc(args, layer_id, name):
     return unit
 
 
-def _checkpoint_cuda_norm(dim, eps, dtype):
+def _checkpoint_cuda_norm(dim, eps, dtype, *, norm_type=None):
     from rtp_llm.models_py.modules.base.cuda.norm import RMSNorm as CudaRMSNorm
 
-    return CudaRMSNorm(
-        nn.Parameter(torch.empty(dim, dtype=dtype), requires_grad=False), eps
+    return (norm_type or CudaRMSNorm)(
+        nn.Parameter(torch.empty(dim, dtype=dtype), requires_grad=False),
+        eps,
     )
 
 
-def runtime_backbone_class():
+def _target_block_norm_factory(device):
+    # Select from the serving device; checkpoint parameters may still be on meta.
+    # Do not let FlashInfer import order choose the BF16 reduction for SM100.
+    if (
+        device is not None
+        and torch.device(device).type == "cuda"
+        and torch.version.cuda is not None
+    ):
+        from rtp_llm.models_py.new_models.deepseek_v4.cuda_rms import (
+            OwnedNativeRMSNorm,
+            use_native_rms,
+        )
+
+        if use_native_rms(device):
+            return partial(_checkpoint_cuda_norm, norm_type=OwnedNativeRMSNorm)
+    return _checkpoint_cuda_norm
+
+
+def runtime_backbone_class(*, target_block_device=None):
     """Compose the real main runtime only for production construction.
 
     Pure checkpoint staging does not import native runtime. Production does
@@ -305,7 +319,7 @@ def runtime_backbone_class():
         attention_type = RuntimeAttention
         commit_attention_type = RuntimeCommitAttention
         hc_type = staticmethod(_checkpoint_native_hc)
-        norm_type = staticmethod(_checkpoint_cuda_norm)
+        norm_type = staticmethod(_target_block_norm_factory(target_block_device))
 
     class RuntimeTransformer(V4Transformer, OwnedV41Transformer):
         __init__ = OwnedV41Transformer.__init__

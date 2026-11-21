@@ -29,6 +29,59 @@ def payload():
 
 
 class V41DSparkAuxiliaryTest(unittest.TestCase):
+    def test_cuda_drafts_bind_the_runtime_norm_to_the_checkpoint_parameter(self):
+        from unittest.mock import patch
+
+        from safetensors.torch import save_file
+
+        from rtp_llm.models_py.modules.base.cuda.norm import RMSNorm as RuntimeNorm
+        from rtp_llm.models_py.new_models.deepseek_v4_dspark.auxiliary import (
+            DSparkAuxiliaryWeights,
+        )
+
+        key = "mtp.0.main_norm.weight"
+        weight = torch.linspace(0.25, 1.75, 128).bfloat16()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "norm.safetensors"
+            save_file({key: weight}, str(path))
+            # Select the production CUDA binding, but stage the two real FST
+            # loads on CPU. No GPU or arithmetic is needed for this contract.
+            with patch.object(torch.version, "cuda", "13.0"):
+                v4 = DSparkAuxiliaryWeights(128, (1,), 16, 16, 4, device="cuda")
+                v41 = V41DSparkAuxiliaryWeights(128, (1,), 16, 4, device="cuda")
+            for model, dispatch in (
+                (v4, v4.load_standalone_checkpoint),
+                (v41, v41.load_weights),
+            ):
+                with self.subTest(owner=type(model).__name__):
+                    self.assertIsInstance(model.main_norm, RuntimeNorm)
+                    self.assertIs(type(model.main_norm).forward, RuntimeNorm.forward)
+                    param = model.main_norm.weight
+                    loader = NewModelLoader(
+                        SimpleNamespace(model_type="deepseek_v41_dspark"),
+                        NewLoaderConfig(device="cpu", load_method="fastsafetensors"),
+                        model_path=folder,
+                    )
+                    include = model.checkpoint_weight_name_filter()
+                    dispatch(
+                        loader._fastsafetensors_weights_iterator(
+                            [str(path)],
+                            "cpu",
+                            include,
+                            None,
+                            loader._checkpoint_read_spec_resolver(model, include, None),
+                        )
+                    )
+                    self.assertIs(model.main_norm.weight, param)
+                    self.assertTrue(torch.equal(param, weight))
+                    self.assertEqual(model.main_norm.variance_epsilon, 1e-6)
+                    self.assertTrue(model.main_norm.supports_independent_weight_updates)
+                    updates = model.main_norm.prepare_weight_updates(
+                        {"weight": torch.zeros_like(weight)}
+                    )
+                    self.assertEqual(len(updates), 1)
+                    self.assertTrue(torch.equal(param, weight))
+
     def _read(self, model, values):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pytorch_model.bin"

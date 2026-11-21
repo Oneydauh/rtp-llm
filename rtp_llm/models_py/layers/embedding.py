@@ -247,7 +247,7 @@ class ParallelLMHead(RtpModule):
                 )
         elif output_vocab_padded_size:
             raise ValueError("Output vocabulary padding requires selected token ids")
-        elif tp_size > 1 and (vocab_size % tp_size or tp_pad8):
+        elif tp_pad8 or vocab_size % tp_size:
             # Preserve existing divisible layouts, and use the legacy pad8
             # alignment when an ordinary vocabulary needs TP padding.
             alignment = tp_size * 8

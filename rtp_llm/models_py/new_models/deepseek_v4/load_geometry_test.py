@@ -8,12 +8,46 @@ import torch
 
 from rtp_llm.models_py.model_loader import NewLoaderConfig
 from rtp_llm.models_py.new_models.deepseek_v4.load_geometry import (
+    make_lm_head,
     validate_load_groups,
     validate_v4_static_placement,
 )
 
 
 class FlashLoadGeometryTest(unittest.TestCase):
+    def test_head_shards_full_and_preselected_rows_have_the_same_padding(self):
+        for vocab, tp, dp, ep, rows in (
+            (19, 1, 1, 1, 19),
+            (19, 1, 2, 1, 24),
+            (18, 2, 1, 1, 16),
+            (19, 2, 1, 1, 16),
+            (3, 2, 1, 2, 8),
+        ):
+            source = torch.arange(vocab * 4).reshape(vocab, 4).float() + 1
+            padded = torch.nn.functional.pad(source, (0, 0, 0, rows * tp - vocab))
+            for rank in range(tp):
+                args = SimpleNamespace(
+                    vocab_size=vocab,
+                    dim=4,
+                    dp_size=dp,
+                    ep_size=ep,
+                    lm_head_tp_size=tp,
+                    lm_head_tp_rank=rank,
+                )
+                for presliced in (False, True):
+                    with self.subTest(
+                        vocab=vocab, tp=tp, rank=rank, presliced=presliced
+                    ):
+                        head = make_lm_head(args, torch.float32)
+                        spec = head.checkpoint_read_spec("weight", tuple(source.shape))
+                        value = (
+                            spec.materialize(source) if spec and presliced else source
+                        )
+                        head.load_weights({"weight": value})
+                        self.assertTrue(
+                            torch.equal(head.weight, padded.chunk(tp)[rank])
+                        )
+
     def config(self, **kwargs):
         return NewLoaderConfig(
             device="cpu",
