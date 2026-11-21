@@ -46,6 +46,7 @@ from rtp_llm.openai.renderers.custom_renderer import RendererParams
 from rtp_llm.ops import TaskType
 from rtp_llm.server.backend_rpc_server_visitor import create_backend_rpc_server_visitor
 from rtp_llm.telemetry import init_telemetry, shutdown_telemetry
+from rtp_llm.utils import dash_sc_startup_timing as startup
 
 if TYPE_CHECKING:
     from rtp_llm.config.model_config import ModelConfig
@@ -692,7 +693,9 @@ class DashScApp:
                 extra_stop_word_ids = _derive_stop_word_ids_list(
                     model_config, self.py_env_configs, base_tok
                 )
-                repetition_monitor_config = _build_repetition_monitor_config(
+                repetition_monitor_config = startup.timed(
+                    "repetition",
+                    _build_repetition_monitor_config,
                     self.py_env_configs.repetition_detection_config,
                     base_tok,
                 )
@@ -702,7 +705,9 @@ class DashScApp:
                 env_terminate_id = (
                     self.py_env_configs.generate_env_config.think_terminate_token_id
                 )
-                think_runtime = build_think_runtime(
+                think_runtime = startup.timed(
+                    "think",
+                    build_think_runtime,
                     base_tok,
                     self.py_env_configs.generate_env_config,
                     model_config.model_type,
@@ -724,8 +729,11 @@ class DashScApp:
                 if model_config.task_type == TaskType.LANGUAGE_MODEL:
                     try:
                         grammar_validator = GrammarValidator(
-                            build_model_grammar_tokenizer_info_json(
-                                base_tok, model_config
+                            startup.timed(
+                                "serialize_vocab",
+                                build_model_grammar_tokenizer_info_json,
+                                base_tok,
+                                model_config,
                             ),
                             grammar_config,
                             self.py_env_configs.grammar_admission_config,
@@ -778,6 +786,7 @@ class DashScApp:
             # (split via the ``protocol`` tag ``grpc_metrics`` injects).
             kmonitor.init()
 
+            startup.mark("barrier.begin")
             _wait_for_bind_barrier(
                 bind_barrier,
                 self.server_config.rank_id,
@@ -801,6 +810,7 @@ class DashScApp:
                 rank_id=self.server_config.rank_id,
             )
             logging.info("[DashScApp] gRPC server bound on port %s", port)
+            startup.finish("bound")
         except BaseException as e:
             _abort_bind_barrier(bind_barrier)
             error_trace = traceback.format_exc()

@@ -41,6 +41,7 @@ from rtp_llm.dash_sc.inference.core_dump_control import (
     _configure_xgrammar_sandbox_core_dump_for_current_process,
 )
 from rtp_llm.ops import GrammarConfig
+from rtp_llm.utils.dash_sc_startup_timing import timed
 
 logger = logging.getLogger(__name__)
 
@@ -230,9 +231,7 @@ def _read_worker_fault_trace(fault_file: BinaryIO | None) -> str:
     except (OSError, ValueError):
         return ""
     truncated = len(raw_trace) > _MAX_WORKER_FAULT_TRACE_BYTES
-    trace = raw_trace[:_MAX_WORKER_FAULT_TRACE_BYTES].decode(
-        "utf-8", errors="replace"
-    )
+    trace = raw_trace[:_MAX_WORKER_FAULT_TRACE_BYTES].decode("utf-8", errors="replace")
     trace = trace.strip()
     if truncated:
         trace += "\n[worker fatal traceback truncated]"
@@ -274,22 +273,18 @@ class GrammarValidator:
         grammar_config: GrammarConfig,
         admission_config: GrammarAdmissionConfig,
     ) -> None:
-        self._result_cache_max_entries = int(
-            admission_config.result_cache_max_entries
-        )
+        self._result_cache_max_entries = int(admission_config.result_cache_max_entries)
         if self._result_cache_max_entries < 0:
             raise ValueError(
                 "grammar admission result_cache_max_entries must be non-negative"
             )
         self._result_cache_lock = threading.Lock()
-        self._result_cache: OrderedDict[
-            tuple[str, str], _GrammarCheckResult
-        ] = OrderedDict()
+        self._result_cache: OrderedDict[tuple[str, str], _GrammarCheckResult] = (
+            OrderedDict()
+        )
         self._crash_circuit_lock = threading.Lock()
         self._crash_circuit: OrderedDict[tuple[str, str], float] = OrderedDict()
-        self._initialize_compiler(
-            tokenizer_info_json, grammar_config, admission_config
-        )
+        self._initialize_compiler(tokenizer_info_json, grammar_config, admission_config)
         self._worker_tokenizer_info_json = tokenizer_info_json
         self._worker_grammar_config = grammar_config
         self._worker_admission_config = admission_config
@@ -333,9 +328,7 @@ class GrammarValidator:
         # for the same key to execute more than once. Keep one in-flight Future per exact
         # grammar so duplicate requests share the leader's compile result.
         self._inflight_lock = threading.Lock()
-        self._inflight: dict[
-            tuple[str, str], Future[_GrammarCheckResult]
-        ] = {}
+        self._inflight: dict[tuple[str, str], Future[_GrammarCheckResult]] = {}
         self._live = 0
         self._spawning = 0
         self._coordinator_running = False
@@ -413,9 +406,7 @@ class GrammarValidator:
             # no sort_keys: validate/cache the exact string xgrammar will compile.
             spec_str = spec if isinstance(spec, str) else json.dumps(spec)
         except Exception as e:
-            detail = (str(e) or type(e).__name__)[
-                :_MAX_COMPILE_ERROR_MESSAGE_LENGTH
-            ]
+            detail = (str(e) or type(e).__name__)[:_MAX_COMPILE_ERROR_MESSAGE_LENGTH]
             logger.warning(
                 _with_request_id(
                     f"GrammarValidator: cannot serialize grammar spec ({detail}); rejecting it"
@@ -439,9 +430,7 @@ class GrammarValidator:
             )
             raise
         except Exception as e:
-            detail = (str(e) or type(e).__name__)[
-                :_MAX_COMPILE_ERROR_MESSAGE_LENGTH
-            ]
+            detail = (str(e) or type(e).__name__)[:_MAX_COMPILE_ERROR_MESSAGE_LENGTH]
             logger.warning(
                 _with_request_id(
                     f"GrammarValidator: unexpected grammar check failure ({detail}); request may be retried"
@@ -498,9 +487,7 @@ class GrammarValidator:
                 if self._inflight.get(key) is future:
                     del self._inflight[key]
 
-    def _get_cached_result(
-        self, key: tuple[str, str]
-    ) -> _GrammarCheckResult | None:
+    def _get_cached_result(self, key: tuple[str, str]) -> _GrammarCheckResult | None:
         if self._result_cache_max_entries == 0:
             return None
         with self._result_cache_lock:
@@ -509,9 +496,7 @@ class GrammarValidator:
                 self._result_cache.move_to_end(key)
             return result
 
-    def _cache_result(
-        self, key: tuple[str, str], result: _GrammarCheckResult
-    ) -> None:
+    def _cache_result(self, key: tuple[str, str], result: _GrammarCheckResult) -> None:
         if self._result_cache_max_entries == 0:
             return
         with self._result_cache_lock:
@@ -650,10 +635,14 @@ class GrammarValidator:
                 "GrammarValidator requires xgrammar for compile/sandbox validation"
             )
         try:
-            tokenizer_info = xgr.TokenizerInfo.deserialize_json(
-                self._tokenizer_info_json
+            tokenizer_info = timed(
+                "deserialize_vocab",
+                xgr.TokenizerInfo.deserialize_json,
+                self._tokenizer_info_json,
             )
-            return xgr.GrammarCompiler(
+            return timed(
+                "create_compiler",
+                xgr.GrammarCompiler,
                 tokenizer_info,
                 # xgrammar 0.2.8's multi-thread GrammarCompiler was observed
                 # hanging in sandbox compile workers on loaded CI hosts, so
@@ -883,9 +872,7 @@ class GrammarValidator:
                     break
                 self._retire(*worker)
 
-    def _retire(
-        self, proc: Any, conn: Any, fault_file: BinaryIO | None = None
-    ) -> None:
+    def _retire(self, proc: Any, conn: Any, fault_file: BinaryIO | None = None) -> None:
         """Kill a dead/bad worker and schedule a bounded-rate replacement."""
         if conn is not None:
             try:

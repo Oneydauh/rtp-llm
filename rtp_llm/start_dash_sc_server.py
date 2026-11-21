@@ -48,6 +48,22 @@ def start_dash_sc_server(
     pipe_writer=None,
     bind_barrier=None,
 ):
+    from rtp_llm.utils.dash_sc_startup_timing import capture
+
+    with capture(world_rank, server_id, py_env_configs):
+        return _start_dash_sc_server(
+            world_rank,
+            server_id,
+            global_controller,
+            py_env_configs,
+            pipe_writer,
+            bind_barrier,
+        )
+
+
+def _start_dash_sc_server(
+    world_rank, server_id, global_controller, py_env_configs, pipe_writer, bind_barrier
+):
     pc = py_env_configs.parallelism_config
     # Topology uses the global rank; listening ports use the derived local rank.
     set_parallelism_config(
